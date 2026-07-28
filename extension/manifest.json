@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Onera",
+  "version": "0.1.0",
+  "description": "Send mods from Nexus Mods to the Onera mod manager.",
+  "minimum_chrome_version": "116",
+  "permissions": ["nativeMessaging", "storage", "activeTab", "scripting"],
+  "host_permissions": ["https://www.nexusmods.com/*"],
+  "background": { "service_worker": "src/service-worker.js", "type": "module" },
+  "action": {
+    "default_title": "Onera",
+    "default_popup": "src/popup.html",
+    "default_icon": { "48": "icons/onera-48.png", "128": "icons/onera-128.png" }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.nexusmods.com/*/mods/*"],
+      "js": ["src/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": { "48": "icons/onera-48.png", "128": "icons/onera-128.png" },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'"
+  }
+}

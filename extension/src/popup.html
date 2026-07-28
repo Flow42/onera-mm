@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Onera</title>
+    <style>
+      body {
+        width: 280px;
+        margin: 0;
+        padding: 12px;
+        font:
+          13px/1.4 system-ui,
+          sans-serif;
+        background: #17171a;
+        color: #f4f4f5;
+      }
+      h1 {
+        font-size: 14px;
+        margin: 0 0 8px;
+      }
+      .status {
+        padding: 8px;
+        border-radius: 6px;
+        background: #232327;
+        margin-bottom: 8px;
+      }
+      .error {
+        color: #ffb4a8;
+      }
+      button {
+        width: 100%;
+        padding: 8px;
+        margin-top: 6px;
+        border-radius: 6px;
+        border: 1px solid #444;
+        background: #2a2a30;
+        color: inherit;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Onera</h1>
+    <div class="status" id="status">Checking…</div>
+    <div id="actions" hidden>
+      <button data-action="add_mod">Add to Onera</button>
+      <button data-action="download">Download</button>
+      <button data-action="download_and_install">Download and install</button>
+    </div>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

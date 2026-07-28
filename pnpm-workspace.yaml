@@ -1,0 +1,8 @@
+packages:
+  - 'apps/*'
+
+# esbuild ships a prebuilt binary that its install script extracts. It is the
+# only dependency in this tree permitted to run a build script; everything else
+# is installed inert.
+allowBuilds:
+  esbuild: true

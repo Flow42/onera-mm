@@ -1,0 +1,36 @@
+[package]
+name = "onera-app"
+description = "Application services wiring Onera's core to its adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+onera-core.workspace = true
+onera-db.workspace = true
+onera-archive.workspace = true
+onera-install.workspace = true
+onera-discovery.workspace = true
+onera-games.workspace = true
+onera-provider.workspace = true
+onera-nexus.workspace = true
+onera-download.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+keyring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+onera-core = { workspace = true }
+tempfile.workspace = true
+wiremock.workspace = true
+zip.workspace = true

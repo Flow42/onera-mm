@@ -1,0 +1,823 @@
+//! The Onera command-line interface.
+//!
+//! A thin adapter over [`onera_app::Onera`]. Every subcommand is a direct
+//! translation of one application method; nothing here decides what to install,
+//! what conflicts mean, or what to write. That keeps the CLI and the desktop
+//! application incapable of disagreeing.
+//!
+//! The CLI is also the headless entry point: CI, packaging smoke tests and the
+//! manual smoke test in `docs/recovery.md` all drive it.
+
+#![forbid(unsafe_code)]
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use onera_app::{InstallRequest, Onera, Paths};
+use onera_core::ids::{InstallationId, LocalGameId, ProviderFileId, ProviderModId};
+use onera_core::plan::{ConflictChoice, Decision, DecisionScope};
+use onera_core::progress::{CancelToken, ProgressEvent, ProgressSink, Stage};
+use onera_core::redact::Secret;
+use onera_install::remove::ModifiedFilePolicy;
+use std::io::IsTerminal as _;
+use std::str::FromStr;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "onera",
+    about = "A Linux-first, game-agnostic mod manager",
+    version
+)]
+struct Cli {
+    /// Print structured JSON instead of human-readable text.
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Enable debug logging.
+    #[arg(long, short, global = true)]
+    verbose: bool,
+
+    /// Use a different data root. Mainly for testing and portable installs.
+    #[arg(long, global = true, env = "ONERA_ROOT")]
+    root: Option<std::path::PathBuf>,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Store, replace, inspect or delete the Nexus personal API key.
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+    /// Find installed games Onera can manage.
+    Discover,
+    /// List registered game installations.
+    Games,
+    /// Show a mod's metadata and files.
+    Mod {
+        /// Nexus game domain, e.g. `cyberpunk2077`.
+        game: String,
+        /// Mod id from the mod page URL.
+        mod_id: String,
+    },
+    /// Preview or perform an installation.
+    Install {
+        /// Registered game installation id, from `onera games`.
+        #[arg(long)]
+        game: String,
+        /// Nexus game domain.
+        #[arg(long)]
+        domain: String,
+        /// Mod id from the mod page URL.
+        #[arg(long)]
+        mod_id: String,
+        /// A specific file id. Defaults to the mod page's primary file.
+        #[arg(long)]
+        file_id: Option<String>,
+        /// Show the plan and stop. This is the default.
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        /// Actually write the files.
+        #[arg(long)]
+        apply: bool,
+        /// Resolve every conflict the same way, rather than stopping.
+        #[arg(long, value_name = "CHOICE")]
+        on_conflict: Option<ConflictArg>,
+    },
+    /// Re-read every file an installation claims.
+    Verify {
+        /// Game installation id.
+        #[arg(long)]
+        game: String,
+        /// Installation id.
+        #[arg(long)]
+        installation: String,
+    },
+    /// Remove an installation and restore what it covered.
+    Remove {
+        /// Game installation id.
+        #[arg(long)]
+        game: String,
+        /// Installation id.
+        #[arg(long)]
+        installation: String,
+        /// Show what would happen and stop.
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove files even if they changed since installation.
+        #[arg(long)]
+        force_modified: bool,
+    },
+    /// Show who provides a deployed path, oldest first.
+    Ownership {
+        /// Game installation id.
+        #[arg(long)]
+        game: String,
+        /// Deployment root key, e.g. `game`.
+        #[arg(long, default_value = "game")]
+        root: String,
+        /// Path relative to that root.
+        path: String,
+    },
+    /// List and resolve operations that were interrupted.
+    Recover {
+        /// Roll back every interrupted operation.
+        #[arg(long)]
+        rollback: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthAction {
+    /// Store an API key, reading it from stdin so it never lands in shell history.
+    Login,
+    /// Show which account the stored key belongs to.
+    Status,
+    /// Delete the stored key.
+    Logout,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConflictArg {
+    Keep,
+    Replace,
+    Adopt,
+}
+
+impl FromStr for ConflictArg {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "keep" => Ok(Self::Keep),
+            "replace" => Ok(Self::Replace),
+            "adopt" => Ok(Self::Adopt),
+            other => Err(format!("expected keep, replace or adopt; got {other:?}")),
+        }
+    }
+}
+
+impl From<ConflictArg> for ConflictChoice {
+    fn from(value: ConflictArg) -> Self {
+        match value {
+            ConflictArg::Keep => Self::KeepExisting,
+            ConflictArg::Replace => Self::ReplaceAfterBackup,
+            ConflictArg::Adopt => Self::AdoptExisting,
+        }
+    }
+}
+
+/// Renders progress as one line per stage change, or as JSON events.
+struct CliProgress {
+    json: bool,
+    quiet: bool,
+}
+
+impl ProgressSink for CliProgress {
+    fn emit(&self, event: ProgressEvent) {
+        if self.quiet {
+            return;
+        }
+        if self.json {
+            if let Ok(line) = serde_json::to_string(&event) {
+                println!("{line}");
+            }
+            return;
+        }
+        match event {
+            ProgressEvent::Started { stage, total, .. } => {
+                eprintln!(
+                    "{}{}",
+                    stage_label(stage),
+                    total.map_or(String::new(), |t| format!(" ({t})"))
+                );
+            }
+            ProgressEvent::Warning { message } => eprintln!("  warning: {message}"),
+            // Per-item advances are far too noisy for a terminal; the stage
+            // transitions are what a user actually wants to see.
+            ProgressEvent::Advanced { .. } | ProgressEvent::Finished { .. } => {}
+        }
+    }
+}
+
+fn stage_label(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Inspecting => "inspecting archive",
+        Stage::Downloading => "downloading",
+        Stage::Extracting => "extracting",
+        Stage::Hashing => "hashing",
+        Stage::Planning => "planning",
+        Stage::BackingUp => "preparing",
+        Stage::Deploying => "deploying",
+        Stage::Verifying => "verifying",
+        Stage::Removing => "removing",
+        Stage::RollingBack => "rolling back",
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let paths = match &cli.root {
+        Some(root) => Paths::rooted_at(root.clone()),
+        None => Paths::discover().context("cannot resolve XDG directories")?,
+    };
+    onera_app::logging::init(
+        Some(&paths.logs()),
+        if cli.json {
+            onera_app::logging::LogFormat::Json
+        } else {
+            onera_app::logging::LogFormat::Text
+        },
+        cli.verbose,
+    )
+    .context("cannot initialize logging")?;
+
+    let onera = Onera::new(paths).await.context("cannot start Onera")?;
+    let cancel = CancelToken::new();
+    let progress = CliProgress {
+        json: cli.json,
+        quiet: false,
+    };
+
+    match cli.command {
+        Commands::Auth { action } => auth(&onera, action, cli.json).await,
+        Commands::Discover => discover(&onera, &cancel, cli.json).await,
+        Commands::Games => games(&onera, cli.json).await,
+        Commands::Mod { game, mod_id } => show_mod(&onera, &game, &mod_id, &cancel, cli.json).await,
+        Commands::Install {
+            game,
+            domain,
+            mod_id,
+            file_id,
+            dry_run,
+            apply,
+            on_conflict,
+        } => {
+            install(
+                &onera,
+                InstallArgs {
+                    game,
+                    domain,
+                    mod_id,
+                    file_id,
+                    apply: apply && !dry_run,
+                    on_conflict,
+                },
+                &progress,
+                &cancel,
+                cli.json,
+            )
+            .await
+        }
+        Commands::Verify { game, installation } => {
+            verify(&onera, &game, &installation, &progress, &cancel, cli.json).await
+        }
+        Commands::Remove {
+            game,
+            installation,
+            dry_run,
+            force_modified,
+        } => {
+            remove(
+                &onera,
+                &game,
+                &installation,
+                dry_run,
+                force_modified,
+                &progress,
+                &cancel,
+                cli.json,
+            )
+            .await
+        }
+        Commands::Ownership { game, root, path } => {
+            ownership(&onera, &game, &root, &path, cli.json).await
+        }
+        Commands::Recover { rollback } => recover(&onera, rollback, &progress, cli.json).await,
+    }
+}
+
+async fn auth(onera: &Onera, action: AuthAction, json: bool) -> Result<()> {
+    match action {
+        AuthAction::Login => {
+            // Reading from stdin keeps the key out of the process table and out
+            // of shell history, which an `--api-key` flag could not.
+            let key = if std::io::stdin().is_terminal() {
+                rpassword_prompt()?
+            } else {
+                let mut buffer = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)?;
+                buffer
+            };
+            let account = onera
+                .set_api_key(Secret::new(key.trim()))
+                .await
+                .context("could not store the API key")?;
+            emit(
+                json,
+                &serde_json::json!({
+                    "username": account.username,
+                    "premium": account.premium,
+                }),
+                || format!("signed in as {}", account.username),
+            );
+        }
+        AuthAction::Status => {
+            if !onera.is_authenticated().await? {
+                emit(json, &serde_json::json!({ "authenticated": false }), || {
+                    "not signed in; run `onera auth login`".to_owned()
+                });
+                return Ok(());
+            }
+            let account = onera.account().await?;
+            emit(
+                json,
+                &serde_json::json!({ "authenticated": true, "username": account.username }),
+                || format!("signed in as {}", account.username),
+            );
+        }
+        AuthAction::Logout => {
+            onera.forget_api_key().await?;
+            emit(json, &serde_json::json!({ "authenticated": false }), || {
+                "the stored API key has been deleted".to_owned()
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Prompt for a key without echoing it.
+///
+/// A dependency-free implementation: the terminal is put into no-echo mode via
+/// `stty`, which is available everywhere Onera runs.
+fn rpassword_prompt() -> Result<String> {
+    eprint!("Nexus API key (input hidden): ");
+    let echo_off = std::process::Command::new("stty").arg("-echo").status();
+    let mut key = String::new();
+    let read = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut key);
+    if echo_off.map(|s| s.success()).unwrap_or(false) {
+        let _ = std::process::Command::new("stty").arg("echo").status();
+    }
+    eprintln!();
+    read?;
+    Ok(key)
+}
+
+async fn discover(onera: &Onera, cancel: &CancelToken, json: bool) -> Result<()> {
+    let found = onera.discover_games(cancel).await?;
+    if json {
+        let rendered: Vec<_> = found
+            .iter()
+            .map(|g| {
+                serde_json::json!({
+                    "adapter": g.adapter_id,
+                    "name": g.name,
+                    "path": g.install_root,
+                    "usable": g.is_usable(),
+                    "source": format!("{:?}", g.source),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rendered)?);
+        return Ok(());
+    }
+
+    if found.is_empty() {
+        println!("no supported games found; add one manually with a path");
+        return Ok(());
+    }
+    for game in &found {
+        println!(
+            "{} {}\n  {}\n  {}",
+            if game.is_usable() { "[ok]  " } else { "[warn]" },
+            game.name,
+            game.install_root.display(),
+            game.validation.findings.join("; ")
+        );
+    }
+    println!("\nconfirm a game in the desktop application before installing into it");
+    Ok(())
+}
+
+async fn games(onera: &Onera, json: bool) -> Result<()> {
+    let installs = onera.local_games().await?;
+    if json {
+        let rendered: Vec<_> = installs
+            .iter()
+            .map(|g| {
+                serde_json::json!({
+                    "id": g.id.to_string(),
+                    "adapter": g.adapter_id,
+                    "path": g.install_root,
+                    "confirmed": g.confirmed,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rendered)?);
+        return Ok(());
+    }
+    if installs.is_empty() {
+        println!("no games registered yet; run `onera discover`");
+    }
+    for game in installs {
+        println!(
+            "{}  {}  {}",
+            game.id,
+            game.adapter_id,
+            game.install_root.display()
+        );
+    }
+    Ok(())
+}
+
+async fn show_mod(
+    onera: &Onera,
+    game: &str,
+    mod_id: &str,
+    cancel: &CancelToken,
+    json: bool,
+) -> Result<()> {
+    let details = onera
+        .fetch_mod(game, &ProviderModId::new(mod_id), cancel)
+        .await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": details.name,
+                "author": details.author,
+                "needs_selection": details.needs_file_selection(),
+                "files": details.files.iter().map(|f| serde_json::json!({
+                    "id": f.provider_file_id.as_str(),
+                    "name": f.name,
+                    "category": format!("{:?}", f.category),
+                    "primary": f.is_primary,
+                    "size": f.size_bytes,
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{} by {}",
+        details.name,
+        details.author.as_deref().unwrap_or("unknown")
+    );
+    for file in &details.files {
+        println!(
+            "  {:<12} {:<10} {}{}",
+            file.provider_file_id.as_str(),
+            format!("{:?}", file.category),
+            file.name,
+            if file.is_primary { "  (primary)" } else { "" }
+        );
+    }
+    if details.needs_file_selection() {
+        println!("\nseveral files are plausible; pass --file-id to choose one");
+    }
+    Ok(())
+}
+
+struct InstallArgs {
+    game: String,
+    domain: String,
+    mod_id: String,
+    file_id: Option<String>,
+    apply: bool,
+    on_conflict: Option<ConflictArg>,
+}
+
+async fn install(
+    onera: &Onera,
+    args: InstallArgs,
+    progress: &CliProgress,
+    cancel: &CancelToken,
+    json: bool,
+) -> Result<()> {
+    let game = LocalGameId::from_str(&args.game).context("invalid game id")?;
+    let details = onera
+        .fetch_mod(&args.domain, &ProviderModId::new(&args.mod_id), cancel)
+        .await?;
+
+    let file = match &args.file_id {
+        Some(id) => details
+            .files
+            .iter()
+            .find(|f| f.provider_file_id.as_str() == id)
+            .context("no file with that id")?,
+        None => details
+            .primary_file()
+            .or_else(|| details.selectable_files().next())
+            .context("this mod offers no downloadable file; pass --file-id")?,
+    };
+    if args.file_id.is_none() && details.needs_file_selection() {
+        anyhow::bail!(
+            "{} offers several plausible files; pass --file-id (see `onera mod`)",
+            details.name
+        );
+    }
+
+    let release_id = details
+        .releases
+        .iter()
+        .find(|r| r.id == file.release_id)
+        .or_else(|| details.releases.first())
+        .context("the mod has no releases")?
+        .id;
+
+    let mut prepared = onera
+        .prepare_install(
+            &InstallRequest {
+                local_game_id: game,
+                game_slug: args.domain.clone(),
+                mod_id: details.mod_id,
+                release_id,
+                provider_mod_id: ProviderModId::new(&args.mod_id),
+                provider_file_id: ProviderFileId::new(file.provider_file_id.as_str()),
+                filename: file.name.clone(),
+                expected_hash: file.published_hash.clone(),
+            },
+            progress,
+            cancel,
+        )
+        .await?;
+
+    if let Some(choice) = args.on_conflict {
+        // Applies to every class that asks, in this operation only. There is no
+        // flag for a persistent global rule; those are deliberately narrow and
+        // are created in the UI.
+        for classification in [
+            onera_core::plan::FileClassification::ConflictWithOtherMod,
+            onera_core::plan::FileClassification::UnmanagedExisting,
+            onera_core::plan::FileClassification::ExternallyModified,
+        ] {
+            let target = prepared.plan.files.first().map(|f| f.target.clone());
+            if let Some(target) = target {
+                prepared.plan.apply_decision(
+                    &target,
+                    &Decision {
+                        choice: choice.into(),
+                        scope: DecisionScope::EquivalentInThisOperation { classification },
+                    },
+                );
+            }
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "operation": prepared.plan.operation_id.to_string(),
+                "installation": prepared.plan.installation_id.to_string(),
+                "layout": prepared.layout_rationale,
+                "ignored": prepared.ignored,
+                "rejected": prepared.rejected_entries.len(),
+                "ready": prepared.plan.is_ready(),
+                "files": prepared.plan.files.iter().map(|f| serde_json::json!({
+                    "target": f.target.to_string(),
+                    "classification": f.classification,
+                    "action": f.effective_action(),
+                    "notes": f.notes,
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+    } else {
+        println!("layout: {}", prepared.layout_rationale);
+        if prepared.ignored > 0 {
+            println!("ignored {} non-content file(s)", prepared.ignored);
+        }
+        for rejected in &prepared.rejected_entries {
+            println!("rejected {}: {}", rejected.raw_path, rejected.reason);
+        }
+        print!("{}", onera_install::render_preview(&prepared.plan));
+    }
+
+    if !args.apply {
+        if !json {
+            println!("\nthis was a dry run; pass --apply to write these files");
+        }
+        return Ok(());
+    }
+    if !prepared.plan.is_ready() {
+        anyhow::bail!(
+            "{} file(s) need a decision; resolve them in the desktop application or pass --on-conflict",
+            prepared.plan.unresolved().count()
+        );
+    }
+
+    let report = onera.apply(&prepared, progress, cancel).await?;
+    emit(
+        json,
+        &serde_json::json!({
+            "installation": prepared.plan.installation_id.to_string(),
+            "written": report.written,
+            "shared": report.shared,
+            "skipped": report.skipped,
+            "backed_up": report.backed_up,
+        }),
+        || {
+            format!(
+                "installed {}: {} written, {} shared, {} skipped, {} backed up\ninstallation {}",
+                details.name,
+                report.written,
+                report.shared,
+                report.skipped,
+                report.backed_up,
+                prepared.plan.installation_id
+            )
+        },
+    );
+    Ok(())
+}
+
+async fn verify(
+    onera: &Onera,
+    game: &str,
+    installation: &str,
+    progress: &CliProgress,
+    cancel: &CancelToken,
+    json: bool,
+) -> Result<()> {
+    let report = onera
+        .verify(
+            LocalGameId::from_str(game).context("invalid game id")?,
+            InstallationId::from_str(installation).context("invalid installation id")?,
+            progress,
+            cancel,
+        )
+        .await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        for (status, count) in report.counts() {
+            println!("{status}: {count}");
+        }
+        for problem in report.problems() {
+            println!("  {:?} {}", problem.status, problem.target);
+        }
+    }
+    if !report.is_clean() {
+        // A non-zero exit lets a script notice without parsing output.
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn remove(
+    onera: &Onera,
+    game: &str,
+    installation: &str,
+    dry_run: bool,
+    force_modified: bool,
+    progress: &CliProgress,
+    cancel: &CancelToken,
+    json: bool,
+) -> Result<()> {
+    let game = LocalGameId::from_str(game).context("invalid game id")?;
+    let installation = InstallationId::from_str(installation).context("invalid installation id")?;
+
+    let report = if dry_run {
+        onera.preview_removal(game, installation).await?
+    } else {
+        onera
+            .remove(
+                game,
+                installation,
+                if force_modified {
+                    ModifiedFilePolicy::Force
+                } else {
+                    ModifiedFilePolicy::Ask
+                },
+                progress,
+                cancel,
+            )
+            .await?
+    };
+
+    emit(
+        json,
+        &serde_json::json!({
+            "deleted": report.deleted.len(),
+            "restored": report.restored.len(),
+            "kept_shared": report.kept_shared.len(),
+            "already_missing": report.already_missing.len(),
+            "externally_modified": report.externally_modified.len(),
+            "directories_removed": report.directories_removed.len(),
+            "dry_run": dry_run,
+        }),
+        || {
+            format!(
+                "{}{} deleted, {} restored, {} kept (shared), {} already gone, {} modified",
+                if dry_run { "would be: " } else { "" },
+                report.deleted.len(),
+                report.restored.len(),
+                report.kept_shared.len(),
+                report.already_missing.len(),
+                report.externally_modified.len()
+            )
+        },
+    );
+    Ok(())
+}
+
+async fn ownership(onera: &Onera, game: &str, root: &str, path: &str, json: bool) -> Result<()> {
+    let target = onera_core::plan::TargetLocation {
+        root_key: root.to_owned(),
+        path: onera_core::RelPath::normalize(path).context("invalid path")?,
+    };
+    let stack = onera
+        .ownership(
+            LocalGameId::from_str(game).context("invalid game id")?,
+            &target,
+        )
+        .await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stack)?);
+        return Ok(());
+    }
+    if stack.is_empty() {
+        println!("{target} is not managed by Onera");
+        return Ok(());
+    }
+    println!("{target}, oldest provider first:");
+    for (index, entry) in stack.entries().iter().enumerate() {
+        let who = match entry.provider.installation_id() {
+            Some(id) => format!("installation {id}"),
+            None => "unmanaged original (backed up)".to_owned(),
+        };
+        println!(
+            "  {index}. {who}  {}  {} bytes{}",
+            entry.hash.prefix(12),
+            entry.size,
+            if index + 1 == stack.len() {
+                "  <- deployed"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+async fn recover(onera: &Onera, rollback: bool, progress: &CliProgress, json: bool) -> Result<()> {
+    let interrupted = onera.interrupted_operations().await?;
+    if interrupted.is_empty() {
+        emit(json, &serde_json::json!([]), || {
+            "no interrupted operations".to_owned()
+        });
+        return Ok(());
+    }
+
+    for item in &interrupted {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "operation": item.operation.id.to_string(),
+                    "state": item.operation.state.to_string(),
+                    "recovery": format!("{:?}", item.recovery),
+                    "committed": item.committed_files,
+                    "staged": item.staged_files,
+                }))?
+            );
+        } else {
+            println!(
+                "{}  state={}  committed={}  staged={}  recovery={:?}",
+                item.operation.id,
+                item.operation.state,
+                item.committed_files,
+                item.staged_files,
+                item.recovery
+            );
+        }
+        if rollback {
+            onera.roll_back(item.operation.id, progress).await?;
+            if !json {
+                println!("  rolled back");
+            }
+        }
+    }
+    if !rollback && !json {
+        println!("\npass --rollback to undo these, or resolve them in the desktop application");
+    }
+    Ok(())
+}
+
+/// Print either JSON or a human-readable line.
+fn emit(json: bool, value: &serde_json::Value, text: impl FnOnce() -> String) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).unwrap_or_default()
+        );
+    } else {
+        println!("{}", text());
+    }
+}

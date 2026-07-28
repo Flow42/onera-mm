@@ -1,0 +1,15 @@
+[package]
+name = "onera-provider"
+description = "Provider registry and provider-facing interfaces for Onera"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+onera-core.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

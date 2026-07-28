@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The minimum Tauri surface Onera's frontend needs. No shell, no filesystem, no HTTP: everything goes through Onera's own commands, which are the only place with authority to touch a game directory.",
+  "windows": ["main"],
+  "permissions": ["core:default", "core:event:allow-listen", "dialog:allow-open"]
+}

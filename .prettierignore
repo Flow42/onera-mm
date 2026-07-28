@@ -1,0 +1,6 @@
+target/
+build/
+dist/
+.svelte-kit/
+pnpm-lock.yaml
+nexus_openapi.yaml

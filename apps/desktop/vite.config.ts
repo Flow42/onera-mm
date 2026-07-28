@@ -1,0 +1,9 @@
+import { sveltekit } from '@sveltejs/kit/vite';
+import { defineConfig } from 'vite';
+
+export default defineConfig({
+  plugins: [sveltekit()],
+  // Tauri controls the port and expects a fixed one.
+  server: { port: 5173, strictPort: true },
+  build: { target: 'es2022', sourcemap: true },
+});

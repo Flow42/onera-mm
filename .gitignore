@@ -1,0 +1,21 @@
+# Rust
+/target/
+apps/desktop/src-tauri/target/
+
+# Node
+node_modules/
+.pnpm-store/
+
+# SvelteKit
+.svelte-kit/
+apps/desktop/build/
+
+# Playwright
+test-results/
+playwright-report/
+blob-report/
+
+# Local state
+*.db
+*.db-shm
+*.db-wal

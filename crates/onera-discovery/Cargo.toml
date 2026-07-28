@@ -1,0 +1,19 @@
+[package]
+name = "onera-discovery"
+description = "Steam game discovery for Onera"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+onera-core.workspace = true
+dirs.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

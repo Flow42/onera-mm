@@ -1,0 +1,62 @@
+//! The Onera desktop application.
+//!
+//! A thin adapter. Every command below is a direct translation of one
+//! [`onera_app::Onera`] method into a serialisable result: no filesystem access,
+//! no installation logic and no conflict resolution happens in this file or in
+//! any frontend component. That boundary is what lets the CLI, the browser
+//! extension and this window behave identically.
+//!
+//! Long-running operations stream [`onera_core::progress::ProgressEvent`]s to
+//! the frontend over the `onera://progress` event channel and can be cancelled
+//! by their operation id.
+
+#![forbid(unsafe_code)]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod commands;
+mod state;
+
+use state::AppState;
+use tauri::Manager as _;
+
+fn main() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            // Startup does real work — XDG directories, migrations, a keyring
+            // probe — so it is awaited here rather than deferred: a window that
+            // paints before the database is usable would only be able to show
+            // errors.
+            let state = tauri::async_runtime::block_on(AppState::start(handle))?;
+            app.manage(state);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::is_authenticated,
+            commands::set_api_key,
+            commands::forget_api_key,
+            commands::account,
+            commands::discover_games,
+            commands::confirm_game,
+            commands::add_manual_game,
+            commands::local_games,
+            commands::fetch_mod,
+            commands::installed_mods,
+            commands::check_updates,
+            commands::prepare_install,
+            commands::decide,
+            commands::apply_plan,
+            commands::cancel_operation,
+            commands::verify,
+            commands::preview_removal,
+            commands::remove_mod,
+            commands::ownership,
+            commands::interrupted_operations,
+            commands::roll_back,
+            commands::diagnostics,
+        ])
+        .run(tauri::generate_context!())
+        .expect("the Onera window could not be created");
+}
