@@ -16,14 +16,18 @@
 
 import type {
   AccountInfo,
+  DownloadJob,
+  DownloadOutcome,
   DiscoveredGame,
   InstallPlanView,
   InstalledMod,
+  InboxRequest,
   InterruptedOperation,
   LocalGame,
   ModDetails,
   ProviderStackView,
   RemovalPreview,
+  StartupStatus,
   VerifyReport,
 } from './types';
 
@@ -142,6 +146,7 @@ export type ProgressEvent =
 
 export const commands = {
   /* onboarding */
+  startupStatus: () => call<StartupStatus>('startup_status'),
   isAuthenticated: () => call<boolean>('is_authenticated'),
   setApiKey: (key: string) => call<AccountInfo>('set_api_key', { key }),
   forgetApiKey: () => call<void>('forget_api_key'),
@@ -158,6 +163,15 @@ export const commands = {
     call<ModDetails>('fetch_mod', { gameDomain, modId }),
   installedMods: (gameId: string) => call<InstalledMod[]>('installed_mods', { gameId }),
   checkUpdates: (gameId: string) => call<InstalledMod[]>('check_updates', { gameId }),
+  inboxRequests: () => call<InboxRequest[]>('inbox_requests'),
+  dismissInboxRequest: (requestId: string) => call<void>('dismiss_inbox_request', { requestId }),
+  completeInboxRequest: (requestId: string) => call<void>('complete_inbox_request', { requestId }),
+
+  /* downloads */
+  downloads: () => call<DownloadJob[]>('downloads'),
+  downloadFile: (gameDomain: string, modId: string, fileId: string) =>
+    call<DownloadOutcome>('download_file', { gameDomain, modId, fileId }),
+  resumeDownloads: () => call<void>('resume_downloads'),
 
   /* installation */
   prepareInstall: (args: { gameId: string; gameDomain: string; modId: string; fileId: string }) =>

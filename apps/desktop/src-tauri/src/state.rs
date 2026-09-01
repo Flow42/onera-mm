@@ -62,12 +62,30 @@ impl AppState {
             cfg!(debug_assertions),
         )?;
         let onera = Arc::new(Onera::new(paths).await?);
-        Ok(Self {
+        if !onera.interrupted_operations().await?.is_empty() {
+            tracing::warn!("startup found an interrupted installation operation");
+        }
+        let state = Self {
             onera,
             prepared: Mutex::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
             handle,
-        })
+        };
+
+        // Download URLs are short-lived, so startup re-resolves each active
+        // job instead of persisting credentials. The task is detached from the
+        // window lifecycle but every result is durable in SQLite.
+        let resume_onera = Arc::clone(&state.onera);
+        let resume_progress = state.progress();
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = resume_onera
+                .resume_downloads(&resume_progress, &CancelToken::new())
+                .await
+            {
+                tracing::warn!(%error, "could not inspect resumable downloads");
+            }
+        });
+        Ok(state)
     }
 
     /// A progress sink bound to the main window.

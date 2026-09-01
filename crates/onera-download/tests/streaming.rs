@@ -7,7 +7,7 @@ use onera_core::CoreError;
 use onera_download::{ContentAddressedStore, DownloadConfig, Downloader};
 use std::sync::Arc;
 use std::time::Duration;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 struct Fixture {
@@ -63,6 +63,84 @@ async fn downloads_stream_to_storage_and_are_hashed() {
     assert!(!outcome.deduplicated);
     assert_eq!(outcome.path, f.store.path_for(&outcome.hash));
     assert_eq!(std::fs::read(&outcome.path).unwrap(), payload);
+}
+
+#[tokio::test]
+async fn a_persisted_partial_download_resumes_with_a_byte_range() {
+    let server = MockServer::start().await;
+    let payload = b"already-downloaded-and-the-rest";
+    let offset = 18;
+    Mock::given(method("GET"))
+        .and(path("/resume.zip"))
+        .and(header("range", format!("bytes={offset}-")))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header(
+                    "content-range",
+                    format!("bytes {offset}-{}/{}", payload.len() - 1, payload.len()),
+                )
+                .set_body_bytes(payload[offset..].to_vec()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let f = Fixture::new();
+    let partial = f.dir.path().join("persistent/job.part");
+    std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
+    std::fs::write(&partial, &payload[..offset]).unwrap();
+    let mut download = target(&server, "/resume.zip", "resume.zip");
+    download.expected_size = Some(payload.len() as u64);
+
+    let outcome = f
+        .downloader(DownloadConfig::default())
+        .fetch_resumable(
+            &download,
+            None,
+            &partial,
+            &NullProgress,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.bytes, payload.len() as u64);
+    assert_eq!(outcome.hash, FileHash::blake3_of(payload));
+    assert_eq!(std::fs::read(outcome.path).unwrap(), payload);
+}
+
+#[tokio::test]
+async fn resume_restarts_safely_when_the_server_ignores_ranges() {
+    let server = MockServer::start().await;
+    let payload = b"complete archive";
+    Mock::given(method("GET"))
+        .and(path("/no-ranges.zip"))
+        .and(header("range", "bytes=4-"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let f = Fixture::new();
+    let partial = f.dir.path().join("persistent/job.part");
+    std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
+    std::fs::write(&partial, b"old!").unwrap();
+    let mut download = target(&server, "/no-ranges.zip", "no-ranges.zip");
+    download.expected_size = Some(payload.len() as u64);
+
+    let outcome = f
+        .downloader(DownloadConfig::default())
+        .fetch_resumable(
+            &download,
+            None,
+            &partial,
+            &NullProgress,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(outcome.path).unwrap(), payload);
 }
 
 #[tokio::test]
@@ -312,6 +390,30 @@ async fn cancellation_stops_a_download_and_leaves_nothing_behind() {
         leftovers, 0,
         "a cancelled download left a partial file behind"
     );
+}
+
+#[tokio::test]
+async fn cancelling_a_resumable_job_discards_its_partial_file() {
+    let f = Fixture::new();
+    let partial = f.dir.path().join("persistent/cancelled.part");
+    std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
+    std::fs::write(&partial, b"partial bytes").unwrap();
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let cancelled_target = DownloadTarget {
+        url: url::Url::parse("http://127.0.0.1:1/unused").unwrap(),
+        headers: Vec::new(),
+        expected_size: None,
+        filename: "unused".into(),
+    };
+
+    let result = f
+        .downloader(DownloadConfig::default())
+        .fetch_resumable(&cancelled_target, None, &partial, &NullProgress, &cancel)
+        .await;
+
+    assert!(matches!(result, Err(CoreError::Cancelled)));
+    assert!(!partial.exists());
 }
 
 #[tokio::test]

@@ -11,7 +11,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use onera_app::{InstallRequest, Onera, Paths};
 use onera_core::ids::{InstallationId, LocalGameId, ProviderFileId, ProviderModId};
 use onera_core::plan::{ConflictChoice, Decision, DecisionScope};
@@ -127,6 +127,11 @@ enum Commands {
         #[arg(long)]
         rollback: bool,
     },
+    /// Configure browser Native Messaging for portable/AppImage installs.
+    Browser {
+        #[command(subcommand)]
+        action: BrowserAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -138,6 +143,34 @@ enum AuthAction {
     /// Delete the stored key.
     Logout,
 }
+
+#[derive(Debug, Subcommand)]
+enum BrowserAction {
+    /// Install a per-user Native Messaging host manifest.
+    Setup {
+        /// Browser whose per-user configuration should be updated.
+        #[arg(long, value_enum, default_value_t = Browser::Chromium)]
+        browser: Browser,
+        /// Absolute path to the onera-nmhost executable.
+        #[arg(long, default_value = "/usr/lib/onera/onera-nmhost")]
+        host_path: std::path::PathBuf,
+    },
+    /// Print a Native Messaging manifest without writing it.
+    Manifest {
+        /// Absolute path to the onera-nmhost executable.
+        #[arg(long, default_value = "/usr/lib/onera/onera-nmhost")]
+        host_path: std::path::PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Browser {
+    Chromium,
+    Chrome,
+    Brave,
+}
+
+const EXTENSION_ID: &str = "pohiidkpoflhifciokepgpaandghjgmj";
 
 #[derive(Debug, Clone, Copy)]
 enum ConflictArg {
@@ -296,7 +329,58 @@ async fn main() -> Result<()> {
             ownership(&onera, &game, &root, &path, cli.json).await
         }
         Commands::Recover { rollback } => recover(&onera, rollback, &progress, cli.json).await,
+        Commands::Browser { action } => browser(action, cli.json).await,
     }
+}
+
+async fn browser(action: BrowserAction, json: bool) -> Result<()> {
+    match action {
+        BrowserAction::Setup { browser, host_path } => {
+            let config =
+                dirs::config_dir().context("cannot resolve the user configuration directory")?;
+            let directory = match browser {
+                Browser::Chromium => config.join("chromium/NativeMessagingHosts"),
+                Browser::Chrome => config.join("google-chrome/NativeMessagingHosts"),
+                Browser::Brave => config.join("BraveSoftware/Brave-Browser/NativeMessagingHosts"),
+            };
+            tokio::fs::create_dir_all(&directory).await?;
+            let destination = directory.join("com.onera.host.json");
+            let manifest = native_messaging_manifest(&absolute_path(host_path)?);
+            tokio::fs::write(&destination, serde_json::to_vec_pretty(&manifest)?).await?;
+            emit(
+                json,
+                &serde_json::json!({ "manifest": destination }),
+                || format!("installed {}", destination.display()),
+            );
+        }
+        BrowserAction::Manifest { host_path } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&native_messaging_manifest(&absolute_path(
+                    host_path
+                )?))?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn absolute_path(path: std::path::PathBuf) -> Result<std::path::PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn native_messaging_manifest(host_path: &std::path::Path) -> serde_json::Value {
+    serde_json::json!({
+        "name": "com.onera.host",
+        "description": "Onera native messaging host",
+        "path": host_path,
+        "type": "stdio",
+        "allowed_origins": [format!("chrome-extension://{EXTENSION_ID}/")],
+    })
 }
 
 async fn auth(onera: &Onera, action: AuthAction, json: bool) -> Result<()> {
@@ -538,6 +622,7 @@ async fn install(
                 provider_mod_id: ProviderModId::new(&args.mod_id),
                 provider_file_id: ProviderFileId::new(file.provider_file_id.as_str()),
                 filename: file.name.clone(),
+                expected_size: file.size_bytes,
                 expected_hash: file.published_hash.clone(),
             },
             progress,
@@ -819,5 +904,39 @@ fn emit(json: bool, value: &serde_json::Value, text: impl FnOnce() -> String) {
         );
     } else {
         println!("{}", text());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_messaging_manifest_uses_the_stable_extension_identity() {
+        let manifest = native_messaging_manifest(std::path::Path::new("/opt/onera/onera-nmhost"));
+        assert_eq!(manifest["name"], "com.onera.host");
+        assert_eq!(manifest["path"], "/opt/onera/onera-nmhost");
+        assert_eq!(
+            manifest["allowed_origins"][0],
+            format!("chrome-extension://{EXTENSION_ID}/")
+        );
+    }
+
+    #[test]
+    fn relative_host_paths_are_made_absolute() {
+        assert!(absolute_path("onera-nmhost".into()).unwrap().is_absolute());
+    }
+
+    #[test]
+    fn packaged_manifest_matches_the_extension_identity() {
+        let packaged: serde_json::Value =
+            serde_json::from_str(include_str!("../../../packaging/com.onera.host.json")).unwrap();
+        let extension: serde_json::Value =
+            serde_json::from_str(include_str!("../../../extension/manifest.json")).unwrap();
+        assert_eq!(
+            packaged["allowed_origins"][0],
+            format!("chrome-extension://{EXTENSION_ID}/")
+        );
+        assert!(extension["key"].as_str().is_some_and(|key| !key.is_empty()));
     }
 }

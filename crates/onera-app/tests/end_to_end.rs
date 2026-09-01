@@ -217,6 +217,7 @@ fn install_request(
         provider_mod_id: ProviderModId::new(MOD_ID),
         provider_file_id: file.provider_file_id.clone(),
         filename: "test-mod-1.0.zip".into(),
+        expected_size: file.size_bytes,
         expected_hash: None,
     }
 }
@@ -273,6 +274,20 @@ async fn the_full_install_verify_remove_restore_flow() {
         !details.needs_file_selection(),
         "a primary file needs no prompt"
     );
+
+    // Browser handoff is durable even when the desktop still needs a choice.
+    let inbox_request = h
+        .onera
+        .enqueue_download_selection_request(GAME_SLUG.into(), ProviderModId::new(MOD_ID), true)
+        .await
+        .unwrap();
+    assert!(inbox_request.provider_file_id.is_none());
+    assert_eq!(h.onera.inbox_requests().await.unwrap().len(), 1);
+    h.onera
+        .complete_inbox_request(inbox_request.id)
+        .await
+        .unwrap();
+    assert!(h.onera.inbox_requests().await.unwrap().is_empty());
 
     // --- download, inspect, map, plan (nothing written yet) -------------
     let progress = RecordingProgress::default();
@@ -332,6 +347,23 @@ async fn the_full_install_verify_remove_restore_flow() {
         h.game_file("readme.txt").is_none(),
         "documentation must not be deployed"
     );
+
+    // The desktop read models are backed by the completed installation and
+    // persisted download, rather than placeholder command responses.
+    let installed = h.onera.installed_mods(game).await.unwrap();
+    assert_eq!(installed.len(), 1);
+    assert_eq!(installed[0].name, "Test Mod");
+    assert_eq!(installed[0].version, "1.0.0");
+    let updates = h
+        .onera
+        .check_updates(game, &CancelToken::new())
+        .await
+        .unwrap();
+    assert_eq!(updates.len(), 1);
+    assert!(!updates[0].update_available);
+    let downloads = h.onera.downloads().await.unwrap();
+    assert_eq!(downloads.len(), 1);
+    assert_eq!(downloads[0].state, onera_download::JobState::Complete);
 
     // --- verify ----------------------------------------------------------
     let installation = prepared.plan.installation_id;

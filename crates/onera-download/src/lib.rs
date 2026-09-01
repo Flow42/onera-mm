@@ -24,7 +24,7 @@ pub mod store;
 pub use job::{DownloadJob, JobState};
 pub use store::ContentAddressedStore;
 
-use onera_core::hash::FileHash;
+use onera_core::hash::{FileHash, HashAlgorithm};
 use onera_core::ports::{ArchiveStore, DownloadTarget};
 use onera_core::progress::{CancelToken, ProgressEvent, ProgressSink, Stage};
 use onera_core::redact::redact_url;
@@ -32,7 +32,7 @@ use onera_core::{CoreError, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 /// Tuning for the downloader.
 #[derive(Debug, Clone, Copy)]
@@ -139,7 +139,53 @@ impl Downloader {
         progress: &dyn ProgressSink,
         cancel: &CancelToken,
     ) -> Result<DownloadOutcome> {
-        // Deduplication: a file whose bytes are already stored is free.
+        self.fetch_internal(
+            target,
+            trusted_expected(expected_hash),
+            None,
+            progress,
+            cancel,
+        )
+        .await
+    }
+
+    /// Fetch into a stable partial path that can continue after restart.
+    ///
+    /// Servers that honor HTTP ranges continue from the existing byte count. A
+    /// server that ignores the range safely restarts the same job from zero.
+    /// Partial bytes survive transient errors, but an explicit cancellation or
+    /// an integrity/size violation removes them.
+    ///
+    /// # Errors
+    /// As [`Downloader::fetch`].
+    pub async fn fetch_resumable(
+        &self,
+        target: &DownloadTarget,
+        expected_hash: Option<&FileHash>,
+        partial_path: &Path,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<DownloadOutcome> {
+        self.fetch_internal(
+            target,
+            trusted_expected(expected_hash),
+            Some(partial_path),
+            progress,
+            cancel,
+        )
+        .await
+    }
+
+    async fn fetch_internal(
+        &self,
+        target: &DownloadTarget,
+        expected_hash: Option<&FileHash>,
+        partial_path: Option<&Path>,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<DownloadOutcome> {
+        // Deduplication is safe only for hashes Onera computes itself. Provider
+        // MD5 values remain display metadata and never drive integrity policy.
         if let Some(hash) = expected_hash {
             if self.store.contains(hash).await? {
                 return Ok(DownloadOutcome {
@@ -159,8 +205,13 @@ impl Downloader {
 
         let mut attempt = 0_u32;
         loop {
-            cancel.check()?;
-            match self.attempt(target, progress, cancel).await {
+            if cancel.is_cancelled() {
+                if let Some(path) = partial_path {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
+                return Err(CoreError::Cancelled);
+            }
+            match self.attempt(target, partial_path, progress, cancel).await {
                 Ok(outcome) => {
                     if let Some(expected) = expected_hash {
                         if &outcome.hash != expected {
@@ -177,6 +228,11 @@ impl Downloader {
                 Err(error) => {
                     attempt += 1;
                     if attempt >= self.config.max_attempts || !error.is_retryable() {
+                        if !error.is_retryable() {
+                            if let Some(path) = partial_path {
+                                let _ = tokio::fs::remove_file(path).await;
+                            }
+                        }
                         return Err(error);
                     }
                     // Same full-jitter backoff as the API client.
@@ -196,12 +252,32 @@ impl Downloader {
     async fn attempt(
         &self,
         target: &DownloadTarget,
+        partial_path: Option<&Path>,
         progress: &dyn ProgressSink,
         cancel: &CancelToken,
     ) -> Result<DownloadOutcome> {
+        let temp = partial_path.map_or_else(
+            || self.temp_dir.join(format!("download-{}.part", uuid_v4())),
+            Path::to_path_buf,
+        );
+        let keep_partial = partial_path.is_some();
+        if let Some(parent) = temp.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| CoreError::fs(parent, e))?;
+        }
+        let mut offset = match tokio::fs::metadata(&temp).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(CoreError::fs(&temp, error)),
+        };
+
         let mut request = self.http.get(target.url.clone());
         for (name, value) in &target.headers {
             request = request.header(name, value.expose());
+        }
+        if offset > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
         }
 
         let response = request.send().await.map_err(|e| {
@@ -224,7 +300,32 @@ impl Downloader {
             });
         }
 
-        let declared = response.content_length().or(target.expected_size);
+        if offset > 0 {
+            if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                let expected_prefix = format!("bytes {offset}-");
+                let valid_range = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.starts_with(&expected_prefix));
+                if !valid_range {
+                    let _ = tokio::fs::remove_file(&temp).await;
+                    return Err(CoreError::Provider(
+                        "the download server returned a mismatched byte range".to_owned(),
+                    ));
+                }
+            } else {
+                // Range support is optional. Starting over is safe and still
+                // leaves the job resumable for a future supporting server.
+                offset = 0;
+            }
+        }
+
+        let declared = target.expected_size.or_else(|| {
+            response
+                .content_length()
+                .map(|remaining| remaining + offset)
+        });
         if let Some(size) = declared {
             if size > self.config.max_bytes {
                 return Err(CoreError::InvalidInput(format!(
@@ -234,11 +335,29 @@ impl Downloader {
             }
         }
 
-        tokio::fs::create_dir_all(&self.temp_dir)
-            .await
-            .map_err(|e| CoreError::fs(&self.temp_dir, e))?;
-        let temp = self.temp_dir.join(format!("download-{}.part", uuid_v4()));
-        let mut file = tokio::fs::File::create(&temp)
+        let mut hasher = blake3::Hasher::new();
+        if offset > 0 {
+            let mut existing = tokio::fs::File::open(&temp)
+                .await
+                .map_err(|e| CoreError::fs(&temp, e))?;
+            let mut buffer = vec![0_u8; 256 * 1024];
+            loop {
+                let read = existing
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|e| CoreError::fs(&temp, e))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+        }
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(offset > 0)
+            .truncate(offset == 0)
+            .open(&temp)
             .await
             .map_err(|e| CoreError::fs(&temp, e))?;
 
@@ -248,8 +367,7 @@ impl Downloader {
             total: declared,
         });
 
-        let mut hasher = blake3::Hasher::new();
-        let mut written = 0_u64;
+        let mut written = offset;
         let mut stream = response.bytes_stream();
         use futures::StreamExt as _;
 
@@ -259,13 +377,17 @@ impl Downloader {
             let chunk = match next {
                 Err(_) => {
                     drop(file);
-                    let _ = tokio::fs::remove_file(&temp).await;
+                    if !keep_partial {
+                        let _ = tokio::fs::remove_file(&temp).await;
+                    }
                     return Err(CoreError::Provider("the download stalled".to_owned()));
                 }
                 Ok(None) => break,
                 Ok(Some(Err(e))) => {
                     drop(file);
-                    let _ = tokio::fs::remove_file(&temp).await;
+                    if !keep_partial {
+                        let _ = tokio::fs::remove_file(&temp).await;
+                    }
                     return Err(CoreError::Provider(format!(
                         "download interrupted: {}",
                         redact_url(&e.to_string())
@@ -330,6 +452,10 @@ impl Downloader {
             deduplicated: false,
         })
     }
+}
+
+fn trusted_expected(expected: Option<&FileHash>) -> Option<&FileHash> {
+    expected.filter(|hash| hash.algorithm == HashAlgorithm::Blake3)
 }
 
 /// Where a completed download ended up.

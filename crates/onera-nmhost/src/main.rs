@@ -19,6 +19,7 @@
 mod protocol;
 
 use onera_app::{Onera, Paths};
+use onera_core::ids::ProviderModId;
 use onera_core::progress::CancelToken;
 use protocol::{
     code_for, error_response, ok_response, read_message, validate, write_message, Command,
@@ -114,15 +115,23 @@ async fn handle(onera: &Onera, request: Request) -> Response {
                 .fetch_mod(&game_domain, &mod_id.as_str().into(), &cancel)
                 .await
             {
-                Ok(details) => ok_response(
-                    &id,
-                    serde_json::json!({
-                        "mod_id": details.mod_id.to_string(),
-                        "name": details.name,
-                        "author": details.author,
-                        "files": details.files.len(),
-                    }),
-                ),
+                Ok(details) => match onera
+                    .enqueue_add_mod(game_domain, mod_id.as_str().into())
+                    .await
+                {
+                    Ok(request) => ok_response(
+                        &id,
+                        serde_json::json!({
+                            "queued": true,
+                            "request_id": request.id.to_string(),
+                            "mod_id": details.mod_id.to_string(),
+                            "name": details.name,
+                            "author": details.author,
+                            "files": details.files.len(),
+                        }),
+                    ),
+                    Err(e) => error_response(&id, code_for(&e), e.to_string()),
+                },
                 Err(e) => error_response(&id, code_for(&e), e.to_string()),
             }
         }
@@ -159,31 +168,64 @@ async fn handle(onera: &Onera, request: Request) -> Response {
             };
 
             let Some(file) = chosen else {
-                return error_response(
-                    &id,
-                    ErrorCode::SelectionRequired,
-                    format!(
-                        "{} offers {} downloadable files; choose one in Onera",
-                        details.name,
-                        details.selectable_files().count()
+                if file_id.is_some() || details.selectable_files().count() == 0 {
+                    return error_response(
+                        &id,
+                        ErrorCode::SelectionRequired,
+                        format!(
+                            "{} does not offer that downloadable file; choose one in Onera",
+                            details.name
+                        ),
+                    );
+                }
+                return match onera
+                    .enqueue_download_selection_request(
+                        game_domain,
+                        ProviderModId::new(mod_id),
+                        should_install,
+                    )
+                    .await
+                {
+                    Ok(request) => ok_response(
+                        &id,
+                        serde_json::json!({
+                            "queued": true,
+                            "request_id": request.id.to_string(),
+                            "mod_id": details.mod_id.to_string(),
+                            "name": details.name,
+                            "selection_required": true,
+                            "install": should_install,
+                        }),
                     ),
-                );
+                    Err(e) => error_response(&id, code_for(&e), e.to_string()),
+                };
             };
 
-            // The heavy work is handed to the desktop application rather than
-            // done inline: Native Messaging has no way to stream progress back
-            // to a popup that may close at any moment.
-            ok_response(
-                &id,
-                serde_json::json!({
-                    "queued": true,
-                    "mod_id": details.mod_id.to_string(),
-                    "name": details.name,
-                    "file_id": file.provider_file_id.as_str(),
-                    "file_name": file.name,
-                    "install": should_install,
-                }),
-            )
+            // The durable inbox is the handoff: the popup may close and this
+            // short-lived host process may exit without losing the request.
+            match onera
+                .enqueue_download_request(
+                    game_domain,
+                    ProviderModId::new(mod_id),
+                    file.provider_file_id.clone(),
+                    should_install,
+                )
+                .await
+            {
+                Ok(request) => ok_response(
+                    &id,
+                    serde_json::json!({
+                        "queued": true,
+                        "request_id": request.id.to_string(),
+                        "mod_id": details.mod_id.to_string(),
+                        "name": details.name,
+                        "file_id": file.provider_file_id.as_str(),
+                        "file_name": file.name,
+                        "install": should_install,
+                    }),
+                ),
+                Err(e) => error_response(&id, code_for(&e), e.to_string()),
+            }
         }
     }
 }

@@ -1,8 +1,9 @@
 //! Integration tests for the persistence ports.
 
+use onera_core::domain::download::{DownloadJob, JobState};
 use onera_core::domain::operation::{OperationKind, OperationState};
 use onera_core::domain::provider_stack::{FileProvider, ProviderStack, StackEntry};
-use onera_core::domain::release::{Mod, Release};
+use onera_core::domain::release::{FileCategory, Mod, ProviderFile, Release};
 use onera_core::hash::FileHash;
 use onera_core::ids::*;
 use onera_core::plan::{
@@ -13,6 +14,7 @@ use onera_core::ports::{
 };
 use onera_core::RelPath;
 use onera_db::backup::FileBackupStore;
+use onera_db::jobs::{InboxRequest, InboxRequestKind, InboxState};
 use onera_db::Database;
 
 /// Insert the provider/game/mod/release/archive rows every deployment test
@@ -22,6 +24,7 @@ struct Fixture {
     game: LocalGameId,
     mod_id: ModId,
     release: ReleaseId,
+    provider_file: ProviderFileId,
     archive: ArchiveId,
 }
 
@@ -72,6 +75,21 @@ async fn fixture() -> Fixture {
     };
     let release = db.upsert_release(&r).await.unwrap();
 
+    let provider_file = ProviderFileId::new("9001");
+    db.upsert_provider_file(&ProviderFile {
+        provider: provider.clone(),
+        provider_file_id: provider_file.clone(),
+        release_id: release,
+        name: "cet-1.2.3.zip".into(),
+        size_bytes: Some(13),
+        category: FileCategory::Main,
+        published_hash: None,
+        uploaded_at: r.published_at,
+        is_primary: true,
+    })
+    .await
+    .unwrap();
+
     let archive = db
         .upsert_archive(
             &FileHash::blake3_of(b"archive bytes"),
@@ -88,8 +106,92 @@ async fn fixture() -> Fixture {
         game: local,
         mod_id,
         release,
+        provider_file,
         archive,
     }
+}
+
+#[tokio::test]
+async fn download_jobs_survive_restart_state_changes() {
+    let f = fixture().await;
+    let mut job = DownloadJob::queued(
+        ProviderId::nexus(),
+        "cyberpunk2077".into(),
+        ProviderModId::new("107"),
+        f.provider_file.clone(),
+        "cet-1.2.3.zip".into(),
+        Some(13),
+        "/data/downloads/job.part".into(),
+    );
+    job.bytes_downloaded = 7;
+    job.state = JobState::Running;
+    f.db.put_download_job(&job).await.unwrap();
+
+    let resumable = f.db.resumable_download_jobs().await.unwrap();
+    assert_eq!(resumable, vec![job.clone()]);
+
+    job.state = JobState::Complete;
+    job.bytes_downloaded = 13;
+    job.archive_id = Some(f.archive);
+    f.db.put_download_job(&job).await.unwrap();
+
+    assert!(f.db.resumable_download_jobs().await.unwrap().is_empty());
+    assert_eq!(
+        f.db.completed_download(&ProviderId::nexus(), &f.provider_file)
+            .await
+            .unwrap(),
+        Some(job)
+    );
+}
+
+#[tokio::test]
+async fn browser_inbox_exposes_only_actionable_requests() {
+    let f = fixture().await;
+    let mut request = InboxRequest::queued(
+        InboxRequestKind::DownloadAndInstall,
+        "cyberpunk2077".into(),
+        ProviderModId::new("107"),
+        Some(f.provider_file.clone()),
+    );
+    request.state = InboxState::WaitingForUser;
+    f.db.put_inbox_request(&request).await.unwrap();
+
+    let queued = f.db.inbox_requests().await.unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, request.id);
+    assert_eq!(queued[0].kind, InboxRequestKind::DownloadAndInstall);
+    assert_eq!(queued[0].state, InboxState::WaitingForUser);
+
+    f.db.set_inbox_state(request.id, InboxState::Complete, None)
+        .await
+        .unwrap();
+    assert!(f.db.inbox_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn installed_mods_and_provider_archives_are_queryable() {
+    let f = fixture().await;
+    let installation = InstallationId::new();
+    f.db.record_installation(installation, f.game, f.mod_id, f.release, f.archive)
+        .await
+        .unwrap();
+    f.db.link_archive_provider_file(f.archive, &ProviderId::nexus(), &f.provider_file)
+        .await
+        .unwrap();
+
+    let installed = f.db.installed_mods(f.game).await.unwrap();
+    assert_eq!(installed.len(), 1);
+    assert_eq!(installed[0].installation_id, installation);
+    assert_eq!(installed[0].name, "Cyber Engine Tweaks");
+    assert_eq!(installed[0].version, "1.2.3");
+
+    let stored =
+        f.db.archive_for_provider_file(&ProviderId::nexus(), &f.provider_file)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(stored.id, f.archive);
+    assert_eq!(stored.size, 13);
 }
 
 fn target(path: &str) -> TargetLocation {

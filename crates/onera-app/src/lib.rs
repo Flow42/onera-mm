@@ -15,6 +15,8 @@ pub mod logging;
 pub mod paths;
 pub mod secrets;
 
-pub use flow::{InstallRequest, Onera, PreparedInstall};
+pub use flow::{
+    DownloadRequest, DownloadedArchive, InstallRequest, InstalledModInfo, Onera, PreparedInstall,
+};
 pub use paths::Paths;
 pub use secrets::{InMemorySecretStore, KeyringSecretStore};

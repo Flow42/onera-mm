@@ -6,27 +6,40 @@
   let games = $state<LocalGame[]>([]);
   let updates = $state<InstalledMod[]>([]);
   let checking = $state(false);
+  let error = $state<string | null>(null);
 
   async function check() {
     checking = true;
+    error = null;
     try {
       const results = await Promise.all(games.map((g) => commands.checkUpdates(g.id)));
       updates = results.flat().filter((m) => m.update_available);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
     } finally {
       checking = false;
     }
   }
 
   onMount(async () => {
-    games = await commands.localGames();
-    await check();
+    try {
+      games = await commands.localGames();
+      await check();
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
   });
 </script>
 
 <h1>Updates</h1>
 <p><button onclick={check} disabled={checking}>{checking ? 'Checking…' : 'Check again'}</button></p>
+{#if error !== null}<p class="error" role="alert">
+    {error} You can retry when the provider is reachable.
+  </p>{/if}
 
-{#if updates.length === 0}
+{#if checking}
+  <p class="muted">Checking installed mods…</p>
+{:else if error === null && updates.length === 0}
   <p class="muted">Everything is up to date.</p>
 {:else}
   <table>

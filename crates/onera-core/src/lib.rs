@@ -32,7 +32,7 @@ pub use error::{CoreError, Result};
 pub use hash::{FileHash, HashAlgorithm};
 pub use ids::{
     AccountId, ArchiveId, BackupId, ConflictId, DeployedFileId, DownloadJobId, GameId,
-    InstallationId, LocalGameId, ModId, OperationId, ProviderFileId, ProviderId, ProviderModId,
-    ReleaseId,
+    InboxRequestId, InstallationId, LocalGameId, ModId, OperationId, ProviderFileId, ProviderId,
+    ProviderModId, ReleaseId,
 };
 pub use paths::{DeployRootKind, RelPath, RelPathError};

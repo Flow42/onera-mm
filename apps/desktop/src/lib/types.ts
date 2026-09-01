@@ -12,6 +12,13 @@ export interface AccountInfo {
   email: string | null;
 }
 
+export interface StartupStatus {
+  authenticated: boolean;
+  recovery_required: boolean;
+  inbox_count: number;
+  expired_plans: number;
+}
+
 export interface DiscoveredGame {
   adapter_id: string;
   provider_slug: string | null;
@@ -87,6 +94,41 @@ export interface InstalledMod {
   installed_at: string;
   update_available: boolean;
   latest_version: string | null;
+}
+
+export interface InboxRequest {
+  id: string;
+  kind: 'add_mod' | 'download' | 'download_and_install';
+  provider: string;
+  game_slug: string;
+  provider_mod_id: string;
+  provider_file_id: string | null;
+  state: 'queued' | 'waiting_for_user' | 'failed';
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DownloadJob {
+  id: string;
+  provider: string;
+  game_slug: string;
+  provider_mod_id: string;
+  provider_file_id: string;
+  filename: string;
+  expected_size: number | null;
+  bytes_downloaded: number;
+  state: 'queued' | 'running' | 'paused' | 'complete' | 'failed' | 'cancelled';
+  attempts: number;
+  error: string | null;
+  archive_id: string | null;
+}
+
+export interface DownloadOutcome {
+  archive_id: string;
+  hash: string;
+  bytes: number;
+  deduplicated: boolean;
 }
 
 export interface VerifyReport {

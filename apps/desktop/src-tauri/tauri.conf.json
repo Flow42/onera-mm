@@ -36,7 +36,10 @@
         "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0", "p7zip-full"],
         "files": {
           "/usr/lib/onera/onera-nmhost": "../../../target/release/onera-nmhost",
-          "/usr/share/onera/native-messaging/com.onera.host.json": "../../../packaging/com.onera.host.json"
+          "/usr/share/onera/native-messaging/com.onera.host.json": "../../../packaging/com.onera.host.json",
+          "/etc/chromium/native-messaging-hosts/com.onera.host.json": "../../../packaging/com.onera.host.json",
+          "/etc/opt/chrome/native-messaging-hosts/com.onera.host.json": "../../../packaging/com.onera.host.json",
+          "/etc/brave/native-messaging-hosts/com.onera.host.json": "../../../packaging/com.onera.host.json"
         }
       }
     }

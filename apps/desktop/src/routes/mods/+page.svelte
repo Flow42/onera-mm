@@ -7,14 +7,18 @@
   let selected = $state<string | null>(null);
   let mods = $state<InstalledMod[]>([]);
   let error = $state<string | null>(null);
+  let loading = $state(true);
 
   async function load(gameId: string) {
     selected = gameId;
     error = null;
+    loading = true;
     try {
       mods = await commands.installedMods(gameId);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
+    } finally {
+      loading = false;
     }
   }
 
@@ -32,13 +36,24 @@
   }
 
   onMount(async () => {
-    games = await commands.localGames();
-    if (games[0] !== undefined) await load(games[0].id);
+    try {
+      games = await commands.localGames();
+      if (games[0] !== undefined) await load(games[0].id);
+      else loading = false;
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+      loading = false;
+    }
   });
 </script>
 
 <h1>Installed mods</h1>
-{#if error !== null}<p class="error" role="alert">{error}</p>{/if}
+<p><a href="/add">Add a mod</a></p>
+{#if error !== null}
+  <p class="error" role="alert">{error}</p>
+  {#if selected !== null}<button onclick={() => selected !== null && load(selected)}>Retry</button
+    >{/if}
+{/if}
 
 <p>
   {#each games as game (game.id)}
@@ -46,21 +61,26 @@
   {/each}
 </p>
 
-<table>
-  <thead><tr><th>Mod</th><th>Version</th><th>Installed</th><th></th></tr></thead>
-  <tbody>
-    {#each mods as mod (mod.installation_id)}
-      <tr>
-        <!-- The version is whatever the author published, shown verbatim. -->
-        <td>{mod.name}</td>
-        <td class="muted">{mod.version}</td>
-        <td class="muted">{mod.installed_at}</td>
-        <td>
-          <a href={`/verify?installation=${mod.installation_id}`}>Verify</a>
-          <button class="danger" onclick={() => remove(mod)}>Remove</button>
-        </td>
-      </tr>
-    {/each}
-  </tbody>
-</table>
-{#if mods.length === 0}<p class="muted">No mods installed for this game yet.</p>{/if}
+{#if loading}
+  <p class="muted">Loading installed mods…</p>
+{:else}<table>
+    <thead><tr><th>Mod</th><th>Version</th><th>Installed</th><th></th></tr></thead>
+    <tbody>
+      {#each mods as mod (mod.installation_id)}
+        <tr>
+          <!-- The version is whatever the author published, shown verbatim. -->
+          <td>{mod.name}</td>
+          <td class="muted">{mod.version}</td>
+          <td class="muted">{mod.installed_at}</td>
+          <td>
+            <a href={`/verify?game=${selected}&installation=${mod.installation_id}`}>Verify</a>
+            <a href={`/ownership?game=${selected}`}>Ownership</a>
+            <button class="danger" onclick={() => remove(mod)}>Remove</button>
+          </td>
+        </tr>
+      {/each}
+    </tbody>
+  </table>{/if}
+{#if !loading && error === null && mods.length === 0}<p class="muted">
+    No mods installed for this game yet.
+  </p>{/if}

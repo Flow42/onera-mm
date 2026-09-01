@@ -23,6 +23,7 @@ pub mod backup;
 pub mod catalog;
 pub mod convert;
 pub mod deployment;
+pub mod jobs;
 pub mod journal;
 
 use onera_core::{CoreError, Result};
@@ -36,7 +37,7 @@ use std::time::Duration;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The schema version this build understands.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// A pooled SQLite database.
 #[derive(Debug, Clone)]
@@ -171,6 +172,76 @@ mod tests {
                 .await
                 .unwrap();
         assert!(count > 15, "expected the full schema, found {count} tables");
+    }
+
+    #[tokio::test]
+    async fn version_one_database_migrates_without_losing_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("onera.sqlite3");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0001_initial.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let migration = MIGRATOR.iter().find(|item| item.version == 1).unwrap();
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations
+                (version, description, success, checksum, execution_time)
+             VALUES (?1, ?2, 1, ?3, 0)",
+        )
+        .bind(migration.version)
+        .bind(migration.description.as_ref())
+        .bind(migration.checksum.as_ref())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO providers (id, name, api_base, created_at) VALUES ('nexus', 'Nexus', 'https://example.invalid', '2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let db = Database::open(&path).await.unwrap();
+        let (version,): (String,) =
+            sqlx::query_as("SELECT value FROM schema_meta WHERE key = 'schema_version'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let (providers,): (i64,) = sqlx::query_as("SELECT count(*) FROM providers")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let columns: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM pragma_table_info('download_jobs')")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+        assert_eq!(providers, 1);
+        assert!(columns.iter().any(|(name,)| name == "game_slug"));
+        assert!(columns.iter().any(|(name,)| name == "provider_mod_id"));
     }
 
     #[tokio::test]

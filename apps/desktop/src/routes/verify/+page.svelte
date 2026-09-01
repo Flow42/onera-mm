@@ -10,6 +10,7 @@
   let error = $state<string | null>(null);
 
   const installation = $derived(page.url.searchParams.get('installation'));
+  const requestedGame = $derived(page.url.searchParams.get('game'));
 
   async function run(gameId: string) {
     if (installation === null) return;
@@ -26,7 +27,8 @@
 
   onMount(async () => {
     games = await commands.localGames();
-    if (games[0] !== undefined) await run(games[0].id);
+    const game = games.find((candidate) => candidate.id === requestedGame) ?? games[0];
+    if (game !== undefined) await run(game.id);
   });
 </script>
 

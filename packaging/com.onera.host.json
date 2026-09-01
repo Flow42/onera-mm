@@ -3,5 +3,5 @@
   "description": "Onera mod manager native messaging host",
   "path": "/usr/lib/onera/onera-nmhost",
   "type": "stdio",
-  "allowed_origins": ["chrome-extension://REPLACE_WITH_YOUR_EXTENSION_ID/"]
+  "allowed_origins": ["chrome-extension://pohiidkpoflhifciokepgpaandghjgmj/"]
 }

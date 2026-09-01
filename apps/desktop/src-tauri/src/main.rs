@@ -34,6 +34,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::startup_status,
             commands::is_authenticated,
             commands::set_api_key,
             commands::forget_api_key,
@@ -45,6 +46,12 @@ fn main() {
             commands::fetch_mod,
             commands::installed_mods,
             commands::check_updates,
+            commands::inbox_requests,
+            commands::dismiss_inbox_request,
+            commands::complete_inbox_request,
+            commands::downloads,
+            commands::download_file,
+            commands::resume_downloads,
             commands::prepare_install,
             commands::decide,
             commands::apply_plan,

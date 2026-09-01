@@ -8,11 +8,10 @@ what was there before, and nothing the user did not put there is ever
 overwritten without being asked. A power cut in the middle of an install leaves
 a recoverable state, not a broken game.
 
-> **Status: early.** The core — archive safety, planning, the transactional
-> installer, provider history, recovery, the Nexus client, downloads — is
-> implemented and covered by tests. The desktop UI is wired end to end but
-> several list views still return empty data from the backend; see
-> [Known gaps](#known-gaps).
+> **Status: early but end-to-end usable.** The first product milestone is
+> complete: archive safety, planning, transactional installation, provider
+> history, recovery, persistent/resumable downloads, browser handoff, and the
+> primary desktop views are implemented and covered by tests.
 
 ## Why another mod manager
 
@@ -96,15 +95,12 @@ the extension. See [`docs/architecture.md`](docs/architecture.md).
 
 ## Known gaps
 
-Honest list of what is scaffolded rather than finished:
+The next milestones are deliberately still open:
 
-- `installed_mods` and `check_updates` Tauri commands return empty lists; the
-  underlying data is in the database but the read queries are not written.
-- The Native Messaging host acknowledges `download` and `download_and_install`
-  and returns the resolved file, but hands the actual work to the desktop
-  application rather than performing it inline.
-- Download jobs are modelled and persisted in the schema, but restart-time
-  resumption is not yet wired into startup.
+- Profiles, dependency solving, and clean game baselines are designed but not
+  implemented; see the implementation plan.
+- Update checks report newer same-lineage releases, but compatible bulk update
+  and dependency-aware update actions belong to the dependency milestone.
 - Only Cyberpunk 2077 has a game adapter.
 - The RAR path is implemented but untested against real RAR archives.
 

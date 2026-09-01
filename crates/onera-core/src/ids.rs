@@ -138,6 +138,10 @@ uuid_id!(
     DownloadJobId
 );
 uuid_id!(
+    /// A request received from the browser extension.
+    InboxRequestId
+);
+uuid_id!(
     /// A provider account (e.g. a signed-in Nexus user).
     AccountId
 );

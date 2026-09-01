@@ -184,6 +184,14 @@ a fresh database.
 
 **Purpose:** provide a dependable user journey before adding more state models.
 
+**Status: complete (2026-09-02).** Schema v2 adds durable browser requests and
+the context needed to resume downloads. The desktop now uses real Installed,
+Updates, Downloads, Add Mod, verification, removal, ownership, and recovery
+flows. Startup resumes partial downloads, routes journal recovery first, and
+expires abandoned previews with an explicit message. The release configuration
+uses a stable extension identity, installs `.deb` host manifests, and ships the
+CLI/host companions needed for AppImage per-user setup.
+
 ### Backend
 
 - Implement `installed_mods` from installations, releases, mods, and active state.

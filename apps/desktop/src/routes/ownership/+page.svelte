@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { page } from '$app/state';
   import { commands } from '$lib/bridge';
   import type { LocalGame, ProviderStackView } from '$lib/types';
   import { onMount } from 'svelte';
@@ -21,7 +22,8 @@
 
   onMount(async () => {
     games = await commands.localGames();
-    gameId = games[0]?.id ?? '';
+    const requested = page.url.searchParams.get('game');
+    gameId = games.find((game) => game.id === requested)?.id ?? games[0]?.id ?? '';
   });
 </script>
 

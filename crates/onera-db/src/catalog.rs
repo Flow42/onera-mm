@@ -18,6 +18,42 @@ use onera_core::{CoreError, Result};
 use sqlx::Row as _;
 use std::path::PathBuf;
 
+/// Installed-mod data required by application list and update flows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledModRecord {
+    /// Concrete installation.
+    pub installation_id: onera_core::ids::InstallationId,
+    /// Mod lineage.
+    pub mod_id: ModId,
+    /// Provider that owns the external identifiers.
+    pub provider: ProviderId,
+    /// Provider game slug.
+    pub game_slug: String,
+    /// Provider mod identifier.
+    pub provider_mod_id: ProviderModId,
+    /// Cached display name.
+    pub name: String,
+    /// Installed version, verbatim.
+    pub version: String,
+    /// Provider publication time used for same-mod ordering.
+    pub published_at: Option<DateTime<Utc>>,
+    /// Installation time.
+    pub installed_at: DateTime<Utc>,
+}
+
+/// A content-addressed archive already associated with a provider file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredArchive {
+    /// Archive database identity.
+    pub id: ArchiveId,
+    /// BLAKE3 content hash.
+    pub hash: FileHash,
+    /// Stored path.
+    pub path: PathBuf,
+    /// Archive size.
+    pub size: u64,
+}
+
 fn source_str(s: InstallSource) -> &'static str {
     match s {
         InstallSource::SteamNative => "steam_native",
@@ -62,6 +98,52 @@ fn parse_category(s: &str) -> FileCategory {
 }
 
 impl Database {
+    /// Installed mods for one local game, newest installation first.
+    ///
+    /// # Errors
+    /// Propagates database and stored-value conversion errors.
+    pub async fn installed_mods(&self, game: LocalGameId) -> Result<Vec<InstalledModRecord>> {
+        let rows = sqlx::query(
+            "SELECT i.id AS installation_id, i.mod_id, i.installed_at,
+                    m.provider_id, m.game_slug, m.provider_mod_id, m.name,
+                    r.version, r.published_at
+             FROM installations i
+             JOIN mods m ON m.id = i.mod_id
+             JOIN releases r ON r.id = i.release_id
+             WHERE i.local_game_id = ?1 AND i.state = 'installed'
+             ORDER BY i.installed_at DESC, m.name",
+        )
+        .bind(game.to_string())
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+
+        rows.into_iter()
+            .map(|row| {
+                let installation: String = row.try_get("installation_id").map_err(db_err)?;
+                let mod_id: String = row.try_get("mod_id").map_err(db_err)?;
+                let installed: String = row.try_get("installed_at").map_err(db_err)?;
+                let published: Option<String> = row.try_get("published_at").map_err(db_err)?;
+                Ok(InstalledModRecord {
+                    installation_id: onera_core::ids::InstallationId::from(uuid(&installation)?),
+                    mod_id: ModId::from(uuid(&mod_id)?),
+                    provider: ProviderId::new(
+                        row.try_get::<String, _>("provider_id").map_err(db_err)?,
+                    ),
+                    game_slug: row.try_get("game_slug").map_err(db_err)?,
+                    provider_mod_id: ProviderModId::new(
+                        row.try_get::<String, _>("provider_mod_id")
+                            .map_err(db_err)?,
+                    ),
+                    name: row.try_get("name").map_err(db_err)?,
+                    version: row.try_get("version").map_err(db_err)?,
+                    published_at: published.map(|value| from_timestamp(&value)).transpose()?,
+                    installed_at: from_timestamp(&installed)?,
+                })
+            })
+            .collect()
+    }
+
     /// Register a provider, or update its display name and base URL.
     ///
     /// # Errors
@@ -507,6 +589,79 @@ impl Database {
         .await
         .map_err(db_err)?;
         Ok(id)
+    }
+
+    /// Associate a stored archive with the provider file it satisfies.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn link_archive_provider_file(
+        &self,
+        archive: ArchiveId,
+        provider: &ProviderId,
+        provider_file: &ProviderFileId,
+    ) -> Result<()> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM provider_files
+             WHERE provider_id = ?1 AND provider_file_id = ?2",
+        )
+        .bind(provider.as_str())
+        .bind(provider_file.as_str())
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        let Some((stored_file_id,)) = row else {
+            return Err(CoreError::NotFound {
+                kind: "provider file",
+                id: provider_file.to_string(),
+            });
+        };
+        sqlx::query(
+            "INSERT INTO archive_provider_files (archive_id, provider_file_id)
+             VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+        )
+        .bind(archive.to_string())
+        .bind(stored_file_id)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Find downloaded content previously associated with a provider file.
+    ///
+    /// # Errors
+    /// Propagates database and stored-value conversion errors.
+    pub async fn archive_for_provider_file(
+        &self,
+        provider: &ProviderId,
+        provider_file: &ProviderFileId,
+    ) -> Result<Option<StoredArchive>> {
+        let row = sqlx::query(
+            "SELECT a.id, a.hash, a.stored_path, a.size
+             FROM archives a
+             JOIN archive_provider_files apf ON apf.archive_id = a.id
+             JOIN provider_files pf ON pf.id = apf.provider_file_id
+             WHERE pf.provider_id = ?1 AND pf.provider_file_id = ?2
+             ORDER BY a.created_at DESC LIMIT 1",
+        )
+        .bind(provider.as_str())
+        .bind(provider_file.as_str())
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        row.map(|row| {
+            let id: String = row.try_get("id").map_err(db_err)?;
+            let stored_hash: String = row.try_get("hash").map_err(db_err)?;
+            let size: i64 = row.try_get("size").map_err(db_err)?;
+            Ok(StoredArchive {
+                id: ArchiveId::from(uuid(&id)?),
+                hash: crate::convert::hash(&stored_hash)?,
+                path: PathBuf::from(row.try_get::<String, _>("stored_path").map_err(db_err)?),
+                size: size.max(0) as u64,
+            })
+        })
+        .transpose()
     }
 
     /// Record the manifest of an extracted archive.

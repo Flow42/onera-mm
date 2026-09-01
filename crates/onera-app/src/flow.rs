@@ -17,8 +17,8 @@ use onera_core::domain::game::{Game, LocalGameInstall};
 use onera_core::domain::release::{ProviderFile, Release};
 use onera_core::hash::FileHash;
 use onera_core::ids::{
-    ArchiveId, InstallationId, LocalGameId, ModId, ProviderFileId, ProviderId, ProviderModId,
-    ReleaseId,
+    ArchiveId, InboxRequestId, InstallationId, LocalGameId, ModId, ProviderFileId, ProviderId,
+    ProviderModId, ReleaseId,
 };
 use onera_core::plan::{InstallPlan, ScopedRule, TargetLocation};
 use onera_core::ports::{
@@ -29,9 +29,10 @@ use onera_core::progress::{CancelToken, ProgressSink};
 use onera_core::redact::Secret;
 use onera_core::{CoreError, Result};
 use onera_db::backup::FileBackupStore;
+use onera_db::jobs::{InboxRequest, InboxRequestKind, InboxState};
 use onera_db::Database;
 use onera_discovery::DiscoveredGame;
-use onera_download::{ContentAddressedStore, DownloadConfig, Downloader};
+use onera_download::{ContentAddressedStore, DownloadConfig, DownloadJob, Downloader, JobState};
 use onera_install::planner::{plan_install, PlanRequest, RootMap};
 use onera_install::remove::{ModifiedFilePolicy, RemovalReport, Remover};
 use onera_install::{
@@ -60,6 +61,8 @@ pub struct Onera {
     installer: Arc<Installer>,
     remover: Arc<Remover>,
     locks: GameLocks,
+    download_lock: tokio::sync::Mutex<()>,
+    expired_prepared_plans: u64,
 }
 
 impl Onera {
@@ -121,6 +124,7 @@ impl Onera {
         allow_plain_http: bool,
     ) -> Result<Self> {
         paths.ensure().await?;
+        let expired_prepared_plans = cleanup_expired_staging(&paths).await?;
         let db = Database::open(&paths.database()).await?;
         db.upsert_provider(
             &ProviderId::nexus(),
@@ -160,6 +164,8 @@ impl Onera {
             )),
             remover: Arc::new(Remover::new(fs, Arc::new(db.clone()), backups)),
             locks: GameLocks::new(),
+            download_lock: tokio::sync::Mutex::new(()),
+            expired_prepared_plans,
             paths,
         })
     }
@@ -168,6 +174,12 @@ impl Onera {
     #[must_use]
     pub fn database(&self) -> &Database {
         &self.db
+    }
+
+    /// Number of abandoned preparation directories removed during startup.
+    #[must_use]
+    pub const fn expired_prepared_plans(&self) -> u64 {
+        self.expired_prepared_plans
     }
 
     // -----------------------------------------------------------------------
@@ -326,6 +338,74 @@ impl Onera {
         self.db.local_installs().await
     }
 
+    /// Installed mods for one local game.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn installed_mods(&self, game: LocalGameId) -> Result<Vec<InstalledModInfo>> {
+        Ok(self
+            .db
+            .installed_mods(game)
+            .await?
+            .into_iter()
+            .map(|record| InstalledModInfo {
+                installation_id: record.installation_id,
+                mod_id: record.mod_id,
+                name: record.name,
+                version: record.version,
+                installed_at: record.installed_at,
+                update_available: false,
+                latest_version: None,
+            })
+            .collect())
+    }
+
+    /// Refresh installed mods and report newer releases from the same lineage.
+    ///
+    /// Version strings remain display-only; publication timestamps determine
+    /// ordering, just as they do everywhere else in Onera.
+    ///
+    /// # Errors
+    /// Propagates provider or database errors.
+    pub async fn check_updates(
+        &self,
+        game: LocalGameId,
+        cancel: &CancelToken,
+    ) -> Result<Vec<InstalledModInfo>> {
+        let records = self.db.installed_mods(game).await?;
+        let mut result = Vec::with_capacity(records.len());
+        for record in records {
+            cancel.check()?;
+            let details = self
+                .fetch_mod(&record.game_slug, &record.provider_mod_id, cancel)
+                .await?;
+            let latest = details
+                .releases
+                .iter()
+                .filter(|release| release.published_at.is_some())
+                .max_by_key(|release| release.published_at);
+            let update_available = match (record.published_at, latest.and_then(|r| r.published_at))
+            {
+                (Some(installed), Some(available)) => available > installed,
+                _ => false,
+            };
+            result.push(InstalledModInfo {
+                installation_id: record.installation_id,
+                mod_id: record.mod_id,
+                name: record.name,
+                version: record.version,
+                installed_at: record.installed_at,
+                update_available,
+                latest_version: if update_available {
+                    latest.map(|release| release.version.clone())
+                } else {
+                    None
+                },
+            });
+        }
+        Ok(result)
+    }
+
     /// Resolve a game's deployment roots through its adapter.
     ///
     /// # Errors
@@ -421,6 +501,312 @@ impl Onera {
     }
 
     // -----------------------------------------------------------------------
+    // Browser inbox and downloads
+    // -----------------------------------------------------------------------
+
+    /// Persist a browser-extension request for the desktop application.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn enqueue_browser_request(
+        &self,
+        kind: InboxRequestKind,
+        game_slug: String,
+        provider_mod_id: ProviderModId,
+        provider_file_id: Option<ProviderFileId>,
+    ) -> Result<InboxRequest> {
+        let request = InboxRequest::queued(kind, game_slug, provider_mod_id, provider_file_id);
+        self.db.put_inbox_request(&request).await?;
+        Ok(request)
+    }
+
+    /// Queue an Add Mod request from the browser.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn enqueue_add_mod(
+        &self,
+        game_slug: String,
+        provider_mod_id: ProviderModId,
+    ) -> Result<InboxRequest> {
+        self.enqueue_browser_request(InboxRequestKind::AddMod, game_slug, provider_mod_id, None)
+            .await
+    }
+
+    /// Queue a browser download, optionally continuing into installation.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn enqueue_download_request(
+        &self,
+        game_slug: String,
+        provider_mod_id: ProviderModId,
+        provider_file_id: ProviderFileId,
+        install: bool,
+    ) -> Result<InboxRequest> {
+        self.enqueue_browser_request(
+            if install {
+                InboxRequestKind::DownloadAndInstall
+            } else {
+                InboxRequestKind::Download
+            },
+            game_slug,
+            provider_mod_id,
+            Some(provider_file_id),
+        )
+        .await
+    }
+
+    /// Queue a browser action that needs desktop file selection first.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn enqueue_download_selection_request(
+        &self,
+        game_slug: String,
+        provider_mod_id: ProviderModId,
+        install: bool,
+    ) -> Result<InboxRequest> {
+        let mut request = InboxRequest::queued(
+            if install {
+                InboxRequestKind::DownloadAndInstall
+            } else {
+                InboxRequestKind::Download
+            },
+            game_slug,
+            provider_mod_id,
+            None,
+        );
+        request.state = InboxState::WaitingForUser;
+        self.db.put_inbox_request(&request).await?;
+        Ok(request)
+    }
+
+    /// Actionable requests received from the browser extension.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn inbox_requests(&self) -> Result<Vec<InboxRequest>> {
+        self.db.inbox_requests().await
+    }
+
+    /// Mark a browser request complete or dismissed.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn set_inbox_state(&self, id: InboxRequestId, state: InboxState) -> Result<()> {
+        self.db.set_inbox_state(id, state, None).await
+    }
+
+    /// Dismiss an actionable browser request.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn dismiss_inbox_request(&self, id: InboxRequestId) -> Result<()> {
+        self.set_inbox_state(id, InboxState::Dismissed).await
+    }
+
+    /// Mark a browser request as successfully handed off.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn complete_inbox_request(&self, id: InboxRequestId) -> Result<()> {
+        self.set_inbox_state(id, InboxState::Complete).await
+    }
+
+    /// Every persisted download, with byte counts refreshed from partial files.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn downloads(&self) -> Result<Vec<DownloadJob>> {
+        let mut jobs = self.db.download_jobs().await?;
+        for job in &mut jobs {
+            if job.state.is_active() {
+                if let Ok(metadata) = tokio::fs::metadata(&job.temp_path).await {
+                    job.bytes_downloaded = metadata.len();
+                    self.db.put_download_job(job).await?;
+                }
+            }
+        }
+        Ok(jobs)
+    }
+
+    /// Download and safety-inspect a provider file into archive storage.
+    ///
+    /// A previously associated archive is reused without a network call.
+    ///
+    /// # Errors
+    /// Propagates provider, download, archive, and database errors.
+    pub async fn download(
+        &self,
+        request: &DownloadRequest,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<DownloadedArchive> {
+        let _guard = self.download_lock.lock().await;
+        if let Some(stored) = self
+            .db
+            .archive_for_provider_file(&ProviderId::nexus(), &request.provider_file_id)
+            .await?
+        {
+            if stored.path.is_file() {
+                return Ok(DownloadedArchive {
+                    archive_id: stored.id,
+                    path: stored.path,
+                    hash: stored.hash,
+                    bytes: stored.size,
+                    deduplicated: true,
+                });
+            }
+        }
+
+        if let Some(job) = self
+            .db
+            .resumable_download_jobs()
+            .await?
+            .into_iter()
+            .find(|job| {
+                job.provider == ProviderId::nexus()
+                    && job.provider_file_id == request.provider_file_id
+            })
+        {
+            return self.run_download_job(job, progress, cancel, false).await;
+        }
+
+        let mut job = DownloadJob::queued(
+            ProviderId::nexus(),
+            request.game_slug.clone(),
+            request.provider_mod_id.clone(),
+            request.provider_file_id.clone(),
+            request.filename.clone(),
+            request.expected_size,
+            PathBuf::new(),
+        );
+        job.temp_path = self.paths.downloads().join(format!("{}.part", job.id));
+        job.expected_hash = trusted_provider_hash(request.expected_hash.as_ref()).cloned();
+        self.db.put_download_job(&job).await?;
+        self.run_download_job(job, progress, cancel, false).await
+    }
+
+    /// Resume all downloads left active by an earlier process.
+    ///
+    /// Individual failures are recorded on their jobs and do not prevent other
+    /// jobs from resuming.
+    ///
+    /// # Errors
+    /// Fails only when the job list itself cannot be read.
+    pub async fn resume_downloads(
+        &self,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        let _guard = self.download_lock.lock().await;
+        for job in self.db.resumable_download_jobs().await? {
+            if cancel.is_cancelled() {
+                break;
+            }
+            if let Err(error) = self.run_download_job(job, progress, cancel, true).await {
+                tracing::warn!(error = %error, "could not resume download");
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_download_job(
+        &self,
+        mut job: DownloadJob,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+        keep_resumable_on_error: bool,
+    ) -> Result<DownloadedArchive> {
+        job.state = JobState::Running;
+        job.attempts = job.attempts.saturating_add(1);
+        job.error = None;
+        if let Ok(metadata) = tokio::fs::metadata(&job.temp_path).await {
+            job.bytes_downloaded = metadata.len();
+        }
+        self.db.put_download_job(&job).await?;
+
+        let result = async {
+            let target = self
+                .provider
+                .resolve_download(
+                    &job.game_slug,
+                    &job.provider_mod_id,
+                    &job.provider_file_id,
+                    cancel,
+                )
+                .await?;
+            let outcome = self
+                .downloader
+                .fetch_resumable(
+                    &target,
+                    job.expected_hash.as_ref(),
+                    &job.temp_path,
+                    progress,
+                    cancel,
+                )
+                .await?;
+            let inspection = self.archives.inspect(&outcome.path, cancel).await?;
+            let archive_size = if outcome.deduplicated {
+                tokio::fs::metadata(&outcome.path)
+                    .await
+                    .map_err(|error| CoreError::fs(&outcome.path, error))?
+                    .len()
+            } else {
+                outcome.bytes
+            };
+            let archive_id = self
+                .db
+                .upsert_archive(
+                    &outcome.hash,
+                    archive_size,
+                    &job.filename,
+                    inspection.format,
+                    &outcome.path,
+                )
+                .await?;
+            self.db
+                .link_archive_provider_file(archive_id, &job.provider, &job.provider_file_id)
+                .await?;
+            Ok::<_, CoreError>((outcome, archive_id, archive_size))
+        }
+        .await;
+
+        match result {
+            Ok((outcome, archive_id, archive_size)) => {
+                job.state = JobState::Complete;
+                job.bytes_downloaded = archive_size;
+                job.archive_id = Some(archive_id);
+                job.error = None;
+                self.db.put_download_job(&job).await?;
+                Ok(DownloadedArchive {
+                    archive_id,
+                    path: outcome.path,
+                    hash: outcome.hash,
+                    bytes: archive_size,
+                    deduplicated: outcome.deduplicated,
+                })
+            }
+            Err(error) => {
+                job.bytes_downloaded = tokio::fs::metadata(&job.temp_path)
+                    .await
+                    .map_or(0, |metadata| metadata.len());
+                job.state = if matches!(error, CoreError::Cancelled) {
+                    JobState::Cancelled
+                } else if keep_resumable_on_error || error.is_retryable() {
+                    JobState::Paused
+                } else {
+                    JobState::Failed
+                };
+                job.error = Some(error.to_string());
+                self.db.put_download_job(&job).await?;
+                Err(error)
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Install
     // -----------------------------------------------------------------------
 
@@ -444,18 +830,19 @@ impl Onera {
         let (roots, adapter) = self.roots_for(request.local_game_id).await?;
 
         // 1. Download (or reuse a stored archive).
-        let target = self
-            .provider
-            .resolve_download(
-                &request.game_slug,
-                &request.provider_mod_id,
-                &request.provider_file_id,
+        let outcome = self
+            .download(
+                &DownloadRequest {
+                    game_slug: request.game_slug.clone(),
+                    provider_mod_id: request.provider_mod_id.clone(),
+                    provider_file_id: request.provider_file_id.clone(),
+                    filename: request.filename.clone(),
+                    expected_size: request.expected_size,
+                    expected_hash: request.expected_hash.clone(),
+                },
+                progress,
                 cancel,
             )
-            .await?;
-        let outcome = self
-            .downloader
-            .fetch(&target, request.expected_hash.as_ref(), progress, cancel)
             .await?;
 
         // 2. Inspect before extracting.
@@ -474,16 +861,7 @@ impl Onera {
             .extract(&outcome.path, &staging, progress, cancel)
             .await?;
 
-        let archive_id = self
-            .db
-            .upsert_archive(
-                &outcome.hash,
-                outcome.bytes,
-                &request.filename,
-                manifest.format,
-                &outcome.path,
-            )
-            .await?;
+        let archive_id = outcome.archive_id;
         self.db
             .record_archive_entries(archive_id, &manifest)
             .await?;
@@ -665,6 +1043,39 @@ impl Onera {
     }
 }
 
+async fn cleanup_expired_staging(paths: &crate::Paths) -> Result<u64> {
+    let mut entries = match tokio::fs::read_dir(paths.staging()).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(CoreError::fs(paths.staging(), error)),
+    };
+    let mut removed = 0;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| CoreError::fs(paths.staging(), error))?
+    {
+        let path = entry.path();
+        let result = if entry
+            .file_type()
+            .await
+            .map_err(|error| CoreError::fs(&path, error))?
+            .is_dir()
+        {
+            tokio::fs::remove_dir_all(&path).await
+        } else {
+            tokio::fs::remove_file(&path).await
+        };
+        result.map_err(|error| CoreError::fs(&path, error))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn trusted_provider_hash(hash: Option<&FileHash>) -> Option<&FileHash> {
+    hash.filter(|value| value.algorithm == onera_core::hash::HashAlgorithm::Blake3)
+}
+
 /// Everything needed to install one file.
 #[derive(Debug, Clone)]
 pub struct InstallRequest {
@@ -682,8 +1093,61 @@ pub struct InstallRequest {
     pub provider_file_id: ProviderFileId,
     /// Filename, for display and for the archive record.
     pub filename: String,
+    /// Size published by the provider, when known.
+    pub expected_size: Option<u64>,
     /// Hash to check against, when the provider published one.
     pub expected_hash: Option<FileHash>,
+}
+
+/// Provider file to download independently of an installation plan.
+#[derive(Debug, Clone)]
+pub struct DownloadRequest {
+    /// Provider game slug.
+    pub game_slug: String,
+    /// Provider mod identifier.
+    pub provider_mod_id: ProviderModId,
+    /// Provider file identifier.
+    pub provider_file_id: ProviderFileId,
+    /// Display filename.
+    pub filename: String,
+    /// Expected size, when published.
+    pub expected_size: Option<u64>,
+    /// Provider hash metadata. Only trusted algorithms drive integrity checks.
+    pub expected_hash: Option<FileHash>,
+}
+
+/// Result of a completed, inspected download.
+#[derive(Debug, Clone)]
+pub struct DownloadedArchive {
+    /// Stored archive identity.
+    pub archive_id: ArchiveId,
+    /// Content-addressed path.
+    pub path: PathBuf,
+    /// Computed BLAKE3 hash.
+    pub hash: FileHash,
+    /// Total archive bytes.
+    pub bytes: u64,
+    /// Whether existing stored content avoided a network transfer.
+    pub deduplicated: bool,
+}
+
+/// Installed-mod row used by desktop and CLI list/update views.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InstalledModInfo {
+    /// Concrete installation identity.
+    pub installation_id: InstallationId,
+    /// Mod lineage identity.
+    pub mod_id: ModId,
+    /// Cached display name.
+    pub name: String,
+    /// Installed version exactly as published.
+    pub version: String,
+    /// Installation timestamp.
+    pub installed_at: chrono::DateTime<chrono::Utc>,
+    /// Whether a newer publication is available.
+    pub update_available: bool,
+    /// Newest available version, verbatim.
+    pub latest_version: Option<String>,
 }
 
 /// A downloaded, extracted, planned install that has not been applied.
@@ -828,5 +1292,27 @@ mod tests {
         let d = details(vec![file("archived.zip", FileCategory::Unknown, false)]);
         assert!(d.needs_file_selection());
         assert_eq!(d.selectable_files().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_expires_abandoned_preparation_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = crate::Paths::rooted_at(directory.path().to_path_buf());
+        paths.ensure().await.unwrap();
+        tokio::fs::create_dir_all(paths.staging().join("old-plan"))
+            .await
+            .unwrap();
+        tokio::fs::write(paths.staging().join("orphan"), b"stale")
+            .await
+            .unwrap();
+
+        assert_eq!(cleanup_expired_staging(&paths).await.unwrap(), 2);
+        assert!(tokio::fs::read_dir(paths.staging())
+            .await
+            .unwrap()
+            .next_entry()
+            .await
+            .unwrap()
+            .is_none());
     }
 }

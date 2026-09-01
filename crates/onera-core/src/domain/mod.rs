@@ -5,6 +5,7 @@
 //! that only the originating provider adapter interprets.
 
 pub mod archive;
+pub mod download;
 pub mod game;
 pub mod operation;
 pub mod provider_stack;

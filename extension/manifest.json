@@ -1,5 +1,6 @@
 {
   "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoV6xBUGTApvme1XShQeb/UlPfkJOpFGUv87pz2y4MroFPj8GobLyNKYhSkXocSzyyEhZB+vevFu/RycJupzHM4JohKcwA1+meQvnoSunG+bEK0tc9Iv4tb9JihXkn7rSJO0KYsFnINzs3P54cpadjumgjZXA7IY+bXOzZWQuSw7yjoCzKX+vx5thS2F94ZksRpvHyQd7k1X/jXWoJ7auYnSOqCN8NEy0DedhHPCThGQA9vrWtsPoPzimT3mRN7MHjiX8SEXnWqcX2W0LsnRvOh+dngvqydCj7GWNLIcgkxV8QnRiOzVkdZtJgWvFvvTy3l+T09bcGGa1m3sOObUzlQIDAQAB",
   "name": "Onera",
   "version": "0.1.0",
   "description": "Send mods from Nexus Mods to the Onera mod manager.",

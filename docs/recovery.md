@@ -4,7 +4,8 @@ What Onera does when something goes wrong, and how to check that it works.
 
 ## On every launch
 
-Onera reads back every operation whose state is not terminal. Each one is
+Onera reads back every operation whose state is not terminal before normal
+navigation. The desktop routes to Recovery first when one exists. Each one is
 presented with the choices its state allows — the state machine decides which,
 so recovery cannot offer something unsafe.
 
@@ -22,6 +23,13 @@ onera recover --rollback   # undo it all
 ```
 
 The desktop application shows the same list under **Recovery**.
+
+Download recovery is separate from the mutation journal. Queued, running, and
+paused jobs retain their partial file and resume in the background with a fresh
+provider URL. A transient startup failure leaves the job paused for another
+retry. Prepared install previews are intentionally not persisted: on restart,
+their staging directories are removed and the Add Mod screen explains that a
+fresh preview is required.
 
 ## What survives what
 

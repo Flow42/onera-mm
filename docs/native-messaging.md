@@ -17,7 +17,13 @@ Onera core
 ## Installing the host manifest
 
 Chromium finds a host by reading a manifest from a well-known directory. The
-`.deb` and AppImage packages install it; for a development build, do it by hand.
+The `.deb` installs system manifests for Chromium, Chrome, and Brave. AppImage
+releases use the per-user setup command because an AppImage cannot write browser
+configuration and its mount path is not stable:
+
+```sh
+./onera browser setup --browser brave --host-path "$PWD/onera-nmhost"
+```
 
 **Brave (per user):**
 
@@ -46,7 +52,7 @@ System-wide equivalents live under `/etc/opt/chrome/native-messaging-hosts/` and
   "description": "Onera mod manager native messaging host",
   "path": "/usr/lib/onera/onera-nmhost",
   "type": "stdio",
-  "allowed_origins": ["chrome-extension://<YOUR_EXTENSION_ID>/"]
+  "allowed_origins": ["chrome-extension://pohiidkpoflhifciokepgpaandghjgmj/"]
 }
 ```
 
@@ -58,12 +64,13 @@ sed -i "s|/usr/lib/onera/onera-nmhost|$PWD/target/release/onera-nmhost|" \
     ~/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts/com.onera.host.json
 ```
 
-## Getting the extension id
+## Extension identity
 
-1. Open `brave://extensions`, enable **Developer mode**.
-2. **Load unpacked** → select the `extension/` directory.
-3. Copy the id and put it in `allowed_origins`.
-4. Restart the browser. Chromium caches host manifests at startup.
+The extension manifest contains a public key, so loading the unpacked
+`extension/` directory always produces the stable id
+`pohiidkpoflhifciokepgpaandghjgmj`. Packaged and CLI-generated host manifests
+allow only that origin. Restart the browser after installing a host manifest;
+Chromium caches host registration at startup.
 
 `allowed_origins` is the only thing stopping any other extension from driving
 Onera, so it must not be left as a wildcard.
@@ -80,7 +87,8 @@ UTF-8 JSON. On top of that Onera defines a versioned envelope:
 
 // response
 { "v": 1, "id": "ext-m3k2-7", "status": "ok",
-  "data": { "queued": true, "file_id": "100", "file_name": "Test Mod 1.0" } }
+  "data": { "queued": true, "request_id": "…",
+            "file_id": "100", "file_name": "Test Mod 1.0" } }
 
 // error
 { "v": 1, "id": "ext-m3k2-7", "status": "error",
@@ -102,13 +110,20 @@ UTF-8 JSON. On top of that Onera defines a versioned envelope:
 
 ### Commands
 
-| Type                   | Fields                  | Does                                                  |
-| ---------------------- | ----------------------- | ----------------------------------------------------- |
-| `ping`                 | —                       | Liveness and version                                  |
-| `status`               | —                       | Whether authenticated, and which games are registered |
-| `add_mod`              | `game_domain`, `mod_id` | Fetches metadata and records the mod                  |
-| `download`             | `+ file_id`             | Resolves a file for download                          |
-| `download_and_install` | `+ file_id`             | As above, then installs                               |
+| Type                   | Fields                  | Does                                                    |
+| ---------------------- | ----------------------- | ------------------------------------------------------- |
+| `ping`                 | —                       | Liveness and version                                    |
+| `status`               | —                       | Whether authenticated, and which games are registered   |
+| `add_mod`              | `game_domain`, `mod_id` | Fetches metadata and queues an Add Mod inbox item       |
+| `download`             | `+ file_id`             | Resolves the file and queues a durable desktop download |
+| `download_and_install` | `+ file_id`             | Resolves the file and queues an installation preview    |
+
+The host returns only after the request is committed to SQLite. If several files
+are plausible, it queues the item as `waiting_for_user` and lets the Add Mod
+screen present the choices. Closing the popup or exiting the short-lived host
+therefore cannot lose the request. On launch, the desktop routes to the inbox
+and marks the request complete only after the requested download or
+installation succeeds.
 
 ## Validation
 

@@ -41,6 +41,16 @@ fn parse_operation(id: &str) -> CommandResult<OperationId> {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
+pub async fn startup_status(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
+    Ok(json!({
+        "authenticated": state.onera.is_authenticated().await?,
+        "recovery_required": !state.onera.interrupted_operations().await?.is_empty(),
+        "inbox_count": state.onera.inbox_requests().await?.len(),
+        "expired_plans": state.onera.expired_prepared_plans(),
+    }))
+}
+
+#[tauri::command]
 pub async fn is_authenticated(state: State<'_, AppState>) -> CommandResult<bool> {
     Ok(state.onera.is_authenticated().await?)
 }
@@ -180,10 +190,10 @@ pub async fn installed_mods(
     state: State<'_, AppState>,
     game_id: String,
 ) -> CommandResult<serde_json::Value> {
-    let _ = (state, parse_game(&game_id)?);
-    // Reading the installed list is a catalogue query; it is served from the
-    // database and never triggers a network call.
-    Ok(json!([]))
+    Ok(serde_json::to_value(
+        state.onera.installed_mods(parse_game(&game_id)?).await?,
+    )
+    .unwrap_or(serde_json::Value::Null))
 }
 
 #[tauri::command]
@@ -191,8 +201,113 @@ pub async fn check_updates(
     state: State<'_, AppState>,
     game_id: String,
 ) -> CommandResult<serde_json::Value> {
-    let _ = (state, parse_game(&game_id)?);
-    Ok(json!([]))
+    let cancel = onera_core::progress::CancelToken::new();
+    Ok(serde_json::to_value(
+        state
+            .onera
+            .check_updates(parse_game(&game_id)?, &cancel)
+            .await?,
+    )
+    .unwrap_or(serde_json::Value::Null))
+}
+
+#[tauri::command]
+pub async fn inbox_requests(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
+    Ok(serde_json::to_value(state.onera.inbox_requests().await?)
+        .unwrap_or(serde_json::Value::Null))
+}
+
+#[tauri::command]
+pub async fn dismiss_inbox_request(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> CommandResult<()> {
+    let id = request_id
+        .parse::<uuid::Uuid>()
+        .map(onera_core::ids::InboxRequestId::from)
+        .map_err(|_| CommandError {
+            code: "invalid_input".into(),
+            message: "that is not a valid inbox request id".into(),
+        })?;
+    state
+        .onera
+        .dismiss_inbox_request(id)
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn complete_inbox_request(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> CommandResult<()> {
+    let id = request_id
+        .parse::<uuid::Uuid>()
+        .map(onera_core::ids::InboxRequestId::from)
+        .map_err(|_| CommandError {
+            code: "invalid_input".into(),
+            message: "that is not a valid inbox request id".into(),
+        })?;
+    state.onera.complete_inbox_request(id).await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn downloads(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
+    Ok(serde_json::to_value(state.onera.downloads().await?)
+        .unwrap_or(serde_json::Value::Null))
+}
+
+#[tauri::command]
+pub async fn download_file(
+    state: State<'_, AppState>,
+    game_domain: String,
+    mod_id: String,
+    file_id: String,
+) -> CommandResult<serde_json::Value> {
+    let cancel = onera_core::progress::CancelToken::new();
+    let details = state
+        .onera
+        .fetch_mod(&game_domain, &ProviderModId::new(&mod_id), &cancel)
+        .await?;
+    let file = details
+        .files
+        .iter()
+        .find(|candidate| candidate.provider_file_id.as_str() == file_id)
+        .ok_or_else(|| CommandError {
+            code: "not_found".into(),
+            message: "that file is not offered by this mod".into(),
+        })?;
+    let outcome = state
+        .onera
+        .download(
+            &onera_app::DownloadRequest {
+                game_slug: game_domain,
+                provider_mod_id: ProviderModId::new(mod_id),
+                provider_file_id: file.provider_file_id.clone(),
+                filename: file.name.clone(),
+                expected_size: file.size_bytes,
+                expected_hash: file.published_hash.clone(),
+            },
+            &state.progress(),
+            &cancel,
+        )
+        .await?;
+    Ok(json!({
+        "archive_id": outcome.archive_id.to_string(),
+        "hash": outcome.hash.to_string(),
+        "bytes": outcome.bytes,
+        "deduplicated": outcome.deduplicated,
+    }))
+}
+
+#[tauri::command]
+pub async fn resume_downloads(state: State<'_, AppState>) -> CommandResult<()> {
+    state
+        .onera
+        .resume_downloads(&state.progress(), &onera_core::progress::CancelToken::new())
+        .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +378,7 @@ pub async fn prepare_install(
                 provider_mod_id: ProviderModId::new(mod_id),
                 provider_file_id: ProviderFileId::new(file_id),
                 filename: file.name.clone(),
+                expected_size: file.size_bytes,
                 expected_hash: file.published_hash.clone(),
             },
             &progress,

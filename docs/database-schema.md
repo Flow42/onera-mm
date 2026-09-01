@@ -73,11 +73,16 @@ understands. Downgrading is the one migration direction that cannot be made safe
 | `conflicts`       | Recorded conflicts and their decisions             |                                                                                                        |
 | `scoped_rules`    | Remembered decisions                               | Unique on `(mod_id, root_key, path_prefix)` — deliberately narrow; there is no global "always replace" |
 
-### Downloads
+### Downloads and browser handoff
 
-| Table           | Holds                    | Notes                                                                                 |
-| --------------- | ------------------------ | ------------------------------------------------------------------------------------- |
-| `download_jobs` | Persisted download state | Stores the _provider file id_, never the signed URL: those expire and are credentials |
+| Table            | Holds                             | Notes                                                                                                                       |
+| ---------------- | --------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `download_jobs`  | Persisted download state          | Stores provider game/mod/file identifiers and a stable partial path, never the signed URL: those expire and are credentials |
+| `inbox_requests` | Durable Native Messaging requests | Queued until the desktop completes, fails, or the user dismisses the requested action                                       |
+
+Queued, running, and paused downloads resume on startup. Onera re-resolves a
+fresh provider URL, sends a byte-range request for the retained partial, and
+safely restarts from zero if the server does not support ranges.
 
 ## Cascades
 

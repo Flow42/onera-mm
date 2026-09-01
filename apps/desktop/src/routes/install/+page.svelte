@@ -55,6 +55,8 @@
     if (plan === null) return;
     try {
       await commands.applyPlan(plan.operation_id);
+      const requestId = page.url.searchParams.get('request');
+      if (requestId !== null) await commands.completeInboxRequest(requestId);
       applied = true;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);

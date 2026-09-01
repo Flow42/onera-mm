@@ -4,9 +4,9 @@
 
 | Suite                        | Command                  | Count |
 | ---------------------------- | ------------------------ | ----- |
-| Rust unit and integration    | `cargo test --workspace` | 310   |
+| Rust unit and integration    | `cargo test --workspace` | 319   |
 | Frontend and extension units | `pnpm test`              | 50    |
-| Frontend end-to-end          | `pnpm test:e2e`          | 6     |
+| Frontend end-to-end          | `pnpm test:e2e`          | 11    |
 
 **No default test needs network access, an API key, a keyring, a real game or a
 built desktop binary.** That is a hard rule: a suite that needs credentials is a
@@ -40,10 +40,10 @@ retry curve, redaction, VDF parsing, and the Cyberpunk layout resolver.
 | File                                        | Covers                                                                                                                                                                                                         |
 | ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `onera-archive/tests/malicious_archives.rs` | Zip slip, Windows traversal, absolute paths, symlinks, hard links, device nodes, compression bombs, entry-count and size limits, deep nesting, dirty staging, cancellation, progress                           |
-| `onera-db/tests/persistence.rs`             | Stack round-trips and ordering, cascade deletes, backup sharing, journal transitions, illegal transitions, catalogue idempotency, verbatim version storage                                                     |
+| `onera-db/tests/persistence.rs`             | Stack round-trips and ordering, cascade deletes, backup sharing, journal transitions, migration from populated v1, durable inbox/download jobs, installed-mod and archive read models                          |
 | `onera-install/tests/install_engine.rs`     | 33 tests: clean install, identical sharing, upgrades, downgrades, every conflict class, every decision, rule scoping, fault-injected rename and staging failures, recovery, verification, removal, round trips |
 | `onera-nexus/tests/api_contract.rs`         | Auth header, pagination, rate limits, retries, cancellation during backoff, malformed bodies, missing required fields, hostile identifiers                                                                     |
-| `onera-download/tests/streaming.rs`         | Streaming, hashing, dedup, hash mismatch, truncated responses, size limits, retries, cancellation, bounded concurrency                                                                                         |
+| `onera-download/tests/streaming.rs`         | Streaming, hashing, dedup, hash mismatch, truncated responses, size limits, retries, cancellation, bounded concurrency, byte-range resume, safe non-range restart                                              |
 | `onera-app/tests/end_to_end.rs`             | The full documented flow, plus conflict handling, malicious archives, and secret redaction across the whole stack                                                                                              |
 
 ### Fault injection
@@ -73,8 +73,9 @@ exhaustively, including that an _unknown_ classification from a newer backend
 fails safe by requiring a decision.
 
 Playwright drives the real SvelteKit build against a stubbed Tauri bridge, so
-onboarding, masking of the key field, and the recovery view are covered without
-a compiled desktop binary.
+onboarding, masking of the key field, recovery-first startup, the durable
+browser inbox, installed-mod read model, and persisted downloads are covered
+without a compiled desktop binary.
 
 ## Coverage of the required cases
 

@@ -4,12 +4,13 @@ Onera ships as an AppImage and a `.deb`, both built by Tauri's bundler.
 
 ## What a package contains
 
-| Component                 | Installed at                                            |
-| ------------------------- | ------------------------------------------------------- |
-| `onera-desktop`           | `/usr/bin/onera`                                        |
-| `onera-nmhost`            | `/usr/lib/onera/onera-nmhost`                           |
-| Native Messaging manifest | `/usr/share/onera/native-messaging/com.onera.host.json` |
-| Desktop entry and icons   | `/usr/share/applications`, `/usr/share/icons`           |
+| Component                  | Installed by `.deb` at                                                |
+| -------------------------- | --------------------------------------------------------------------- |
+| `onera-desktop`            | `/usr/bin/onera-desktop`                                              |
+| `onera-nmhost`             | `/usr/lib/onera/onera-nmhost`                                         |
+| Native Messaging manifests | Chromium, Chrome, and Brave system discovery directories under `/etc` |
+| Reference host manifest    | `/usr/share/onera/native-messaging/com.onera.host.json`               |
+| Desktop entry and icons    | `/usr/share/applications`, `/usr/share/icons`                         |
 
 The CLI (`onera`) is built separately and is not currently part of the desktop
 bundle.
@@ -57,18 +58,22 @@ one a user has depends on their desktop.
 ## AppImage notes
 
 An AppImage cannot install a Native Messaging manifest into the user's browser
-config, so the browser extension needs one manual step after first run:
+config, and its temporary mount path changes each run. Releases therefore ship
+the CLI and Native Messaging host alongside the AppImage. Put both executables
+in a stable location, then run the per-user setup command:
 
 ```sh
-mkdir -p ~/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts
-onera --print-nmhost-manifest > \
-  ~/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts/com.onera.host.json
+chmod +x onera onera-nmhost
+./onera browser setup --browser brave --host-path "$PWD/onera-nmhost"
 ```
 
-> **Not yet implemented.** `--print-nmhost-manifest` is not in the CLI today.
-> Until it is, copy `packaging/com.onera.host.json` and edit `path` to point at
-> the extracted AppImage's `onera-nmhost`. See
-> [`native-messaging.md`](native-messaging.md).
+Use `--browser chromium` or `--browser chrome` for those browsers. The command
+creates the correct per-user directory and writes an absolute host path. It can
+also print a manifest without writing it:
+
+```sh
+./onera browser manifest --host-path "$PWD/onera-nmhost"
+```
 
 AppImages also mount at a different path on every run, so an absolute `path` in
 the manifest must point at an extracted location rather than inside the mount.
@@ -85,6 +90,7 @@ the same dependency graph.
 dpkg-deb --contents onera_0.1.0_amd64.deb
 dpkg -I onera_0.1.0_amd64.deb              # check declared dependencies
 ./Onera_0.1.0_amd64.AppImage --appimage-extract-and-run --version
+./onera browser manifest --host-path "$PWD/onera-nmhost"
 ```
 
 Then run the manual smoke test in [`recovery.md`](recovery.md#manual-smoke-test)

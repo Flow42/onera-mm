@@ -77,7 +77,9 @@ recovery understands.
 ## Data flow for an install
 
 ```text
-extension ─(game domain, mod id)─► NM host ─► onera-app
+extension ─(game domain, mod id)─► NM host ─► durable inbox
+                                                │
+                                      desktop Add Mod view
                                                 │
                           ┌─────────────────────┼─────────────────────┐
                           ▼                     ▼                     ▼
