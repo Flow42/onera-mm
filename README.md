@@ -70,20 +70,21 @@ the extension. See [`docs/architecture.md`](docs/architecture.md).
 
 ## Documentation
 
-| Document                                                   | What it covers                                             |
-| ---------------------------------------------------------- | ---------------------------------------------------------- |
-| [Architecture](docs/architecture.md)                       | Crate layout, ports, and the rules that keep adapters thin |
-| [Threat model](docs/threat-model.md)                       | What Onera defends against and how                         |
-| [Database schema](docs/database-schema.md)                 | Every table and why it exists                              |
-| [Operation state machine](docs/operation-state-machine.md) | The journal and its transitions                            |
-| [File-provider stack](docs/file-provider-stack.md)         | How restoration actually works                             |
-| [Game adapter guide](docs/game-adapter-guide.md)           | Adding a game                                              |
-| [Provider guide](docs/provider-guide.md)                   | Adding a mod source                                        |
-| [Nexus API assumptions](docs/nexus-api-assumptions.md)     | What Onera relies on, and what breaks if it changes        |
-| [Native Messaging setup](docs/native-messaging.md)         | Wiring the browser extension to the host                   |
-| [Packaging](docs/packaging.md)                             | AppImage and `.deb`                                        |
-| [Recovery behaviour](docs/recovery.md)                     | What happens after a crash, plus the manual smoke test     |
-| [Test strategy](docs/test-strategy.md)                     | What is tested, how, and what is deliberately not          |
+| Document                                                   | What it covers                                                              |
+| ---------------------------------------------------------- | --------------------------------------------------------------------------- |
+| [Architecture](docs/architecture.md)                       | Crate layout, ports, and the rules that keep adapters thin                  |
+| [Threat model](docs/threat-model.md)                       | What Onera defends against and how                                          |
+| [Database schema](docs/database-schema.md)                 | Every table and why it exists                                               |
+| [Operation state machine](docs/operation-state-machine.md) | The journal and its transitions                                             |
+| [File-provider stack](docs/file-provider-stack.md)         | How restoration actually works                                              |
+| [Game adapter guide](docs/game-adapter-guide.md)           | Adding a game                                                               |
+| [Provider guide](docs/provider-guide.md)                   | Adding a mod source                                                         |
+| [Nexus API assumptions](docs/nexus-api-assumptions.md)     | What Onera relies on, and what breaks if it changes                         |
+| [Native Messaging setup](docs/native-messaging.md)         | Wiring the browser extension to the host                                    |
+| [Packaging](docs/packaging.md)                             | AppImage and `.deb`                                                         |
+| [Recovery behaviour](docs/recovery.md)                     | What happens after a crash, plus the manual smoke test                      |
+| [Test strategy](docs/test-strategy.md)                     | What is tested, how, and what is deliberately not                           |
+| [Implementation plan](docs/implementation-plan.md)         | Roadmap for product completion, profiles, dependencies, and clean baselines |
 
 ## Requirements
 
