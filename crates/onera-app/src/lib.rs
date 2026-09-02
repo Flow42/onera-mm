@@ -15,6 +15,7 @@ pub mod clean;
 pub mod flow;
 pub mod logging;
 pub mod paths;
+pub mod profile;
 pub mod secrets;
 
 pub use baseline::{BaselineCapturePreview, BaselineStatusReport};

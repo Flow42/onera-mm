@@ -20,7 +20,9 @@
 //! * A member may name an artifact that has not been downloaded yet. That is a
 //!   *missing* member, reported by [`desired_state`], not a silent omission.
 
-use crate::domain::reconcile::DesiredGameState;
+use crate::domain::baseline::BaselineFreshness;
+use crate::domain::dependency::ResolutionResult;
+use crate::domain::reconcile::{DesiredGameState, MutationPlan};
 use crate::ids::{
     InstallationId, LocalGameId, ModId, OperationId, ProfileId, ProfileMemberId,
     ProviderFileGroupId, ProviderFileId, ProviderId, ProviderModId, ProviderVersionId,
@@ -223,6 +225,182 @@ impl ProfileMember {
     }
 }
 
+/// An enabled member whose artifact still has to be acquired.
+///
+/// A profile may name a file that has never been downloaded. That member is a
+/// *download* in the activation preview, never an omission: dropping it would
+/// present an incomplete profile as a complete one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivationDownload {
+    /// Membership requiring the acquisition.
+    pub member_id: ProfileMemberId,
+    /// Mod lineage, so the row can be linked to the catalogue.
+    pub mod_id: ModId,
+    /// Display name of the file, or of the mod when the file has no name yet.
+    pub name: String,
+    /// Size the provider reported, when it reported one.
+    ///
+    /// `None` is "the provider did not say", which a byte total must not read
+    /// as zero.
+    pub bytes: Option<u64>,
+}
+
+/// Something that must be resolved before a profile can be activated.
+///
+/// Blockers are reasons an *apply* is refused, not warnings. A stale baseline
+/// is deliberately not one of them: it is disclosed with the preview and left
+/// to the user, exactly as it is for a single install.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ActivationBlocker {
+    /// Two selected artifacts provide different bytes for one path.
+    ///
+    /// Resolved with the existing conflict decision, never by dependency
+    /// choices: accepting a dependency risk never picks a winner for a path.
+    CrossModConflict {
+        /// The contested path, as `root_key:relative/path`.
+        target: String,
+    },
+    /// A member's requirements are unsatisfied, or could not be evaluated.
+    DependencyUnsatisfied {
+        /// The membership in question.
+        member_id: ProfileMemberId,
+    },
+    /// An enabled member names no artifact and no provider file.
+    ///
+    /// Onera does not guess a version. Choosing one for the user is the
+    /// dependency solver's job, and until it exists the member is a blocker
+    /// rather than a silently skipped row.
+    UnresolvedSelection {
+        /// The membership in question.
+        member_id: ProfileMemberId,
+    },
+}
+
+/// Everything one profile switch entails, previewed before anything is written.
+///
+/// Serializes as the `plan_profile_activation` payload in
+/// `docs/frontend-contracts.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileActivationPreview {
+    /// Profile that is active now, if the game has one.
+    pub from_profile_id: Option<ProfileId>,
+    /// Profile the user wants to activate.
+    pub to_profile_id: ProfileId,
+    /// The reconciliation this switch would perform with what is on disk now.
+    pub plan: MutationPlan,
+    /// Artifacts that must be acquired first. Not blockers.
+    pub downloads: Vec<ActivationDownload>,
+    /// Dependency evidence for the enabled members.
+    ///
+    /// `unknown` here is a real answer, not an empty one, and it blocks.
+    pub dependency: ResolutionResult,
+    /// Whether the recorded clean state still describes the installed build.
+    pub baseline_freshness: BaselineFreshness,
+    /// Bytes the mutation plan would write into the game directory.
+    pub bytes_to_write: u64,
+    /// Whether this exact preview can be applied without more decisions.
+    pub ready: bool,
+    /// Why it cannot, when it cannot.
+    pub blockers: Vec<ActivationBlocker>,
+    /// Digest of the inputs this preview was computed from.
+    ///
+    /// An apply may quote it to say *which* preview the user approved; a
+    /// different digest means the desired state or the deployment moved
+    /// underneath them and the preview must be shown again.
+    pub fingerprint: String,
+}
+
+impl ProfileActivationPreview {
+    /// Assemble a preview, deriving blockers, byte totals and the fingerprint.
+    ///
+    /// Pure: every input is already resolved by the caller. Cross-mod conflicts
+    /// come from the plan and dependency blockers from the resolution, so the
+    /// two kinds of problem cannot be collapsed into one another.
+    #[must_use]
+    pub fn assemble(
+        from_profile_id: Option<ProfileId>,
+        to_profile_id: ProfileId,
+        plan: MutationPlan,
+        downloads: Vec<ActivationDownload>,
+        dependency: ResolutionResult,
+        baseline_freshness: BaselineFreshness,
+        unresolved: &[ProfileMemberId],
+    ) -> Self {
+        let mut blockers: Vec<ActivationBlocker> = plan
+            .conflicts
+            .iter()
+            .map(|conflict| ActivationBlocker::CrossModConflict {
+                target: conflict.target.to_string(),
+            })
+            .collect();
+        for member in &dependency.health {
+            if member.health.blocks_apply() {
+                blockers.push(ActivationBlocker::DependencyUnsatisfied {
+                    member_id: member.profile_member_id,
+                });
+            }
+        }
+        for member_id in unresolved {
+            blockers.push(ActivationBlocker::UnresolvedSelection {
+                member_id: *member_id,
+            });
+        }
+        let bytes_to_write = plan
+            .steps
+            .iter()
+            .map(|step| match step {
+                crate::domain::reconcile::MutationStep::Write { provider, .. } => provider.size,
+                crate::domain::reconcile::MutationStep::Delete { .. } => 0,
+            })
+            .sum();
+        let fingerprint = fingerprint_of(to_profile_id, &plan, &blockers);
+        Self {
+            from_profile_id,
+            to_profile_id,
+            plan,
+            downloads,
+            dependency,
+            baseline_freshness,
+            bytes_to_write,
+            ready: blockers.is_empty(),
+            blockers,
+            fingerprint,
+        }
+    }
+
+    /// Whether this preview describes the same decision as a recorded digest.
+    ///
+    /// `None` means the caller approved without quoting one, which is allowed:
+    /// the engine still refuses a plan whose on-disk preconditions moved.
+    #[must_use]
+    pub fn matches_fingerprint(&self, expected: Option<&str>) -> bool {
+        expected.is_none_or(|expected| expected == self.fingerprint)
+    }
+}
+
+/// Digest the parts of a preview that a user's approval is actually about.
+///
+/// Downloads, byte totals and baseline freshness are derived or advisory; the
+/// desired state, the disk changes, the preconditions and the blockers are what
+/// change the meaning of "yes".
+fn fingerprint_of(
+    profile: ProfileId,
+    plan: &MutationPlan,
+    blockers: &[ActivationBlocker],
+) -> String {
+    let canonical = serde_json::json!({
+        "profile": profile,
+        "desired": plan.desired,
+        "steps": plan.steps,
+        "expected": plan.expected_files.iter().collect::<Vec<_>>(),
+        "conflicts": plan.conflicts,
+        "decisions": plan.conflict_decisions.iter().collect::<Vec<_>>(),
+        "blockers": blockers,
+    });
+    crate::hash::FileHash::blake3_of(canonical.to_string().as_bytes()).to_string()
+}
+
 /// How far a profile activation got.
 ///
 /// The target profile is only marked active in [`ProfileActivationState::Applied`],
@@ -395,6 +573,9 @@ pub fn desired_state(local_game_id: LocalGameId, members: &[ProfileMember]) -> P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::dependency::{
+        DependencyHealth, MemberHealth, ResolutionOutcome, ResolutionResult,
+    };
     use crate::ids::ProviderId;
 
     fn now() -> DateTime<Utc> {
@@ -543,6 +724,191 @@ mod tests {
         assert_eq!(back, m);
         assert!(back.pin.is_pinned());
         assert!(!back.is_deployable());
+    }
+
+    fn empty_plan(game: LocalGameId, installations: Vec<InstallationId>) -> MutationPlan {
+        crate::domain::reconcile::reconcile(
+            DesiredGameState::new(game, installations),
+            &std::collections::BTreeMap::new(),
+            &[],
+        )
+    }
+
+    fn conflicting_plan(game: LocalGameId) -> (MutationPlan, InstallationId, InstallationId) {
+        use crate::domain::reconcile::InstallationMapping;
+        use crate::hash::FileHash;
+        use crate::paths::RelPath;
+        use crate::plan::TargetLocation;
+
+        let (a, b) = (InstallationId::new(), InstallationId::new());
+        let target = TargetLocation {
+            root_key: "game".into(),
+            path: RelPath::normalize("archive/pc/mod/a.archive").unwrap(),
+        };
+        let mapping = |installation_id, bytes: &[u8]| InstallationMapping {
+            installation_id,
+            source: RelPath::normalize("a.archive").unwrap(),
+            target: target.clone(),
+            source_hash: FileHash::blake3_of(bytes),
+            source_size: bytes.len() as u64,
+        };
+        let plan = crate::domain::reconcile::reconcile(
+            DesiredGameState::new(game, vec![a, b]),
+            &std::collections::BTreeMap::new(),
+            &[mapping(a, b"a"), mapping(b, b"b")],
+        );
+        (plan, a, b)
+    }
+
+    fn resolution(health: Vec<(ProfileMemberId, DependencyHealth)>) -> ResolutionResult {
+        ResolutionResult {
+            outcome: ResolutionOutcome::Compatible,
+            health: health
+                .into_iter()
+                .map(|(profile_member_id, health)| MemberHealth {
+                    profile_member_id,
+                    health,
+                    unsatisfied: vec![],
+                })
+                .collect(),
+            evidence: crate::domain::dependency::ResolutionEvidence::default(),
+        }
+    }
+
+    #[test]
+    fn a_preview_with_no_problems_is_ready_and_writes_nothing() {
+        let game = LocalGameId::new();
+        let preview = ProfileActivationPreview::assemble(
+            None,
+            ProfileId::new(),
+            empty_plan(game, vec![]),
+            vec![],
+            resolution(vec![]),
+            BaselineFreshness::Fresh,
+            &[],
+        );
+        assert!(preview.ready);
+        assert!(preview.blockers.is_empty());
+        assert_eq!(preview.bytes_to_write, 0);
+    }
+
+    #[test]
+    fn every_kind_of_problem_becomes_its_own_blocker() {
+        let game = LocalGameId::new();
+        let (plan, _, _) = conflicting_plan(game);
+        let unknown = ProfileMemberId::new();
+        let unresolved = ProfileMemberId::new();
+        let preview = ProfileActivationPreview::assemble(
+            Some(ProfileId::new()),
+            ProfileId::new(),
+            plan,
+            vec![],
+            resolution(vec![
+                (unknown, DependencyHealth::Unknown),
+                (ProfileMemberId::new(), DependencyHealth::NotApplicable),
+            ]),
+            BaselineFreshness::Fresh,
+            &[unresolved],
+        );
+        assert!(!preview.ready);
+        assert_eq!(preview.blockers.len(), 3);
+        assert!(preview.blockers.iter().any(|blocker| matches!(
+            blocker,
+            ActivationBlocker::CrossModConflict { target }
+                if target == "game:archive/pc/mod/a.archive"
+        )));
+        // Unknown dependency data blocks; "not applicable" does not.
+        assert!(preview
+            .blockers
+            .contains(&ActivationBlocker::DependencyUnsatisfied { member_id: unknown }));
+        assert!(preview
+            .blockers
+            .contains(&ActivationBlocker::UnresolvedSelection {
+                member_id: unresolved,
+            }));
+    }
+
+    #[test]
+    fn a_missing_artifact_is_a_download_and_not_a_blocker() {
+        let member_id = ProfileMemberId::new();
+        let preview = ProfileActivationPreview::assemble(
+            None,
+            ProfileId::new(),
+            empty_plan(LocalGameId::new(), vec![]),
+            vec![ActivationDownload {
+                member_id,
+                mod_id: ModId::new(),
+                name: "Test Mod 1.0".into(),
+                // The provider did not report a size; a byte total must not
+                // read that as zero.
+                bytes: None,
+            }],
+            resolution(vec![]),
+            BaselineFreshness::Fresh,
+            &[],
+        );
+        assert!(preview.ready, "a download is work to do, not a refusal");
+        assert_eq!(preview.downloads[0].member_id, member_id);
+        assert!(preview.downloads[0].bytes.is_none());
+    }
+
+    #[test]
+    fn the_fingerprint_covers_the_decision_and_not_its_presentation() {
+        let game = LocalGameId::new();
+        let profile = ProfileId::new();
+        let installation = InstallationId::new();
+        let build = |installations: Vec<InstallationId>, freshness| {
+            ProfileActivationPreview::assemble(
+                None,
+                profile,
+                empty_plan(game, installations),
+                vec![],
+                resolution(vec![]),
+                freshness,
+                &[],
+            )
+        };
+        let base = build(vec![], BaselineFreshness::Fresh);
+        // Same decision, different disclosure: the approval still stands.
+        assert_eq!(
+            base.fingerprint,
+            build(
+                vec![],
+                BaselineFreshness::Unknown {
+                    reason: "no comparable identity".into()
+                }
+            )
+            .fingerprint
+        );
+        // A different desired state is a different question.
+        assert_ne!(
+            base.fingerprint,
+            build(vec![installation], BaselineFreshness::Fresh).fingerprint
+        );
+        assert!(base.matches_fingerprint(None), "approval may go unquoted");
+        assert!(base.matches_fingerprint(Some(&base.fingerprint)));
+        assert!(!base.matches_fingerprint(Some("b3:not-this-one")));
+    }
+
+    #[test]
+    fn a_preview_serializes_as_the_documented_payload() {
+        let preview = ProfileActivationPreview::assemble(
+            None,
+            ProfileId::new(),
+            conflicting_plan(LocalGameId::new()).0,
+            vec![],
+            resolution(vec![]),
+            BaselineFreshness::Fresh,
+            &[],
+        );
+        let json = serde_json::to_value(&preview).unwrap();
+        assert!(json["from_profile_id"].is_null());
+        assert_eq!(json["ready"], serde_json::json!(false));
+        assert_eq!(json["blockers"][0]["kind"], "cross_mod_conflict");
+        assert_eq!(json["baseline_freshness"]["kind"], "fresh");
+        assert!(json["dependency"]["outcome"]["kind"].is_string());
+        let back: ProfileActivationPreview = serde_json::from_value(json).unwrap();
+        assert_eq!(back, preview);
     }
 
     #[test]

@@ -3,14 +3,16 @@
 use chrono::{DateTime, Utc};
 use onera_core::domain::archive::ArchiveFormat;
 use onera_core::domain::game::{Game, InstallSource, LocalGameInstall};
+use onera_core::domain::operation::{OperationKind, OperationState};
 use onera_core::domain::profile::{
-    DesiredModState, MemberPin, MemberPriority, MemberSelection, Profile, ProfileActivation,
-    ProfileActivationState, ProfileMember, DEFAULT_PROFILE_NAME,
+    validate_profile_set, DesiredModState, MemberPin, MemberPriority, MemberSelection, Profile,
+    ProfileActivation, ProfileActivationState, ProfileMember, DEFAULT_PROFILE_NAME,
 };
+use onera_core::domain::reconcile::{DesiredGameState, MutationPlan};
 use onera_core::domain::release::{FileCategory, Mod, ProviderFile, Release};
 use onera_core::hash::FileHash;
 use onera_core::ids::*;
-use onera_core::ports::{DeploymentStore, ProfileStore};
+use onera_core::ports::{DeploymentStore, OperationJournal, ProfileStore, ReconciliationStore};
 use onera_core::CoreError;
 use onera_db::Database;
 
@@ -338,4 +340,221 @@ async fn activation_history_round_trips_newest_first() {
         f.db.activation_history(f.game, 10).await.unwrap(),
         vec![activation]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Activation publication
+// ---------------------------------------------------------------------------
+
+/// An empty reconciliation for one game: enough to drive the completion
+/// transaction without needing a filesystem.
+fn empty_plan(game: LocalGameId) -> MutationPlan {
+    onera_core::domain::reconcile::reconcile(
+        DesiredGameState::new(game, vec![]),
+        &std::collections::BTreeMap::new(),
+        &[],
+    )
+}
+
+/// Advance an operation to the only state the completion transaction accepts.
+async fn committing(db: &Database, plan: &MutationPlan) -> OperationId {
+    let operation = db
+        .begin_reconciliation(plan, OperationKind::Reconcile)
+        .await
+        .unwrap();
+    db.set_state(operation.id, OperationState::Prepared, None)
+        .await
+        .unwrap();
+    db.set_state(operation.id, OperationState::Committing, None)
+        .await
+        .unwrap();
+    operation.id
+}
+
+fn attempt(
+    from: ProfileId,
+    to: ProfileId,
+    state: ProfileActivationState,
+    started_at: DateTime<Utc>,
+) -> ProfileActivation {
+    ProfileActivation {
+        from_profile_id: Some(from),
+        to_profile_id: to,
+        operation_id: None,
+        state,
+        started_at,
+        finished_at: None,
+        error: None,
+    }
+}
+
+#[tokio::test]
+async fn an_acquired_artifact_is_retained_without_disturbing_the_deployment() {
+    let f = fixture().await;
+    let retained = InstallationId::new();
+    f.db.record_retained_installation(
+        retained,
+        f.game,
+        f.mod_id,
+        release_of(&f.db, f.installation).await,
+        archive_of(&f.db, f.installation).await,
+    )
+    .await
+    .unwrap();
+
+    // The artifact exists and is addressable...
+    assert!(f
+        .db
+        .archive_for_installation(f.game, retained)
+        .await
+        .unwrap()
+        .is_some());
+    // ...but preparing a profile changed nothing about what is deployed. The
+    // previously active artifact keeps its unique active slot.
+    assert_eq!(
+        f.db.active_installations(f.game).await.unwrap(),
+        vec![f.installation]
+    );
+}
+
+#[tokio::test]
+async fn the_profile_switch_commits_with_the_deployment_it_describes() {
+    let f = fixture().await;
+    let target = f.db.put_profile(&profile(f.game, "Modded")).await;
+    assert!(target.is_ok());
+    let target =
+        f.db.profiles(f.game)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "Modded")
+            .unwrap();
+
+    let started = DateTime::from_timestamp(1_700_000_100, 0).unwrap();
+    f.db.record_activation(&attempt(
+        f.default_profile.id,
+        target.id,
+        ProfileActivationState::Applying,
+        started,
+    ))
+    .await
+    .unwrap();
+
+    let plan = empty_plan(f.game);
+    let operation = committing(&f.db, &plan).await;
+    f.db.complete_reconciliation_publishing(operation, &plan, Some(target.id))
+        .await
+        .unwrap();
+
+    // One active profile, and it is the target.
+    let profiles = f.db.profiles(f.game).await.unwrap();
+    assert!(validate_profile_set(&profiles).is_ok());
+    assert_eq!(
+        f.db.active_profile(f.game).await.unwrap().unwrap().id,
+        target.id
+    );
+    // The attempt was finished by the same transaction, carrying its operation.
+    let history = f.db.activation_history(f.game, 10).await.unwrap();
+    assert_eq!(history[0].state, ProfileActivationState::Applied);
+    assert_eq!(history[0].operation_id, Some(operation));
+    assert!(history[0].finished_at.is_some());
+    assert!(f.db.interrupted_activations().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_refused_completion_leaves_the_old_profile_active() {
+    let f = fixture().await;
+    f.db.put_profile(&profile(f.game, "Modded")).await.unwrap();
+    let target =
+        f.db.profiles(f.game)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "Modded")
+            .unwrap();
+    let plan = empty_plan(f.game);
+
+    // An operation that never reached `committing` cannot publish anything...
+    let operation =
+        f.db.begin_reconciliation(&plan, OperationKind::Reconcile)
+            .await
+            .unwrap();
+    assert!(matches!(
+        f.db.complete_reconciliation_publishing(operation.id, &plan, Some(target.id))
+            .await,
+        Err(CoreError::Conflict(_))
+    ));
+
+    // ...and neither can one asked to activate another game's profile.
+    let committing_id = committing(&f.db, &plan).await;
+    assert!(matches!(
+        f.db.complete_reconciliation_publishing(committing_id, &plan, Some(f.other_profile.id))
+            .await,
+        Err(CoreError::Conflict(_))
+    ));
+
+    assert_eq!(
+        f.db.active_profile(f.game).await.unwrap().unwrap().id,
+        f.default_profile.id
+    );
+    // The whole transaction rolled back, operation state included.
+    assert_eq!(
+        f.db.get(committing_id).await.unwrap().unwrap().state,
+        OperationState::Committing
+    );
+}
+
+#[tokio::test]
+async fn only_unfinished_attempts_are_offered_for_recovery() {
+    let f = fixture().await;
+    f.db.put_profile(&profile(f.game, "Modded")).await.unwrap();
+    let target =
+        f.db.profiles(f.game)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "Modded")
+            .unwrap();
+    let at = |offset: i64| DateTime::from_timestamp(1_700_000_000 + offset, 0).unwrap();
+
+    for (offset, state) in [
+        (1, ProfileActivationState::Preparing),
+        (2, ProfileActivationState::Applying),
+        (3, ProfileActivationState::Applied),
+        (4, ProfileActivationState::RolledBack),
+        (5, ProfileActivationState::Failed),
+    ] {
+        f.db.record_activation(&attempt(f.default_profile.id, target.id, state, at(offset)))
+            .await
+            .unwrap();
+    }
+
+    let interrupted = f.db.interrupted_activations().await.unwrap();
+    assert_eq!(interrupted.len(), 2);
+    assert_eq!(interrupted[0].state, ProfileActivationState::Preparing);
+    assert_eq!(interrupted[1].state, ProfileActivationState::Applying);
+    // Recovery never reads a terminal record as unfinished, and never makes one
+    // active on its own.
+    assert_eq!(
+        f.db.active_profile(f.game).await.unwrap().unwrap().id,
+        f.default_profile.id
+    );
+}
+
+async fn release_of(db: &Database, installation: InstallationId) -> ReleaseId {
+    let (id,): (String,) = sqlx::query_as("SELECT release_id FROM installations WHERE id = ?1")
+        .bind(installation.to_string())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    ReleaseId::from(uuid::Uuid::parse_str(&id).unwrap())
+}
+
+async fn archive_of(db: &Database, installation: InstallationId) -> ArchiveId {
+    let (id,): (String,) = sqlx::query_as("SELECT archive_id FROM installations WHERE id = ?1")
+        .bind(installation.to_string())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    ArchiveId::from(uuid::Uuid::parse_str(&id).unwrap())
 }

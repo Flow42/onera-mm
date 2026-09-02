@@ -4,8 +4,8 @@
 
 | Suite                        | Command                  | Count |
 | ---------------------------- | ------------------------ | ----- |
-| Rust unit and integration    | `cargo test --workspace` | 431   |
-| Frontend and extension units | `pnpm test`              | 67    |
+| Rust unit and integration    | `cargo test --workspace` | 453   |
+| Frontend and extension units | `pnpm test`              | 76    |
 | Frontend end-to-end          | `pnpm test:e2e`          | 20    |
 
 **No default test needs network access, an API key, a keyring, a real game or a
@@ -49,17 +49,19 @@ retry curve, redaction, VDF parsing, and the Cyberpunk layout resolver.
 
 ### Integration
 
-| File                                        | Covers                                                                                                                                                                                                                       |
-| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `onera-archive/tests/malicious_archives.rs` | Zip slip, Windows traversal, absolute paths, symlinks, hard links, device nodes, compression bombs, entry-count and size limits, deep nesting, dirty staging, cancellation, progress                                         |
-| `onera-db/tests/persistence.rs`             | Stack round-trips and ordering, cascade deletes, backup sharing, journal transitions, migration from populated v1, durable inbox/download jobs, installed-mod and archive read models                                        |
-| `onera-install/tests/install_engine.rs`     | 33 tests: clean install, identical sharing, upgrades, downgrades, every conflict class, every decision, rule scoping, fault-injected rename and staging failures, recovery, verification, removal, round trips               |
-| `onera-install/tests/reconciliation.rs`     | Multi-artifact atomic commit, offline deactivate/reactivate, stale previews, and complete rollback after injected staging/rename failures                                                                                    |
-| `onera-nexus/tests/api_contract.rs`         | Auth header, pagination, rate limits, retries, cancellation during backoff, malformed bodies, missing required fields, hostile identifiers                                                                                   |
-| `onera-download/tests/streaming.rs`         | Streaming, hashing, dedup, hash mismatch, truncated responses, size limits, retries, cancellation, bounded concurrency, byte-range resume, safe non-range restart                                                            |
-| `onera-discovery/tests/steam_identity.rs`   | Build identity from real-shaped `appmanifest` fixtures: normal manifests, beta branches, multiple depots, missing and malformed optional fields, native/Flatpak/second-drive layouts, manual installs, unknown DLC ownership |
-| `onera-app/tests/end_to_end.rs`             | The full documented flow, plus conflict handling, malicious archives, secret redaction, and return-to-clean across the whole stack                                                                                           |
-| `onera-app/tests/baseline.rs`               | Baseline status, capture and verification against a real `appmanifest`: capture leaves the scope untouched, symlinks are reported not followed, a build change is stale, a missing identity is unknown, recapture supersedes |
+| File                                        | Covers                                                                                                                                                                                                                                                      |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `onera-archive/tests/malicious_archives.rs` | Zip slip, Windows traversal, absolute paths, symlinks, hard links, device nodes, compression bombs, entry-count and size limits, deep nesting, dirty staging, cancellation, progress                                                                        |
+| `onera-db/tests/persistence.rs`             | Stack round-trips and ordering, cascade deletes, backup sharing, journal transitions, migration from populated v1, durable inbox/download jobs, installed-mod and archive read models                                                                       |
+| `onera-install/tests/install_engine.rs`     | 33 tests: clean install, identical sharing, upgrades, downgrades, every conflict class, every decision, rule scoping, fault-injected rename and staging failures, recovery, verification, removal, round trips                                              |
+| `onera-install/tests/reconciliation.rs`     | Multi-artifact atomic commit, offline deactivate/reactivate, stale previews, and complete rollback after injected staging/rename failures                                                                                                                   |
+| `onera-nexus/tests/api_contract.rs`         | Auth header, pagination, rate limits, retries, cancellation during backoff, malformed bodies, missing required fields, hostile identifiers                                                                                                                  |
+| `onera-download/tests/streaming.rs`         | Streaming, hashing, dedup, hash mismatch, truncated responses, size limits, retries, cancellation, bounded concurrency, byte-range resume, safe non-range restart                                                                                           |
+| `onera-discovery/tests/steam_identity.rs`   | Build identity from real-shaped `appmanifest` fixtures: normal manifests, beta branches, multiple depots, missing and malformed optional fields, native/Flatpak/second-drive layouts, manual installs, unknown DLC ownership                                |
+| `onera-app/tests/end_to_end.rs`             | The full documented flow, plus conflict handling, malicious archives, secret redaction, and return-to-clean across the whole stack                                                                                                                          |
+| `onera-app/tests/baseline.rs`               | Baseline status, capture and verification against a real `appmanifest`: capture leaves the scope untouched, symlinks are reported not followed, a build change is stale, a missing identity is unknown, recapture supersedes                                |
+| `onera-app/tests/profiles.rs`               | Profile activation end to end: preview writes nothing, a missing artifact is downloaded during preparation, A→B→A restores byte for byte, a stale preview and an unresolved member are refused, cancellation and crash recovery keep the old profile active |
+| `onera-db/tests/profiles.rs`                | Profile CRUD and, for activation, that the switch commits with the deployment it describes, that a refused completion rolls both halves back, and that only non-terminal attempts are offered for recovery                                                  |
 
 ### Fault injection
 
@@ -98,30 +100,31 @@ and returning to clean names what it refuses to touch.
 
 ## Coverage of the required cases
 
-| Required                           | Where                                                                  |
-| ---------------------------------- | ---------------------------------------------------------------------- |
-| Path normalization and traversal   | `paths.rs` proptests, `validate.rs`, `malicious_archives.rs`           |
-| Malicious archives, archive bombs  | `malicious_archives.rs`, `limits.rs`                                   |
-| Layout detection                   | `cyberpunk2077.rs` (plain, wrapped, nested, ambiguous, unrecognizable) |
-| Clean installs                     | `install_engine.rs`, `end_to_end.rs`                                   |
-| Identical shared files             | `provider_stack.rs`, `install_engine.rs`                               |
-| Same-mod upgrades and downgrades   | `install_engine.rs`                                                    |
-| Unmanaged and cross-mod conflicts  | `install_engine.rs`, `end_to_end.rs`                                   |
-| External file modifications        | `install_engine.rs`, `end_to_end.rs`                                   |
-| Restoring previous providers       | `install_engine.rs`, `provider_stack.rs`                               |
-| Restoring unmanaged backups        | `install_engine.rs`, `end_to_end.rs`                                   |
-| Interrupted writes and renames     | `install_engine.rs` (fault injection)                                  |
-| Multi-mod atomic reconciliation    | `reconciliation.rs`, `domain/reconcile.rs`                             |
-| Restart recovery                   | `install_engine.rs`                                                    |
-| Removal and reinstall round trips  | `install_engine.rs`                                                    |
-| Nexus pagination and rate limiting | `api_contract.rs`                                                      |
-| Malformed API responses            | `api_contract.rs`, `models.rs`                                         |
-| Secret redaction                   | `redact.rs`, `end_to_end.rs`                                           |
-| Native Messaging validation        | `onera-nmhost/src/protocol.rs`                                         |
-| Steam build identity and layouts   | `onera-discovery/tests/steam_identity.rs`                              |
-| Baseline capture and verification  | `onera-app/tests/baseline.rs`, `onera-install/tests/baseline.rs`       |
-| Return to clean                    | `end_to_end.rs`, `tests/e2e/integrity.spec.ts`                         |
-| Browser-extension flows            | `tests/js/`, `tests/e2e/`                                              |
+| Required                           | Where                                                                            |
+| ---------------------------------- | -------------------------------------------------------------------------------- |
+| Path normalization and traversal   | `paths.rs` proptests, `validate.rs`, `malicious_archives.rs`                     |
+| Malicious archives, archive bombs  | `malicious_archives.rs`, `limits.rs`                                             |
+| Layout detection                   | `cyberpunk2077.rs` (plain, wrapped, nested, ambiguous, unrecognizable)           |
+| Clean installs                     | `install_engine.rs`, `end_to_end.rs`                                             |
+| Identical shared files             | `provider_stack.rs`, `install_engine.rs`                                         |
+| Same-mod upgrades and downgrades   | `install_engine.rs`                                                              |
+| Unmanaged and cross-mod conflicts  | `install_engine.rs`, `end_to_end.rs`                                             |
+| External file modifications        | `install_engine.rs`, `end_to_end.rs`                                             |
+| Restoring previous providers       | `install_engine.rs`, `provider_stack.rs`                                         |
+| Restoring unmanaged backups        | `install_engine.rs`, `end_to_end.rs`                                             |
+| Interrupted writes and renames     | `install_engine.rs` (fault injection)                                            |
+| Multi-mod atomic reconciliation    | `reconciliation.rs`, `domain/reconcile.rs`                                       |
+| Profile activation and rollback    | `onera-app/tests/profiles.rs`, `reconciliation.rs`, `onera-db/tests/profiles.rs` |
+| Restart recovery                   | `install_engine.rs`                                                              |
+| Removal and reinstall round trips  | `install_engine.rs`                                                              |
+| Nexus pagination and rate limiting | `api_contract.rs`                                                                |
+| Malformed API responses            | `api_contract.rs`, `models.rs`                                                   |
+| Secret redaction                   | `redact.rs`, `end_to_end.rs`                                                     |
+| Native Messaging validation        | `onera-nmhost/src/protocol.rs`                                                   |
+| Steam build identity and layouts   | `onera-discovery/tests/steam_identity.rs`                                        |
+| Baseline capture and verification  | `onera-app/tests/baseline.rs`, `onera-install/tests/baseline.rs`                 |
+| Return to clean                    | `end_to_end.rs`, `tests/e2e/integrity.spec.ts`                                   |
+| Browser-extension flows            | `tests/js/`, `tests/e2e/`                                                        |
 
 ## Gaps
 

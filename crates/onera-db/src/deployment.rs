@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use onera_core::domain::provider_stack::{FileProvider, ProviderStack, StackEntry};
 use onera_core::domain::reconcile::{InstallationMapping, MutationPlan};
 use onera_core::ids::{
-    ArchiveId, BackupId, InstallationId, LocalGameId, ModId, OperationId, ReleaseId,
+    ArchiveId, BackupId, InstallationId, LocalGameId, ModId, OperationId, ProfileId, ReleaseId,
 };
 use onera_core::plan::{ConflictChoice, ScopedRule, TargetLocation};
 use onera_core::ports::{DeploymentStore, ReconciliationStore};
@@ -286,6 +286,35 @@ impl DeploymentStore for Database {
         Ok(())
     }
 
+    async fn record_retained_installation(
+        &self,
+        installation: InstallationId,
+        game: LocalGameId,
+        mod_id: ModId,
+        release: ReleaseId,
+        archive: ArchiveId,
+    ) -> Result<()> {
+        // No lineage row is touched: acquiring an artifact for a profile that
+        // has not been activated must not disturb what is deployed now.
+        sqlx::query(
+            "INSERT INTO installations
+               (id, local_game_id, mod_id, release_id, archive_id, state, active, installed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'artifact', 0, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+               release_id = ?4, archive_id = ?5, installed_at = ?6",
+        )
+        .bind(installation.to_string())
+        .bind(game.to_string())
+        .bind(mod_id.to_string())
+        .bind(release.to_string())
+        .bind(archive.to_string())
+        .bind(now())
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn remove_installation(&self, installation: InstallationId) -> Result<()> {
         sqlx::query("DELETE FROM installations WHERE id = ?1")
             .bind(installation.to_string())
@@ -523,10 +552,11 @@ fn row_to_target(row: sqlx::sqlite::SqliteRow) -> Result<TargetLocation> {
 
 #[async_trait]
 impl ReconciliationStore for Database {
-    async fn complete_reconciliation(
+    async fn complete_reconciliation_publishing(
         &self,
         operation: OperationId,
         plan: &MutationPlan,
+        activate_profile: Option<ProfileId>,
     ) -> Result<()> {
         let mut tx = self.pool().begin().await.map_err(db_err)?;
         for (target, stack) in &plan.final_stacks {
@@ -616,6 +646,59 @@ impl ReconciliationStore for Database {
             return Err(CoreError::Conflict(format!(
                 "operation {operation} is not committing"
             )));
+        }
+        // The profile switch rides on the same commit as the deployment it
+        // describes. Nothing between here and `tx.commit` may fail in a way
+        // that leaves one half published without the other.
+        if let Some(profile) = activate_profile {
+            let owner: Option<(String,)> =
+                sqlx::query_as("SELECT local_game_id FROM profiles WHERE id = ?1")
+                    .bind(profile.to_string())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+            match owner {
+                None => {
+                    return Err(CoreError::NotFound {
+                        kind: "profile",
+                        id: profile.to_string(),
+                    })
+                }
+                Some((owner,)) if owner != plan.desired.local_game_id.to_string() => {
+                    return Err(CoreError::Conflict(format!(
+                        "profile {profile} belongs to another game"
+                    )))
+                }
+                Some(_) => {}
+            }
+            let changed_at = now();
+            sqlx::query(
+                "UPDATE profiles SET is_active = 0, updated_at = ?2
+                 WHERE local_game_id = ?1 AND is_active = 1 AND id != ?3",
+            )
+            .bind(plan.desired.local_game_id.to_string())
+            .bind(&changed_at)
+            .bind(profile.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            sqlx::query("UPDATE profiles SET is_active = 1, updated_at = ?2 WHERE id = ?1")
+                .bind(profile.to_string())
+                .bind(&changed_at)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            sqlx::query(
+                "UPDATE profile_activation_history
+                 SET state = 'applied', finished_at = ?2, operation_id = ?3, error = NULL
+                 WHERE to_profile_id = ?1 AND state = 'applying'",
+            )
+            .bind(profile.to_string())
+            .bind(&changed_at)
+            .bind(operation.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
         }
         tx.commit().await.map_err(db_err)?;
         Ok(())

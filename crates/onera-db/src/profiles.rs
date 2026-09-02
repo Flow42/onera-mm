@@ -154,6 +154,25 @@ impl Database {
             .transpose()
     }
 
+    /// Activation attempts that never reached a terminal state.
+    ///
+    /// Read on startup: every row here belongs to a process that died mid
+    /// switch. None of them may be reported as `applied` — the target profile
+    /// is active only when the completion transaction said so.
+    pub async fn interrupted_activations(&self) -> Result<Vec<ProfileActivation>> {
+        let rows = sqlx::query(
+            "SELECT from_profile_id, to_profile_id, operation_id, state,
+                    started_at, finished_at, error
+             FROM profile_activation_history
+             WHERE state IN ('preparing', 'applying')
+             ORDER BY started_at, id",
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        rows.into_iter().map(activation_from_row).collect()
+    }
+
     /// Resolve a mod/file choice into the opaque selection and any retained
     /// installation that already satisfies it for this profile's game.
     pub async fn selection_for_profile_member(
@@ -651,28 +670,28 @@ impl ProfileStore for Database {
         .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
-        rows.into_iter()
-            .map(|row| {
-                let from: Option<String> = row.try_get("from_profile_id").map_err(db_err)?;
-                let to: String = row.try_get("to_profile_id").map_err(db_err)?;
-                let operation: Option<String> = row.try_get("operation_id").map_err(db_err)?;
-                let state: String = row.try_get("state").map_err(db_err)?;
-                let started: String = row.try_get("started_at").map_err(db_err)?;
-                let finished: Option<String> = row.try_get("finished_at").map_err(db_err)?;
-                Ok(ProfileActivation {
-                    from_profile_id: from.as_deref().map(uuid).transpose()?.map(ProfileId::from),
-                    to_profile_id: ProfileId::from(uuid(&to)?),
-                    operation_id: operation
-                        .as_deref()
-                        .map(uuid)
-                        .transpose()?
-                        .map(onera_core::ids::OperationId::from),
-                    state: parse_activation(&state)?,
-                    started_at: from_timestamp(&started)?,
-                    finished_at: finished.as_deref().map(from_timestamp).transpose()?,
-                    error: row.try_get("error").map_err(db_err)?,
-                })
-            })
-            .collect()
+        rows.into_iter().map(activation_from_row).collect()
     }
+}
+
+fn activation_from_row(row: SqliteRow) -> Result<ProfileActivation> {
+    let from: Option<String> = row.try_get("from_profile_id").map_err(db_err)?;
+    let to: String = row.try_get("to_profile_id").map_err(db_err)?;
+    let operation: Option<String> = row.try_get("operation_id").map_err(db_err)?;
+    let state: String = row.try_get("state").map_err(db_err)?;
+    let started: String = row.try_get("started_at").map_err(db_err)?;
+    let finished: Option<String> = row.try_get("finished_at").map_err(db_err)?;
+    Ok(ProfileActivation {
+        from_profile_id: from.as_deref().map(uuid).transpose()?.map(ProfileId::from),
+        to_profile_id: ProfileId::from(uuid(&to)?),
+        operation_id: operation
+            .as_deref()
+            .map(uuid)
+            .transpose()?
+            .map(onera_core::ids::OperationId::from),
+        state: parse_activation(&state)?,
+        started_at: from_timestamp(&started)?,
+        finished_at: finished.as_deref().map(from_timestamp).transpose()?,
+        error: row.try_get("error").map_err(db_err)?,
+    })
 }

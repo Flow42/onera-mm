@@ -1,14 +1,16 @@
 mod harness;
 
 use harness::{target, World};
+use onera_core::domain::operation::OperationKind;
+use onera_core::domain::profile::Profile;
 use onera_core::domain::provider_stack::{FileProvider, ProviderStack, StackEntry};
 use onera_core::domain::reconcile::{reconcile, DesiredGameState, InstallationMapping};
 use onera_core::hash::FileHash;
-use onera_core::ids::InstallationId;
-use onera_core::ports::{DeploymentStore, FileSystem, OperationJournal};
+use onera_core::ids::{InstallationId, ProfileId};
+use onera_core::ports::{DeploymentStore, FileSystem, OperationJournal, ProfileStore};
 use onera_core::progress::{CancelToken, NullProgress};
 use onera_install::fs::fault::{FailAt, FaultyFileSystem};
-use onera_install::{RealFileSystem, ReconciliationEngine};
+use onera_install::{Publication, RealFileSystem, ReconciliationEngine};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -435,4 +437,219 @@ async fn a_staging_failure_removes_earlier_temporary_files() {
         .collect();
     assert!(entries.iter().all(|name| !name.contains(".onera-tmp")));
     assert!(world.db.interrupted().await.unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Profile publication
+// ---------------------------------------------------------------------------
+
+/// Two profiles for the harness game: an active one and the switch target.
+async fn two_profiles(world: &World) -> (ProfileId, ProfileId) {
+    let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let make = |name: &str, active: bool| Profile {
+        id: ProfileId::new(),
+        local_game_id: world.local_game,
+        name: name.to_owned(),
+        description: None,
+        is_active: active,
+        created_at: at,
+        updated_at: at,
+    };
+    let current = make("Default", true);
+    let target = make("Modded", false);
+    world.db.put_profile(&current).await.unwrap();
+    world.db.put_profile(&target).await.unwrap();
+    (current.id, target.id)
+}
+
+/// A one-file activation plan backed by a retained artifact.
+async fn activation_plan(
+    world: &World,
+    files: &[(&str, &[u8])],
+) -> (
+    InstallationId,
+    std::path::PathBuf,
+    Vec<InstallationMapping>,
+    onera_core::domain::reconcile::MutationPlan,
+) {
+    let installation = InstallationId::new();
+    world
+        .db
+        .record_installation(
+            installation,
+            world.local_game,
+            world.mod_id,
+            world.release,
+            world.archive,
+        )
+        .await
+        .unwrap();
+    world
+        .db
+        .deactivate_installation(installation)
+        .await
+        .unwrap();
+    let (staging, _) = world.stage("activation", files);
+    let mappings: Vec<_> = files
+        .iter()
+        .map(|(path, bytes)| InstallationMapping {
+            installation_id: installation,
+            source: onera_core::RelPath::normalize(path).unwrap(),
+            target: target(path),
+            source_hash: FileHash::blake3_of(bytes),
+            source_size: bytes.len() as u64,
+        })
+        .collect();
+    let plan = reconcile(
+        DesiredGameState::new(world.local_game, vec![installation]),
+        &BTreeMap::new(),
+        &mappings,
+    );
+    (installation, staging, mappings, plan)
+}
+
+#[tokio::test]
+async fn a_profile_becomes_active_with_the_deployment_it_describes() {
+    let world = World::new().await;
+    let (current, switch_to) = two_profiles(&world).await;
+    let (installation, staging, mappings, plan) =
+        activation_plan(&world, &[("mods/a.bin", b"profile a")]).await;
+
+    let attempt = engine(&world)
+        .attempt(
+            &plan,
+            &mappings,
+            &BTreeMap::from([(installation, staging)]),
+            &world.roots,
+            OperationKind::Reconcile,
+            Publication::activating(switch_to),
+            &NullProgress,
+            &CancelToken::new(),
+        )
+        .await;
+    assert!(attempt.result.is_ok());
+    assert!(
+        attempt.operation.is_some(),
+        "the attempt must name its operation"
+    );
+
+    assert_eq!(
+        world.read_game_file("mods/a.bin"),
+        Some(b"profile a".to_vec())
+    );
+    let active = world
+        .db
+        .active_profile(world.local_game)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.id, switch_to);
+    assert_ne!(active.id, current);
+}
+
+#[tokio::test]
+async fn a_failed_rename_leaves_the_previous_profile_active() {
+    let world = World::new().await;
+    let (current, switch_to) = two_profiles(&world).await;
+    let (installation, staging, mappings, plan) =
+        activation_plan(&world, &[("a", b"a"), ("b", b"b")]).await;
+
+    let attempt = engine_with(&world, Arc::new(FaultyFileSystem::new(FailAt::Rename(1))))
+        .attempt(
+            &plan,
+            &mappings,
+            &BTreeMap::from([(installation, staging)]),
+            &world.roots,
+            OperationKind::Reconcile,
+            Publication::activating(switch_to),
+            &NullProgress,
+            &CancelToken::new(),
+        )
+        .await;
+    let error = attempt.result.unwrap_err();
+    assert!(error.to_string().contains("injected rename failure"));
+    assert!(attempt.rolled_back, "the failure was undone");
+
+    // Neither half of the publication happened: no files, no switch.
+    assert!(!world.game_file_exists("a"));
+    assert!(!world.game_file_exists("b"));
+    assert!(world
+        .db
+        .active_installations(world.local_game)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        world
+            .db
+            .active_profile(world.local_game)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        current
+    );
+    assert!(world.db.interrupted().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_unresolved_conflict_publishes_no_profile_and_journals_nothing() {
+    let world = World::new().await;
+    let (current, switch_to) = two_profiles(&world).await;
+    let (first, staging, mut mappings, _) = activation_plan(&world, &[("shared", b"one")]).await;
+    let (other_mod, other_release) = world.another_mod("2").await;
+    let second = InstallationId::new();
+    world
+        .db
+        .record_installation(
+            second,
+            world.local_game,
+            other_mod,
+            other_release,
+            world.archive,
+        )
+        .await
+        .unwrap();
+    world.db.deactivate_installation(second).await.unwrap();
+    mappings.push(InstallationMapping {
+        installation_id: second,
+        source: onera_core::RelPath::normalize("shared").unwrap(),
+        target: target("shared"),
+        source_hash: FileHash::blake3_of(b"two"),
+        source_size: 3,
+    });
+    let plan = reconcile(
+        DesiredGameState::new(world.local_game, vec![first, second]),
+        &BTreeMap::new(),
+        &mappings,
+    );
+    assert!(!plan.is_ready());
+
+    let attempt = engine(&world)
+        .attempt(
+            &plan,
+            &mappings,
+            &BTreeMap::from([(first, staging)]),
+            &world.roots,
+            OperationKind::Reconcile,
+            Publication::activating(switch_to),
+            &NullProgress,
+            &CancelToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        attempt.result,
+        Err(onera_core::CoreError::DecisionRequired(_))
+    ));
+    assert!(attempt.operation.is_none(), "nothing may be journaled");
+    assert_eq!(
+        world
+            .db
+            .active_profile(world.local_game)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        current
+    );
 }

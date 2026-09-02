@@ -3,7 +3,7 @@
 use crate::planner::RootMap;
 use onera_core::domain::operation::{OperationKind, OperationState};
 use onera_core::domain::reconcile::{InstallationMapping, MutationPlan, MutationStep};
-use onera_core::ids::{InstallationId, OperationId};
+use onera_core::ids::{InstallationId, OperationId, ProfileId};
 use onera_core::ports::{
     BackupStore, FileSystem, JournalEntry, JournalStatus, OperationJournal, ReconciliationStore,
 };
@@ -12,6 +12,54 @@ use onera_core::{CoreError, FileHash, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// What a completed reconciliation must publish besides the deployment itself.
+///
+/// Everything named here commits in the *same* database transaction as the
+/// completed operation, so a crash can never leave one half visible without
+/// the other.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Publication {
+    /// Profile to make active once the filesystem has been verified.
+    pub activate_profile: Option<ProfileId>,
+}
+
+impl Publication {
+    /// Publish nothing beyond the deployment.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            activate_profile: None,
+        }
+    }
+
+    /// Publish a profile switch alongside the deployment.
+    #[must_use]
+    pub const fn activating(profile: ProfileId) -> Self {
+        Self {
+            activate_profile: Some(profile),
+        }
+    }
+}
+
+/// The outcome of one apply attempt, including the operation it journaled.
+///
+/// Callers that keep their own record of an attempt — profile activation does —
+/// need the operation identifier and whether the rollback succeeded even when
+/// the apply itself failed. Returning only `Result<()>` would force them to
+/// guess both.
+#[derive(Debug)]
+pub struct ReconciliationAttempt {
+    /// The journaled operation, once one was begun.
+    pub operation: Option<OperationId>,
+    /// Whether a failure was fully undone.
+    ///
+    /// `false` after a failure means recovery is required; it is never `true`
+    /// for an attempt that succeeded.
+    pub rolled_back: bool,
+    /// What the apply itself concluded.
+    pub result: Result<()>,
+}
 
 /// Applies one complete desired-state plan as a single journaled operation.
 pub struct ReconciliationEngine {
@@ -64,6 +112,82 @@ impl ReconciliationEngine {
         .await
     }
 
+    /// Apply a ready plan, reporting the journaled operation either way.
+    ///
+    /// # Errors
+    /// Never returns `Err` itself: every failure is carried in
+    /// [`ReconciliationAttempt::result`] alongside the operation it belongs to.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn attempt(
+        &self,
+        plan: &MutationPlan,
+        mappings: &[InstallationMapping],
+        extracted: &BTreeMap<InstallationId, PathBuf>,
+        roots: &RootMap,
+        kind: OperationKind,
+        publication: Publication,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> ReconciliationAttempt {
+        if !plan.is_ready() {
+            return ReconciliationAttempt {
+                operation: None,
+                rolled_back: false,
+                result: Err(CoreError::DecisionRequired(
+                    "reconciliation has unresolved cross-mod conflicts".into(),
+                )),
+            };
+        }
+        let operation = match self.journal.begin_reconciliation(plan, kind).await {
+            Ok(operation) => operation,
+            Err(error) => {
+                return ReconciliationAttempt {
+                    operation: None,
+                    rolled_back: false,
+                    result: Err(error),
+                }
+            }
+        };
+        progress.emit(ProgressEvent::Started {
+            operation: Some(operation.id),
+            stage: Stage::Deploying,
+            total: Some(plan.steps.len() as u64),
+        });
+        let started = self
+            .apply_started(
+                operation.id,
+                plan,
+                mappings,
+                extracted,
+                roots,
+                publication,
+                progress,
+                cancel,
+            )
+            .await;
+        let (rolled_back, result) = match started {
+            Ok(()) => (false, Ok(())),
+            Err(original) => match self.rollback(operation.id).await {
+                Ok(()) => (true, Err(original)),
+                Err(rollback) => (
+                    false,
+                    Err(CoreError::Conflict(format!(
+                        "{original}; reconciliation rollback also failed: {rollback}"
+                    ))),
+                ),
+            },
+        };
+        progress.emit(ProgressEvent::Finished {
+            stage: Stage::Deploying,
+            success: result.is_ok(),
+        });
+        ReconciliationAttempt {
+            operation: Some(operation.id),
+            rolled_back,
+            result,
+        }
+    }
+
     /// Apply a ready plan, journaled under an explicit operation kind.
     ///
     /// A return-to-clean reaches the same empty desired state as any other
@@ -84,42 +208,18 @@ impl ReconciliationEngine {
         progress: &dyn ProgressSink,
         cancel: &CancelToken,
     ) -> Result<()> {
-        if !plan.is_ready() {
-            return Err(CoreError::DecisionRequired(
-                "reconciliation has unresolved cross-mod conflicts".into(),
-            ));
-        }
-        let operation = self.journal.begin_reconciliation(plan, kind).await?;
-        progress.emit(ProgressEvent::Started {
-            operation: Some(operation.id),
-            stage: Stage::Deploying,
-            total: Some(plan.steps.len() as u64),
-        });
-        let result = self
-            .apply_started(
-                operation.id,
-                plan,
-                mappings,
-                extracted,
-                roots,
-                progress,
-                cancel,
-            )
-            .await;
-        let result = match result {
-            Ok(()) => Ok(()),
-            Err(original) => match self.rollback(operation.id).await {
-                Ok(()) => Err(original),
-                Err(rollback) => Err(CoreError::Conflict(format!(
-                    "{original}; reconciliation rollback also failed: {rollback}"
-                ))),
-            },
-        };
-        progress.emit(ProgressEvent::Finished {
-            stage: Stage::Deploying,
-            success: result.is_ok(),
-        });
-        result
+        self.attempt(
+            plan,
+            mappings,
+            extracted,
+            roots,
+            kind,
+            Publication::none(),
+            progress,
+            cancel,
+        )
+        .await
+        .result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -130,6 +230,7 @@ impl ReconciliationEngine {
         mappings: &[InstallationMapping],
         extracted: &BTreeMap<InstallationId, PathBuf>,
         roots: &RootMap,
+        publication: Publication,
         progress: &dyn ProgressSink,
         cancel: &CancelToken,
     ) -> Result<()> {
@@ -269,7 +370,12 @@ impl ReconciliationEngine {
                 detail: Some(entry.target.to_string()),
             });
         }
-        self.state.complete_reconciliation(operation, plan).await
+        // Every write has been renamed into place and re-hashed above, so the
+        // filesystem now matches the plan. Only here may a profile be published
+        // as active, and it commits with the deployment, not after it.
+        self.state
+            .complete_reconciliation_publishing(operation, plan, publication.activate_profile)
+            .await
     }
 
     /// Restore every staged or committed file. SQLite remains at the old state

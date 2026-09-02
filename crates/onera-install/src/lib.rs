@@ -34,7 +34,7 @@ pub use engine::{InstallReport, Installer};
 pub use fs::RealFileSystem;
 pub use lock::GameLocks;
 pub use planner::{plan_install, render_preview, PlanRequest, RootMap};
-pub use reconcile::ReconciliationEngine;
+pub use reconcile::{Publication, ReconciliationAttempt, ReconciliationEngine};
 pub use recovery::{recover_all, InterruptedOperation, RecoveryChoice};
 pub use remove::{RemovalReport, Remover};
 pub use verify::{verify_installation, VerifyReport, VerifyStatus};

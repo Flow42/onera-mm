@@ -360,6 +360,28 @@ enum ProfileAction {
         #[arg(long, allow_hyphen_values = true)]
         priority: i32,
     },
+    /// Preview everything switching to this profile entails, changing nothing.
+    PlanActivate {
+        /// Profile id.
+        #[arg(long)]
+        profile: String,
+    },
+    /// Switch the game to this profile.
+    ///
+    /// Missing artifacts are downloaded first; the game directory only changes
+    /// in the journaled reconciliation that follows, and the profile is
+    /// reported active only once the files on disk match it.
+    Activate {
+        /// Profile id.
+        #[arg(long)]
+        profile: String,
+        /// Fingerprint from the preview you approved.
+        ///
+        /// Refuses to apply if the desired state or the deployment moved since,
+        /// instead of quietly applying a different plan.
+        #[arg(long)]
+        expect: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -580,11 +602,19 @@ async fn main() -> Result<()> {
         }
         Commands::Recover { rollback } => recover(&onera, rollback, &progress, cli.json).await,
         Commands::Browser { action } => browser(action, cli.json).await,
-        Commands::Profiles { action } => profiles(&onera, action, cli.json).await,
+        Commands::Profiles { action } => {
+            profiles(&onera, action, &progress, &cancel, cli.json).await
+        }
     }
 }
 
-async fn profiles(onera: &Onera, action: ProfileAction, json: bool) -> Result<()> {
+async fn profiles(
+    onera: &Onera,
+    action: ProfileAction,
+    progress: &CliProgress,
+    cancel: &CancelToken,
+    json: bool,
+) -> Result<()> {
     match action {
         ProfileAction::List { game } => {
             let profiles = onera
@@ -740,8 +770,75 @@ async fn profiles(onera: &Onera, action: ProfileAction, json: bool) -> Result<()
                 .await?;
             print_profile_member(json, &member, "reordered");
         }
+        ProfileAction::PlanActivate { profile } => {
+            let preview = onera
+                .plan_profile_activation(
+                    ProfileId::from_str(&profile).context("invalid profile id")?,
+                )
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&preview)?);
+            } else {
+                print_activation_preview(&preview);
+            }
+        }
+        ProfileAction::Activate { profile, expect } => {
+            let activation = onera
+                .activate_profile(
+                    ProfileId::from_str(&profile).context("invalid profile id")?,
+                    expect.as_deref(),
+                    progress,
+                    cancel,
+                )
+                .await?;
+            emit(json, &serde_json::to_value(&activation)?, || {
+                format!(
+                    "activation {:?}: {} is now active",
+                    activation.state, activation.to_profile_id
+                )
+            });
+        }
     }
     Ok(())
+}
+
+/// Print the activation preview the way the JSON payload reads.
+///
+/// Downloads are listed separately from blockers on purpose: a member whose
+/// artifact is missing is work to do, not a reason the switch cannot happen.
+fn print_activation_preview(preview: &onera_core::domain::profile::ProfileActivationPreview) {
+    println!(
+        "from: {}",
+        preview
+            .from_profile_id
+            .map_or_else(|| "(none)".to_owned(), |id| id.to_string())
+    );
+    println!("to:   {}", preview.to_profile_id);
+    println!(
+        "{} file change(s), {} byte(s) to write",
+        preview.plan.steps.len(),
+        preview.bytes_to_write
+    );
+    for download in &preview.downloads {
+        println!(
+            "  download  {}  {}",
+            download.name,
+            download.bytes.map_or_else(
+                || "size unknown".to_owned(),
+                |bytes| format!("{bytes} bytes")
+            )
+        );
+    }
+    println!("baseline: {}", freshness_label(&preview.baseline_freshness));
+    if preview.ready {
+        println!("ready to apply");
+    } else {
+        println!("not ready:");
+        for blocker in &preview.blockers {
+            println!("  {}", serde_json::to_string(blocker).unwrap_or_default());
+        }
+    }
+    println!("fingerprint: {}", preview.fingerprint);
 }
 
 fn print_profile_member(
@@ -1352,8 +1449,15 @@ async fn ownership(onera: &Onera, game: &str, root: &str, path: &str, json: bool
 async fn recover(onera: &Onera, rollback: bool, progress: &CliProgress, json: bool) -> Result<()> {
     let interrupted = onera.interrupted_operations().await?;
     if interrupted.is_empty() {
-        emit(json, &serde_json::json!([]), || {
-            "no interrupted operations".to_owned()
+        // An activation can be interrupted before it journals anything, so the
+        // records are finalized even when no operation needs recovering.
+        let activations = onera.recover_profile_activations().await?;
+        emit(json, &serde_json::to_value(&activations)?, || {
+            if activations.is_empty() {
+                "no interrupted operations".to_owned()
+            } else {
+                format!("finalized {} interrupted activation(s)", activations.len())
+            }
         });
         return Ok(());
     }
@@ -1387,7 +1491,18 @@ async fn recover(onera: &Onera, rollback: bool, progress: &CliProgress, json: bo
             }
         }
     }
-    if !rollback && !json {
+    // Only after the journal half has been resolved: an activation whose
+    // operation is still in flight is deliberately left alone.
+    let activations = onera.recover_profile_activations().await?;
+    if !json {
+        for activation in &activations {
+            println!(
+                "activation of {} finalized as {:?}",
+                activation.to_profile_id, activation.state
+            );
+        }
+    }
+    if !rollback && !interrupted.is_empty() && !json {
         println!("\npass --rollback to undo these, or resolve them in the desktop application");
     }
     Ok(())
@@ -1654,7 +1769,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_crud_commands_parse_without_activation_commands() {
+    fn profile_commands_parse() {
         let id = "00000000-0000-0000-0000-000000000000".to_owned();
         for args in [
             vec!["onera", "profiles", "list", "--game", &id],
@@ -1666,10 +1781,68 @@ mod tests {
             vec!["onera", "profiles", "disable", &id],
             vec!["onera", "profiles", "pin", &id, "--unpin"],
             vec!["onera", "profiles", "reorder", &id, "--priority", "-10"],
+            vec!["onera", "profiles", "plan-activate", "--profile", &id],
+            vec!["onera", "profiles", "activate", "--profile", &id],
+            vec![
+                "onera",
+                "profiles",
+                "activate",
+                "--profile",
+                &id,
+                "--expect",
+                "b3:0123",
+            ],
         ] {
-            assert!(Cli::try_parse_from(args).is_ok());
+            assert!(Cli::try_parse_from(args.clone()).is_ok(), "{args:?}");
         }
-        assert!(Cli::try_parse_from(["onera", "profiles", "plan-activate", &id]).is_err());
+        // The profile is named, never positional: activating the wrong game's
+        // profile because two ids swapped places is not a mistake worth
+        // allowing.
         assert!(Cli::try_parse_from(["onera", "profiles", "activate", &id]).is_err());
+    }
+
+    #[test]
+    fn an_activation_preview_prints_its_contract_payload() {
+        use onera_core::domain::baseline::BaselineFreshness;
+        use onera_core::domain::dependency::{
+            ResolutionEvidence, ResolutionOutcome, ResolutionResult,
+        };
+        use onera_core::domain::profile::ProfileActivationPreview;
+        use onera_core::domain::reconcile::{reconcile, DesiredGameState};
+        use onera_core::ids::LocalGameId;
+
+        let preview = ProfileActivationPreview::assemble(
+            None,
+            ProfileId::new(),
+            reconcile(
+                DesiredGameState::new(LocalGameId::new(), vec![]),
+                &std::collections::BTreeMap::new(),
+                &[],
+            ),
+            vec![],
+            ResolutionResult {
+                outcome: ResolutionOutcome::Compatible,
+                health: vec![],
+                evidence: ResolutionEvidence::default(),
+            },
+            BaselineFreshness::Fresh,
+            &[],
+        );
+        let json = serde_json::to_value(&preview).unwrap();
+        // The fields `docs/frontend-contracts.md` promises, by name.
+        for field in [
+            "from_profile_id",
+            "to_profile_id",
+            "plan",
+            "downloads",
+            "dependency",
+            "baseline_freshness",
+            "bytes_to_write",
+            "ready",
+            "blockers",
+        ] {
+            assert!(json.get(field).is_some(), "missing {field}");
+        }
+        assert_eq!(json["ready"], serde_json::json!(true));
     }
 }

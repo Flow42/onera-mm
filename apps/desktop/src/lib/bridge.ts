@@ -33,7 +33,12 @@ import type {
   LocalGame,
   ModDetails,
   ProviderStackView,
+  Profile,
+  ProfileActivation,
+  ProfileActivationPreview,
+  ProfileMember,
   RemovalPreview,
+  ResolutionResult,
   StartupStatus,
   VerifyReport,
 } from './types';
@@ -214,6 +219,40 @@ export const commands = {
     call<CleanRestorePreview>('plan_return_to_clean', { gameId }),
   applyReturnToClean: (gameId: string) =>
     call<CleanRestoreReport>('apply_return_to_clean', { gameId }),
+
+  /* profiles (desired state only until activateProfile) */
+  profiles: (gameId: string) => call<Profile[]>('profiles', { gameId }),
+  profileMembers: (profileId: string) => call<ProfileMember[]>('profile_members', { profileId }),
+  createProfile: (gameId: string, name: string, description?: string, copyFromProfileId?: string) =>
+    call<Profile>('create_profile', {
+      gameId,
+      name,
+      description: description ?? null,
+      copyFromProfileId: copyFromProfileId ?? null,
+    }),
+  renameProfile: (profileId: string, name: string) =>
+    call<Profile>('rename_profile', { profileId, name }),
+  deleteProfile: (profileId: string) => call<Profile>('delete_profile', { profileId }),
+  addProfileMember: (profileId: string, modId: string, providerFileId?: string) =>
+    call<ProfileMember>('add_profile_member', {
+      profileId,
+      modId,
+      providerFileId: providerFileId ?? null,
+    }),
+  removeProfileMember: (memberId: string) =>
+    call<ProfileMember>('remove_profile_member', { memberId }),
+  setMemberState: (memberId: string, desired: 'enabled' | 'disabled') =>
+    call<ProfileMember>('set_member_state', { memberId, desired }),
+  setMemberPin: (memberId: string, pinned: boolean, reason?: string) =>
+    call<ProfileMember>('set_member_pin', { memberId, pinned, reason: reason ?? null }),
+  reorderProfileMember: (memberId: string, priority: number) =>
+    call<ProfileMember>('reorder_profile_member', { memberId, priority }),
+  resolveDependencies: (profileId: string) =>
+    call<ResolutionResult>('resolve_dependencies', { profileId }),
+  planProfileActivation: (profileId: string) =>
+    call<ProfileActivationPreview>('plan_profile_activation', { profileId }),
+  activateProfile: (profileId: string) =>
+    call<ProfileActivation>('activate_profile', { profileId }),
 
   /* recovery and diagnostics */
   interruptedOperations: () => call<InterruptedOperation[]>('interrupted_operations'),

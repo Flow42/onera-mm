@@ -698,6 +698,21 @@ pub trait DeploymentStore: Send + Sync {
         archive: ArchiveId,
     ) -> Result<()>;
 
+    /// Record an acquired artifact that is deliberately *not* deployed.
+    ///
+    /// This is what preparing a profile activation produces: the archive is
+    /// downloaded, validated and mapped, but nothing in the game directory has
+    /// changed and no other artifact in the lineage loses its active slot. The
+    /// reconciler decides later, under the journal, whether it becomes active.
+    async fn record_retained_installation(
+        &self,
+        installation: InstallationId,
+        game: LocalGameId,
+        mod_id: ModId,
+        release: ReleaseId,
+        archive: ArchiveId,
+    ) -> Result<()>;
+
     /// Forget an installation once every file it owned has been released.
     async fn remove_installation(&self, installation: InstallationId) -> Result<()>;
 
@@ -763,6 +778,26 @@ pub trait ReconciliationStore: Send + Sync {
         &self,
         operation: OperationId,
         plan: &MutationPlan,
+    ) -> Result<()> {
+        self.complete_reconciliation_publishing(operation, plan, None)
+            .await
+    }
+
+    /// Publish a completed reconciliation and, in the same transaction, make a
+    /// profile the active one.
+    ///
+    /// The two halves must commit together. A profile marked active in its own
+    /// statement could survive a crash that lost the deployment it describes,
+    /// which is precisely the lie the activation flow exists to prevent: the
+    /// target profile is reported active only once the filesystem matches it.
+    ///
+    /// Any activation attempt recorded for that profile and still `applying` is
+    /// finished in the same transaction.
+    async fn complete_reconciliation_publishing(
+        &self,
+        operation: OperationId,
+        plan: &MutationPlan,
+        activate_profile: Option<ProfileId>,
     ) -> Result<()>;
 }
 

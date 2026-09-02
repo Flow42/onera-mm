@@ -44,7 +44,7 @@ use onera_install::planner::{plan_install, PlanRequest, RootMap};
 use onera_install::remove::{ModifiedFilePolicy, RemovalReport, Remover};
 use onera_install::{
     recover_all, verify_installation, GameLocks, InstallReport, Installer, InterruptedOperation,
-    RealFileSystem, ReconciliationEngine, VerifyReport,
+    Publication, RealFileSystem, ReconciliationAttempt, ReconciliationEngine, VerifyReport,
 };
 use onera_nexus::{ApiKeyAuth, NexusClient, NexusConfig};
 use std::path::PathBuf;
@@ -61,15 +61,15 @@ pub struct Onera {
     /// Resolved XDG directories.
     pub paths: crate::Paths,
     db: Database,
-    provider: Arc<dyn ModProvider>,
+    pub(crate) provider: Arc<dyn ModProvider>,
     auth: Arc<dyn AuthProvider>,
-    archives: Arc<dyn ArchiveBackend>,
+    pub(crate) archives: Arc<dyn ArchiveBackend>,
     downloader: Arc<Downloader>,
     installer: Arc<Installer>,
     remover: Arc<Remover>,
-    reconciler: Arc<ReconciliationEngine>,
+    pub(crate) reconciler: Arc<ReconciliationEngine>,
     backups: Arc<dyn onera_core::ports::BackupStore>,
-    locks: GameLocks,
+    pub(crate) locks: GameLocks,
     download_lock: tokio::sync::Mutex<()>,
     expired_prepared_plans: u64,
 }
@@ -1291,8 +1291,30 @@ impl Onera {
         progress: &dyn ProgressSink,
         cancel: &CancelToken,
     ) -> Result<()> {
+        let _guard = self
+            .locks
+            .acquire(prepared.plan.desired.local_game_id)
+            .await;
+        self.apply_state_locked(prepared, kind, Publication::none(), progress, cancel)
+            .await
+            .result
+    }
+
+    /// Apply an approved state preview while the game lock is already held.
+    ///
+    /// Callers that sequence several steps under one lock — profile activation
+    /// acquires it before it starts downloading — use this and keep the guard
+    /// themselves. It reports the journaled operation whether or not the apply
+    /// succeeded, which is what an activation record needs.
+    pub(crate) async fn apply_state_locked(
+        &self,
+        prepared: &PreparedState,
+        kind: OperationKind,
+        publication: Publication,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> ReconciliationAttempt {
         let game = prepared.plan.desired.local_game_id;
-        let _guard = self.locks.acquire(game).await;
         let mut needed = std::collections::BTreeSet::new();
         for step in &prepared.plan.steps {
             if let MutationStep::Write { provider, .. } = step {
@@ -1302,7 +1324,7 @@ impl Onera {
             }
         }
         let mut extracted = std::collections::BTreeMap::new();
-        let result = async {
+        let staged = async {
             for installation in needed {
                 let archive = self
                     .db
@@ -1346,23 +1368,34 @@ impl Onera {
                     }
                 }
             }
-            self.reconciler
-                .apply_as(
-                    &prepared.plan,
-                    &prepared.mappings,
-                    &extracted,
-                    &prepared.roots,
-                    kind,
-                    progress,
-                    cancel,
-                )
-                .await
+            Ok(())
         }
         .await;
+        let attempt = match staged {
+            Err(error) => ReconciliationAttempt {
+                operation: None,
+                rolled_back: false,
+                result: Err(error),
+            },
+            Ok(()) => {
+                self.reconciler
+                    .attempt(
+                        &prepared.plan,
+                        &prepared.mappings,
+                        &extracted,
+                        &prepared.roots,
+                        kind,
+                        publication,
+                        progress,
+                        cancel,
+                    )
+                    .await
+            }
+        };
         for staging in extracted.values() {
             let _ = tokio::fs::remove_dir_all(staging).await;
         }
-        result
+        attempt
     }
 
     /// Enable a retained artifact through the shared reconciler.

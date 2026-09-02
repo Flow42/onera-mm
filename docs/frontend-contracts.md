@@ -4,7 +4,8 @@ The request and response shapes for Milestones 2–4, fixed **before** the
 backends behind them exist so frontend work can be built and tested against
 stable mocks.
 
-Nothing in this document is implemented yet. The domain types it describes are
+The baseline commands and the profile commands through `activate_profile` are
+implemented; the dependency commands are not. The domain types are
 (`onera_core::domain::{baseline, profile, dependency}`), and every payload here
 is the serialization of one of them, so a mock written against this file and the
 eventual real command return the same JSON.
@@ -286,8 +287,10 @@ be activated first, so a game is never left without one.
   "ready": false,
   "blockers": [
     { "kind": "cross_mod_conflict", "target": "game:archive/pc/mod/a.archive" },
-    { "kind": "dependency_unsatisfied", "member_id": "22…" }
-  ]
+    { "kind": "dependency_unsatisfied", "member_id": "22…" },
+    { "kind": "unresolved_selection", "member_id": "23…" }
+  ],
+  "fingerprint": "b3:…"
 }
 ```
 
@@ -297,9 +300,28 @@ with the existing `decide` command and are **separate from dependency
 problems** — accepting a dependency risk never picks a winner for a path
 conflict.
 
-`activate_profile` returns the activation record. `state` is one of `preparing`,
-`applying`, `applied`, `rolled_back`, `failed`; the target profile is reported
-active only in `applied`, which is reached after filesystem verification.
+`blocker.kind` is `cross_mod_conflict`, `dependency_unsatisfied` or
+`unresolved_selection`. The last one is an enabled member that names neither a
+downloaded artifact nor a provider file: Onera does not choose a version for
+the user, so the member is refused rather than quietly left out of the switch.
+A member that names a file it has not downloaded is **not** a blocker — it is a
+row in `downloads`, and `bytes` there is `null` when the provider did not
+report a size, which a total must not render as zero.
+
+`fingerprint` digests the desired state, the disk changes, their preconditions
+and the blockers — the parts of the preview the user's approval is actually
+about, and not the advisory disclosure around them. Send it back as
+`activate_profile`'s `expectedFingerprint`: if the profile or the deployment
+moved in the meantime the command returns `conflict` and asks for a fresh
+preview, instead of applying a different plan than the one that was shown.
+Omitting it applies whatever is current.
+
+`activate_profile` (`{ profileId, expectedFingerprint? }`) returns the
+activation record. `state` is one of `preparing`, `applying`, `applied`,
+`rolled_back`, `failed`; the target profile is reported active only in
+`applied`, which is reached after filesystem verification — in the same
+database transaction that publishes the deployment, so the two can never come
+apart. Every other state leaves the previous profile active.
 
 ## Dependency commands
 
@@ -453,7 +475,7 @@ onera profiles disable  --member <member-id>
 onera profiles pin      --member <member-id> [--reason <text>]
 onera profiles reorder  --member <member-id> --priority <int>
 onera profiles plan-activate --profile <profile-id>
-onera profiles activate      --profile <profile-id>
+onera profiles activate      --profile <profile-id> [--expect <fingerprint>]
 
 onera deps check    --profile <profile-id>
 onera deps show     --mod <mod-id> --file <provider-file-id>

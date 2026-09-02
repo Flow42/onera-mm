@@ -312,3 +312,165 @@ export interface CleanRestoreReport {
   verification: BaselineVerification;
   clean: boolean;
 }
+
+// ---------------------------------------------------------------------------
+// Profiles and activation
+// ---------------------------------------------------------------------------
+
+/** A reusable desired mod set belonging to one concrete game installation. */
+export interface Profile {
+  id: string;
+  local_game_id: string;
+  name: string;
+  description: string | null;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MemberSelection {
+  provider: string;
+  provider_mod_id: string;
+  provider_file_id: string | null;
+  provider_version_id: string | null;
+  provider_file_group_id: string | null;
+}
+
+export type MemberPin =
+  { kind: 'unpinned' } | { kind: 'pinned'; pinned_at: string; reason: string | null };
+
+/** One row in a profile's signed-priority member list. */
+export interface ProfileMember {
+  id: string;
+  profile_id: string;
+  mod_id: string;
+  selection: MemberSelection;
+  installation_id: string | null;
+  desired: 'enabled' | 'disabled';
+  pin: MemberPin;
+  priority: number;
+  added_at: string;
+}
+
+export interface DependencyProblem {
+  source: {
+    provider: string;
+    game_slug: string;
+    provider_mod_id: string;
+    provider_file_id: string | null;
+    provider_version_id: string | null;
+  };
+  group_id: string;
+  label: string;
+  explanation: string;
+}
+
+export type DependencyHealthKind =
+  'satisfied' | 'unsatisfied' | 'ignored' | 'not_applicable' | 'unknown';
+
+export interface MemberDependencyHealth {
+  profile_member_id: string;
+  health: DependencyHealthKind;
+  unsatisfied: DependencyProblem[];
+}
+
+export type DependencyOutcome =
+  | { kind: 'compatible' }
+  | { kind: 'unsatisfied' }
+  | { kind: 'unknown'; reason?: string }
+  | {
+      kind: 'install_missing' | 'update_set' | 'disable_set';
+      select?: Array<Record<string, string | null>>;
+      install?: Array<Record<string, string | null>>;
+      disable?: string[];
+    };
+
+export interface DependencyEvidence {
+  fresh: number;
+  cached: number;
+  stale: number;
+  unavailable: number;
+  unsupported: number;
+  unknown_dlc: number;
+}
+
+export interface ResolutionResult {
+  outcome: DependencyOutcome;
+  health: MemberDependencyHealth[];
+  evidence: DependencyEvidence;
+}
+
+/** Adapter-root-relative path. Blocker targets are already formatted strings. */
+export type MutationTarget = string | { root_key: string; path: string };
+
+/**
+ * The reconciler currently serialises write/delete steps. Keeping `kind` open
+ * lets the view safely label later semantic step kinds instead of dropping
+ * them or pretending that an unrecognised change is harmless.
+ */
+export interface MutationStep {
+  kind: string;
+  target: MutationTarget;
+  provider?: {
+    provider: {
+      kind: string;
+      installation_id?: string;
+      backup_id?: string;
+    };
+    hash: string;
+    size: number;
+  };
+  expected_previous?: string | null;
+}
+
+export interface MutationConflict {
+  target: MutationTarget;
+  providers: string[];
+}
+
+export interface MutationPlan {
+  desired?: { local_game_id: string; installations: string[] };
+  final_stacks?: unknown[];
+  steps: MutationStep[];
+  expected_files?: unknown[];
+  conflicts: MutationConflict[];
+  conflict_decisions?: unknown[];
+}
+
+export interface ActivationDownload {
+  member_id: string;
+  name: string;
+  bytes: number;
+}
+
+export interface ActivationBlocker {
+  kind: string;
+  target?: string;
+  member_id?: string;
+  detail?: string;
+}
+
+export interface ProfileActivationPreview {
+  from_profile_id: string | null;
+  to_profile_id: string;
+  plan: MutationPlan;
+  downloads: ActivationDownload[];
+  dependency: ResolutionResult;
+  baseline_freshness: BaselineFreshness;
+  bytes_to_write: number;
+  ready: boolean;
+  blockers: ActivationBlocker[];
+}
+
+export type ProfileActivationState =
+  'preparing' | 'applying' | 'applied' | 'rolled_back' | 'failed';
+
+export interface ProfileActivation {
+  from_profile_id: string | null;
+  to_profile_id: string;
+  operation_id: string | null;
+  state: ProfileActivationState;
+  started_at: string;
+  finished_at: string | null;
+  error: string | null;
+}

@@ -43,9 +43,15 @@ fn parse_operation(id: &str) -> CommandResult<OperationId> {
 
 #[tauri::command]
 pub async fn startup_status(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
+    let recovery_required = !state.onera.interrupted_operations().await?.is_empty();
+    // Activation records left behind by a dead process are finished here, after
+    // journal recovery has had its say. None of them can make a target profile
+    // active: only the completion transaction does that.
+    let finalized_activations = state.onera.recover_profile_activations().await?.len();
     Ok(json!({
         "authenticated": state.onera.is_authenticated().await?,
-        "recovery_required": !state.onera.interrupted_operations().await?.is_empty(),
+        "recovery_required": recovery_required,
+        "finalized_activations": finalized_activations,
         "inbox_count": state.onera.inbox_requests().await?.len(),
         "expired_plans": state.onera.expired_prepared_plans(),
     }))
@@ -191,10 +197,10 @@ pub async fn installed_mods(
     state: State<'_, AppState>,
     game_id: String,
 ) -> CommandResult<serde_json::Value> {
-    Ok(serde_json::to_value(
-        state.onera.installed_mods(parse_game(&game_id)?).await?,
+    Ok(
+        serde_json::to_value(state.onera.installed_mods(parse_game(&game_id)?).await?)
+            .unwrap_or(serde_json::Value::Null),
     )
-    .unwrap_or(serde_json::Value::Null))
 }
 
 #[tauri::command]
@@ -214,8 +220,10 @@ pub async fn check_updates(
 
 #[tauri::command]
 pub async fn inbox_requests(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
-    Ok(serde_json::to_value(state.onera.inbox_requests().await?)
-        .unwrap_or(serde_json::Value::Null))
+    Ok(
+        serde_json::to_value(state.onera.inbox_requests().await?)
+            .unwrap_or(serde_json::Value::Null),
+    )
 }
 
 #[tauri::command]
@@ -230,10 +238,7 @@ pub async fn dismiss_inbox_request(
             code: "invalid_input".into(),
             message: "that is not a valid inbox request id".into(),
         })?;
-    state
-        .onera
-        .dismiss_inbox_request(id)
-        .await?;
+    state.onera.dismiss_inbox_request(id).await?;
     Ok(())
 }
 
@@ -255,8 +260,7 @@ pub async fn complete_inbox_request(
 
 #[tauri::command]
 pub async fn downloads(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
-    Ok(serde_json::to_value(state.onera.downloads().await?)
-        .unwrap_or(serde_json::Value::Null))
+    Ok(serde_json::to_value(state.onera.downloads().await?).unwrap_or(serde_json::Value::Null))
 }
 
 #[tauri::command]
@@ -545,6 +549,246 @@ pub async fn verify(
 }
 
 // ---------------------------------------------------------------------------
+// Profiles
+// ---------------------------------------------------------------------------
+
+fn parse_profile(id: &str) -> CommandResult<onera_core::ids::ProfileId> {
+    onera_core::ids::ProfileId::from_str(id).map_err(|_| CommandError {
+        code: "internal".into(),
+        message: "that is not a valid profile id".into(),
+    })
+}
+
+/// Every profile for a game. Exactly one is active.
+#[tauri::command]
+pub async fn profiles(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> CommandResult<serde_json::Value> {
+    let profiles = state.onera.profiles(parse_game(&game_id)?).await?;
+    Ok(serde_json::to_value(&profiles).unwrap_or(serde_json::Value::Null))
+}
+
+/// One profile's members, lowest priority first.
+///
+/// `installation_id: null` is a member whose artifact is not downloaded yet —
+/// a download in the activation preview, never an omission.
+#[tauri::command]
+pub async fn profile_members(
+    state: State<'_, AppState>,
+    profile_id: String,
+) -> CommandResult<serde_json::Value> {
+    let details = state
+        .onera
+        .profile_details(parse_profile(&profile_id)?)
+        .await?;
+    Ok(serde_json::to_value(&details.members).unwrap_or(serde_json::Value::Null))
+}
+
+fn parse_member(id: &str) -> CommandResult<onera_core::ids::ProfileMemberId> {
+    onera_core::ids::ProfileMemberId::from_str(id).map_err(|_| CommandError {
+        code: "internal".into(),
+        message: "that is not a valid profile member id".into(),
+    })
+}
+
+/// Create an empty profile, or duplicate one as a starting point.
+#[tauri::command]
+pub async fn create_profile(
+    state: State<'_, AppState>,
+    game_id: String,
+    name: String,
+    description: Option<String>,
+    copy_from_profile_id: Option<String>,
+) -> CommandResult<serde_json::Value> {
+    let copy_from = copy_from_profile_id
+        .as_deref()
+        .map(parse_profile)
+        .transpose()?;
+    let profile = state
+        .onera
+        .create_profile(parse_game(&game_id)?, name, description, copy_from)
+        .await?;
+    Ok(serde_json::to_value(&profile).unwrap_or(serde_json::Value::Null))
+}
+
+#[tauri::command]
+pub async fn rename_profile(
+    state: State<'_, AppState>,
+    profile_id: String,
+    name: String,
+) -> CommandResult<serde_json::Value> {
+    let profile = state
+        .onera
+        .rename_profile(parse_profile(&profile_id)?, name)
+        .await?;
+    Ok(serde_json::to_value(&profile).unwrap_or(serde_json::Value::Null))
+}
+
+/// Delete an inactive profile.
+///
+/// Deleting the active one returns `conflict`: another profile must be
+/// activated first, so a game is never left without one.
+#[tauri::command]
+pub async fn delete_profile(state: State<'_, AppState>, profile_id: String) -> CommandResult<()> {
+    state
+        .onera
+        .delete_profile(parse_profile(&profile_id)?)
+        .await?;
+    Ok(())
+}
+
+/// Add a mod lineage to a profile's desired state. Changes nothing on disk.
+#[tauri::command]
+pub async fn add_profile_member(
+    state: State<'_, AppState>,
+    profile_id: String,
+    mod_id: String,
+    provider_file_id: Option<String>,
+) -> CommandResult<serde_json::Value> {
+    let mod_id = onera_core::ids::ModId::from_str(&mod_id).map_err(|_| CommandError {
+        code: "internal".into(),
+        message: "that is not a valid mod id".into(),
+    })?;
+    let member = state
+        .onera
+        .add_profile_member(
+            parse_profile(&profile_id)?,
+            mod_id,
+            provider_file_id.map(ProviderFileId::new),
+        )
+        .await?;
+    Ok(serde_json::to_value(&member).unwrap_or(serde_json::Value::Null))
+}
+
+#[tauri::command]
+pub async fn remove_profile_member(
+    state: State<'_, AppState>,
+    member_id: String,
+) -> CommandResult<()> {
+    state
+        .onera
+        .remove_profile_member(parse_member(&member_id)?)
+        .await?;
+    Ok(())
+}
+
+/// Enable or disable a member in desired state only.
+#[tauri::command]
+pub async fn set_member_state(
+    state: State<'_, AppState>,
+    member_id: String,
+    desired: String,
+) -> CommandResult<serde_json::Value> {
+    let desired = match desired.as_str() {
+        "enabled" => onera_core::domain::profile::DesiredModState::Enabled,
+        "disabled" => onera_core::domain::profile::DesiredModState::Disabled,
+        other => {
+            return Err(CommandError {
+                code: "internal".into(),
+                message: format!("{other:?} is not a desired mod state"),
+            })
+        }
+    };
+    let member = state
+        .onera
+        .set_member_state(parse_member(&member_id)?, desired)
+        .await?;
+    Ok(serde_json::to_value(&member).unwrap_or(serde_json::Value::Null))
+}
+
+#[tauri::command]
+pub async fn set_member_pin(
+    state: State<'_, AppState>,
+    member_id: String,
+    pinned: bool,
+    reason: Option<String>,
+) -> CommandResult<serde_json::Value> {
+    let member = state
+        .onera
+        .set_member_pin(parse_member(&member_id)?, pinned, reason)
+        .await?;
+    Ok(serde_json::to_value(&member).unwrap_or(serde_json::Value::Null))
+}
+
+/// Move a member in the provider stack.
+///
+/// `priority` is a signed integer, not a list index: inserting between two
+/// members does not renumber the profile.
+#[tauri::command]
+pub async fn reorder_profile_member(
+    state: State<'_, AppState>,
+    member_id: String,
+    priority: i32,
+) -> CommandResult<serde_json::Value> {
+    let member = state
+        .onera
+        .reorder_profile_member(
+            parse_member(&member_id)?,
+            onera_core::domain::profile::MemberPriority(priority),
+        )
+        .await?;
+    Ok(serde_json::to_value(&member).unwrap_or(serde_json::Value::Null))
+}
+
+/// Preview a profile switch without touching the game directory.
+///
+/// `ready` is false whenever `blockers` is non-empty. Cross-mod conflicts are
+/// resolved with `decide` and stay separate from dependency problems: accepting
+/// a dependency risk never picks a winner for a path conflict.
+#[tauri::command]
+pub async fn plan_profile_activation(
+    state: State<'_, AppState>,
+    profile_id: String,
+) -> CommandResult<serde_json::Value> {
+    let preview = state
+        .onera
+        .plan_profile_activation(parse_profile(&profile_id)?)
+        .await?;
+    Ok(serde_json::to_value(&preview).unwrap_or(serde_json::Value::Null))
+}
+
+/// Apply a profile switch.
+///
+/// `expectedFingerprint` is the digest carried by the preview the user
+/// approved; sending it back turns a desired state that moved in the meantime
+/// into `conflict` instead of a silently different apply. The returned record
+/// reports the target profile active only in `applied`, which is reached after
+/// the written files have been re-hashed.
+#[tauri::command]
+pub async fn activate_profile(
+    state: State<'_, AppState>,
+    profile_id: String,
+    expected_fingerprint: Option<String>,
+) -> CommandResult<serde_json::Value> {
+    let cancel = onera_core::progress::CancelToken::new();
+    let progress = state.progress();
+    let activation = state
+        .onera
+        .activate_profile(
+            parse_profile(&profile_id)?,
+            expected_fingerprint.as_deref(),
+            &progress,
+            &cancel,
+        )
+        .await?;
+    Ok(serde_json::to_value(&activation).unwrap_or(serde_json::Value::Null))
+}
+
+/// Recent activation attempts for a game, newest first.
+#[tauri::command]
+pub async fn profile_activation_history(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> CommandResult<serde_json::Value> {
+    let history = state
+        .onera
+        .profile_activation_history(parse_game(&game_id)?, 20)
+        .await?;
+    Ok(serde_json::to_value(&history).unwrap_or(serde_json::Value::Null))
+}
+
+// ---------------------------------------------------------------------------
 // Baseline
 // ---------------------------------------------------------------------------
 
@@ -798,4 +1042,35 @@ pub async fn diagnostics(state: State<'_, AppState>) -> CommandResult<serde_json
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "not found".to_owned()),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onera_core::CoreError;
+
+    #[test]
+    fn identifier_arguments_are_parsed_not_trusted() {
+        assert!(parse_profile(&onera_core::ids::ProfileId::new().to_string()).is_ok());
+        let rejected = parse_profile("../../etc/passwd").unwrap_err();
+        assert_eq!(rejected.code, "internal");
+        assert!(parse_game("not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn the_activation_refusals_carry_the_codes_the_contract_names() {
+        // A preview that is not ready.
+        let blocked: CommandError = CoreError::DecisionRequired("2 blockers".into()).into();
+        assert_eq!(blocked.code, "decision_required");
+        // A preview whose desired state moved underneath it.
+        let stale: CommandError = CoreError::Conflict("the preview is out of date".into()).into();
+        assert_eq!(stale.code, "conflict");
+        // An unknown profile.
+        let missing: CommandError = CoreError::NotFound {
+            kind: "profile",
+            id: "x".into(),
+        }
+        .into();
+        assert_eq!(missing.code, "not_found");
+    }
 }

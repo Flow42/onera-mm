@@ -63,4 +63,62 @@ describe('commands', () => {
 
     setBridge(null);
   });
+
+  it('uses the documented profile command names and camelCase arguments', async () => {
+    const invoke = vi.fn().mockResolvedValue({});
+    setBridge({ invoke, listen: vi.fn() });
+
+    await commands.profiles('game-1');
+    await commands.profileMembers('profile-1');
+    await commands.createProfile('game-1', 'Quiet', undefined, 'profile-1');
+    await commands.renameProfile('profile-1', 'Loud');
+    await commands.deleteProfile('profile-1');
+    await commands.addProfileMember('profile-1', 'mod-1');
+    await commands.removeProfileMember('member-1');
+    await commands.setMemberState('member-1', 'disabled');
+    await commands.setMemberPin('member-1', true, 'known good');
+    await commands.reorderProfileMember('member-1', -12);
+    await commands.resolveDependencies('profile-1');
+    await commands.planProfileActivation('profile-1');
+    await commands.activateProfile('profile-1');
+
+    expect(invoke.mock.calls).toEqual([
+      ['profiles', { gameId: 'game-1' }],
+      ['profile_members', { profileId: 'profile-1' }],
+      [
+        'create_profile',
+        {
+          gameId: 'game-1',
+          name: 'Quiet',
+          description: null,
+          copyFromProfileId: 'profile-1',
+        },
+      ],
+      ['rename_profile', { profileId: 'profile-1', name: 'Loud' }],
+      ['delete_profile', { profileId: 'profile-1' }],
+      ['add_profile_member', { profileId: 'profile-1', modId: 'mod-1', providerFileId: null }],
+      ['remove_profile_member', { memberId: 'member-1' }],
+      ['set_member_state', { memberId: 'member-1', desired: 'disabled' }],
+      ['set_member_pin', { memberId: 'member-1', pinned: true, reason: 'known good' }],
+      ['reorder_profile_member', { memberId: 'member-1', priority: -12 }],
+      ['resolve_dependencies', { profileId: 'profile-1' }],
+      ['plan_profile_activation', { profileId: 'profile-1' }],
+      ['activate_profile', { profileId: 'profile-1' }],
+    ]);
+
+    setBridge(null);
+  });
+
+  it('preserves the stable conflict code for active-profile deletion', async () => {
+    setBridge({
+      invoke: vi.fn().mockRejectedValue({
+        code: 'conflict',
+        message: 'the active profile cannot be deleted',
+      }),
+      listen: vi.fn(),
+    });
+
+    await expect(commands.deleteProfile('active')).rejects.toMatchObject({ code: 'conflict' });
+    setBridge(null);
+  });
 });

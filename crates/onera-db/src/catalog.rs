@@ -527,6 +527,76 @@ impl Database {
         .transpose()
     }
 
+    /// Look one cached mod up by Onera's own identifier.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn mod_by_id(&self, id: ModId) -> Result<Option<Mod>> {
+        let row = sqlx::query(
+            "SELECT provider_id, provider_mod_id, game_slug, name, author
+             FROM mods WHERE id = ?1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+
+        row.map(|row| {
+            let provider: String = row.try_get("provider_id").map_err(db_err)?;
+            let provider_mod_id: String = row.try_get("provider_mod_id").map_err(db_err)?;
+            Ok(Mod {
+                id,
+                provider: ProviderId::new(provider),
+                provider_mod_id: ProviderModId::new(provider_mod_id),
+                game_slug: row.try_get("game_slug").map_err(db_err)?,
+                name: row.try_get("name").map_err(db_err)?,
+                author: row.try_get("author").map_err(db_err)?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Look one cached provider file up by its opaque provider identity.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn provider_file(
+        &self,
+        provider: &ProviderId,
+        provider_file_id: &ProviderFileId,
+    ) -> Result<Option<ProviderFile>> {
+        let row = sqlx::query(
+            "SELECT release_id, name, size_bytes, category, published_hash,
+                    uploaded_at, is_primary
+             FROM provider_files WHERE provider_id = ?1 AND provider_file_id = ?2",
+        )
+        .bind(provider.as_str())
+        .bind(provider_file_id.as_str())
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+
+        row.map(|row| {
+            let release: String = row.try_get("release_id").map_err(db_err)?;
+            let category: String = row.try_get("category").map_err(db_err)?;
+            let size: Option<i64> = row.try_get("size_bytes").map_err(db_err)?;
+            let uploaded: Option<String> = row.try_get("uploaded_at").map_err(db_err)?;
+            let primary: i64 = row.try_get("is_primary").map_err(db_err)?;
+            Ok(ProviderFile {
+                provider: provider.clone(),
+                provider_file_id: provider_file_id.clone(),
+                release_id: ReleaseId::from(uuid(&release)?),
+                name: row.try_get("name").map_err(db_err)?,
+                size_bytes: size.map(|s| s as u64),
+                category: parse_category(&category),
+                published_hash: opt_hash(row.try_get("published_hash").map_err(db_err)?)?,
+                uploaded_at: uploaded.as_deref().map(from_timestamp).transpose()?,
+                is_primary: primary != 0,
+            })
+        })
+        .transpose()
+    }
+
     /// Cache a release. The version string is stored verbatim.
     ///
     /// # Errors

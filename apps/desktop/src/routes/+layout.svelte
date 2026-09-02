@@ -6,6 +6,7 @@
 
   const sections = [
     { href: '/games', label: 'Games' },
+    { href: '/profiles', label: 'Profiles' },
     { href: '/add', label: 'Add mods' },
     { href: '/mods', label: 'Installed' },
     { href: '/updates', label: 'Updates' },
