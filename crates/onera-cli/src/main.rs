@@ -13,7 +13,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use onera_app::{InstallRequest, Onera, Paths};
-use onera_core::ids::{InstallationId, LocalGameId, ProviderFileId, ProviderModId};
+use onera_core::domain::baseline::{BaselineFreshness, BaselineSource};
+use onera_core::domain::profile::{DesiredModState, MemberPriority};
+use onera_core::ids::{
+    InstallationId, LocalGameId, ModId, ProfileId, ProfileMemberId, ProviderFileId, ProviderModId,
+};
 use onera_core::plan::{ConflictChoice, Decision, DecisionScope};
 use onera_core::progress::{CancelToken, ProgressEvent, ProgressSink, Stage};
 use onera_core::redact::Secret;
@@ -175,10 +179,57 @@ enum Commands {
         #[arg(long)]
         rollback: bool,
     },
+    /// Inspect, capture and verify a game's clean-state baseline.
+    Baseline {
+        #[command(subcommand)]
+        action: BaselineAction,
+    },
     /// Configure browser Native Messaging for portable/AppImage installs.
     Browser {
         #[command(subcommand)]
         action: BrowserAction,
+    },
+    /// Manage reusable desired-state profiles without activating them.
+    Profiles {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BaselineAction {
+    /// Show the baseline, its freshness, and whether a capture can start.
+    Status {
+        /// Registered game installation id.
+        #[arg(long)]
+        game: String,
+    },
+    /// Hash the store-managed scope and record it as the current baseline.
+    Capture {
+        /// Registered game installation id.
+        #[arg(long)]
+        game: String,
+        /// Confirm that the store's own file verification was run and finished.
+        ///
+        /// Onera cannot check this itself, so a store-verified capture refuses
+        /// to start without it.
+        #[arg(long)]
+        verified: bool,
+        /// Record a clearly labelled local snapshot instead.
+        #[arg(long, conflicts_with = "verified")]
+        local_snapshot: bool,
+        /// Show what would be scanned and stop.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Compare the installation with its baseline.
+    Verify {
+        /// Registered game installation id.
+        #[arg(long)]
+        game: String,
+        /// Compare sizes and modes only. Fast, and never reports clean.
+        #[arg(long)]
+        quick: bool,
     },
 }
 
@@ -208,6 +259,94 @@ enum BrowserAction {
         /// Absolute path to the onera-nmhost executable.
         #[arg(long, default_value = "/usr/lib/onera/onera-nmhost")]
         host_path: std::path::PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileAction {
+    /// List every profile for a registered local game.
+    List {
+        /// Registered local game installation id.
+        #[arg(long)]
+        game: String,
+    },
+    /// Create an empty profile or duplicate an existing profile.
+    Create {
+        /// Registered local game installation id.
+        #[arg(long)]
+        game: String,
+        /// Per-game unique display name.
+        #[arg(long)]
+        name: String,
+        /// Optional profile note.
+        #[arg(long)]
+        description: Option<String>,
+        /// Existing profile in the same game to duplicate.
+        #[arg(long = "from-profile")]
+        from_profile: Option<String>,
+    },
+    /// Rename a profile.
+    Rename {
+        /// Profile id.
+        profile: String,
+        /// New per-game unique display name.
+        #[arg(long)]
+        name: String,
+    },
+    /// Delete an inactive profile.
+    Delete {
+        /// Profile id.
+        profile: String,
+    },
+    /// Show one profile and its priority-ordered members.
+    Show {
+        /// Profile id.
+        profile: String,
+    },
+    /// Add a mod lineage to a profile's desired state.
+    Add {
+        /// Profile id.
+        profile: String,
+        /// Onera mod-lineage id.
+        #[arg(long = "mod")]
+        mod_id: String,
+        /// Optional opaque provider file id.
+        #[arg(long = "file")]
+        provider_file: Option<String>,
+    },
+    /// Remove a member from its profile.
+    Remove {
+        /// Profile member id.
+        member: String,
+    },
+    /// Mark a member enabled in desired state.
+    Enable {
+        /// Profile member id.
+        member: String,
+    },
+    /// Mark a member disabled in desired state.
+    Disable {
+        /// Profile member id.
+        member: String,
+    },
+    /// Pin a member's selected provider version, or unpin it.
+    Pin {
+        /// Profile member id.
+        member: String,
+        /// Optional explanation for the pin.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Remove the existing pin.
+        #[arg(long, conflicts_with = "reason")]
+        unpin: bool,
+    },
+    /// Assign a signed provider-stack priority to a member.
+    Reorder {
+        /// Profile member id.
+        member: String,
+        /// Lower values deploy first.
+        #[arg(long, allow_hyphen_values = true)]
+        priority: i32,
     },
 }
 
@@ -424,8 +563,187 @@ async fn main() -> Result<()> {
         Commands::Ownership { game, root, path } => {
             ownership(&onera, &game, &root, &path, cli.json).await
         }
+        Commands::Baseline { action } => {
+            baseline(&onera, action, &progress, &cancel, cli.json).await
+        }
         Commands::Recover { rollback } => recover(&onera, rollback, &progress, cli.json).await,
         Commands::Browser { action } => browser(action, cli.json).await,
+        Commands::Profiles { action } => profiles(&onera, action, cli.json).await,
+    }
+}
+
+async fn profiles(onera: &Onera, action: ProfileAction, json: bool) -> Result<()> {
+    match action {
+        ProfileAction::List { game } => {
+            let profiles = onera
+                .profiles(LocalGameId::from_str(&game).context("invalid game id")?)
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&profiles)?);
+            } else if profiles.is_empty() {
+                println!("no profiles for this game");
+            } else {
+                for profile in profiles {
+                    println!(
+                        "{}  {}{}",
+                        profile.id,
+                        profile.name,
+                        if profile.is_active { "  (active)" } else { "" }
+                    );
+                }
+            }
+        }
+        ProfileAction::Create {
+            game,
+            name,
+            description,
+            from_profile,
+        } => {
+            let profile = onera
+                .create_profile(
+                    LocalGameId::from_str(&game).context("invalid game id")?,
+                    name,
+                    description,
+                    from_profile
+                        .as_deref()
+                        .map(ProfileId::from_str)
+                        .transpose()
+                        .context("invalid source profile id")?,
+                )
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&profile)?);
+            } else {
+                println!("created {} ({})", profile.name, profile.id);
+            }
+        }
+        ProfileAction::Rename { profile, name } => {
+            let profile = onera
+                .rename_profile(
+                    ProfileId::from_str(&profile).context("invalid profile id")?,
+                    name,
+                )
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&profile)?);
+            } else {
+                println!("renamed profile {} to {}", profile.id, profile.name);
+            }
+        }
+        ProfileAction::Delete { profile } => {
+            let profile = ProfileId::from_str(&profile).context("invalid profile id")?;
+            onera.delete_profile(profile).await?;
+            emit(
+                json,
+                &serde_json::json!({ "deleted_profile_id": profile }),
+                || format!("deleted profile {profile}"),
+            );
+        }
+        ProfileAction::Show { profile } => {
+            let details = onera
+                .profile_details(ProfileId::from_str(&profile).context("invalid profile id")?)
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&details)?);
+            } else {
+                println!(
+                    "{} ({}){}",
+                    details.profile.name,
+                    details.profile.id,
+                    if details.profile.is_active {
+                        "  active"
+                    } else {
+                        ""
+                    }
+                );
+                for member in details.members {
+                    println!(
+                        "  {}  priority={}  {:?}  mod={}",
+                        member.id, member.priority.0, member.desired, member.mod_id
+                    );
+                }
+            }
+        }
+        ProfileAction::Add {
+            profile,
+            mod_id,
+            provider_file,
+        } => {
+            let member = onera
+                .add_profile_member(
+                    ProfileId::from_str(&profile).context("invalid profile id")?,
+                    ModId::from_str(&mod_id).context("invalid mod id")?,
+                    provider_file.map(ProviderFileId::new),
+                )
+                .await?;
+            print_profile_member(json, &member, "added");
+        }
+        ProfileAction::Remove { member } => {
+            let member = ProfileMemberId::from_str(&member).context("invalid member id")?;
+            onera.remove_profile_member(member).await?;
+            emit(
+                json,
+                &serde_json::json!({ "removed_member_id": member }),
+                || format!("removed profile member {member}"),
+            );
+        }
+        ProfileAction::Enable { member } => {
+            let member = onera
+                .set_member_state(
+                    ProfileMemberId::from_str(&member).context("invalid member id")?,
+                    DesiredModState::Enabled,
+                )
+                .await?;
+            print_profile_member(json, &member, "enabled");
+        }
+        ProfileAction::Disable { member } => {
+            let member = onera
+                .set_member_state(
+                    ProfileMemberId::from_str(&member).context("invalid member id")?,
+                    DesiredModState::Disabled,
+                )
+                .await?;
+            print_profile_member(json, &member, "disabled");
+        }
+        ProfileAction::Pin {
+            member,
+            reason,
+            unpin,
+        } => {
+            let member = onera
+                .set_member_pin(
+                    ProfileMemberId::from_str(&member).context("invalid member id")?,
+                    !unpin,
+                    reason,
+                )
+                .await?;
+            print_profile_member(json, &member, if unpin { "unpinned" } else { "pinned" });
+        }
+        ProfileAction::Reorder { member, priority } => {
+            let member = onera
+                .reorder_profile_member(
+                    ProfileMemberId::from_str(&member).context("invalid member id")?,
+                    MemberPriority(priority),
+                )
+                .await?;
+            print_profile_member(json, &member, "reordered");
+        }
+    }
+    Ok(())
+}
+
+fn print_profile_member(
+    json: bool,
+    member: &onera_core::domain::profile::ProfileMember,
+    action: &str,
+) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(member).unwrap_or_default()
+        );
+    } else {
+        println!("{action} profile member {}", member.id);
     }
 }
 
@@ -1063,6 +1381,152 @@ async fn recover(onera: &Onera, rollback: bool, progress: &CliProgress, json: bo
     Ok(())
 }
 
+/// `onera baseline …` — one application method per subcommand.
+///
+/// `--json` prints the payloads in `docs/frontend-contracts.md` verbatim, which
+/// is what keeps the desktop and the CLI incapable of disagreeing about them.
+async fn baseline(
+    onera: &Onera,
+    action: BaselineAction,
+    progress: &CliProgress,
+    cancel: &CancelToken,
+    json: bool,
+) -> Result<()> {
+    match action {
+        BaselineAction::Status { game } => {
+            let report = onera
+                .baseline_status(LocalGameId::from_str(&game).context("invalid game id")?)
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                match &report.baseline {
+                    None => println!("no baseline has been captured for this installation"),
+                    Some(baseline) => {
+                        println!("baseline:   {}", baseline.id);
+                        println!("source:     {}", source_label(baseline.source));
+                        println!("captured:   {}", baseline.captured_at);
+                        println!(
+                            "contents:   {} files, {} bytes",
+                            baseline.file_count, baseline.total_bytes
+                        );
+                    }
+                }
+                println!("freshness:  {}", freshness_label(&report.freshness));
+                println!("active mods: {}", report.active_mod_count);
+                if let Some(reason) = &report.capture_blocked_reason {
+                    println!("capture blocked: {reason}");
+                }
+            }
+            Ok(())
+        }
+        BaselineAction::Capture {
+            game,
+            verified,
+            local_snapshot,
+            dry_run,
+        } => {
+            let game = LocalGameId::from_str(&game).context("invalid game id")?;
+            let source = local_snapshot.then_some(BaselineSource::LocalSnapshot);
+            if dry_run {
+                let preview = onera.plan_baseline_capture(game, source).await?;
+                emit(json, &serde_json::to_value(&preview)?, || {
+                    format!(
+                        "would scan {} root(s), {} file(s), {} bytes as {}",
+                        preview.roots.len(),
+                        preview.estimated_files,
+                        preview.estimated_bytes,
+                        source_label(preview.source)
+                    )
+                });
+                return Ok(());
+            }
+            let baseline = onera
+                .capture_baseline(game, source, verified, progress, cancel)
+                .await?;
+            emit(json, &serde_json::to_value(&baseline)?, || {
+                format!(
+                    "captured {} as {}: {} files, {} bytes",
+                    baseline.id,
+                    source_label(baseline.source),
+                    baseline.file_count,
+                    baseline.total_bytes
+                )
+            });
+            Ok(())
+        }
+        BaselineAction::Verify { game, quick } => {
+            let game = LocalGameId::from_str(&game).context("invalid game id")?;
+            let verification = onera.verify_baseline(game, quick, progress, cancel).await?;
+            let baseline = onera
+                .baseline_status(game)
+                .await?
+                .baseline
+                .context("the baseline vanished while it was being verified")?;
+            let clean = verification.is_clean(&baseline);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&verification)?);
+            } else {
+                let counts = &verification.counts;
+                println!("state:     {:?}", verification.state);
+                println!("evidence:  {:?}", verification.evidence);
+                println!(
+                    "matching {} modified {} missing {} extra-managed {} extra-unknown {} \
+                     unreadable {} special {}",
+                    counts.matching,
+                    counts.modified,
+                    counts.missing,
+                    counts.extra_managed,
+                    counts.extra_unknown,
+                    counts.unreadable,
+                    counts.special
+                );
+                for finding in verification.findings.iter().filter(|finding| {
+                    finding.classification
+                        != onera_core::domain::baseline::FileClassification::Matching
+                }) {
+                    println!(
+                        "  {:?} {}:{}",
+                        finding.classification, finding.root_key, finding.path
+                    );
+                }
+                println!(
+                    "{}",
+                    if clean {
+                        "clean"
+                    } else {
+                        "not clean (a metadata-only scan is never clean)"
+                    }
+                );
+            }
+            if !clean {
+                // A non-zero exit lets a script notice without parsing output.
+                std::process::exit(2);
+            }
+            Ok(())
+        }
+    }
+}
+
+const fn source_label(source: BaselineSource) -> &'static str {
+    match source {
+        BaselineSource::StoreVerifiedCapture => "store-verified capture",
+        BaselineSource::LocalSnapshot => "local snapshot (not store-verified)",
+        BaselineSource::StoreManifest => "store manifest",
+    }
+}
+
+fn freshness_label(freshness: &BaselineFreshness) -> String {
+    match freshness {
+        BaselineFreshness::None => "none — nothing captured yet".to_owned(),
+        BaselineFreshness::Fresh => "fresh".to_owned(),
+        BaselineFreshness::Stale { .. } => {
+            "stale — the store's build identity changed; verify files and recapture".to_owned()
+        }
+        BaselineFreshness::Unknown { reason } => format!("unknown — {reason}"),
+    }
+}
+
 /// Print either JSON or a human-readable line.
 fn emit(json: bool, value: &serde_json::Value, text: impl FnOnce() -> String) {
     if json {
@@ -1106,5 +1570,25 @@ mod tests {
             format!("chrome-extension://{EXTENSION_ID}/")
         );
         assert!(extension["key"].as_str().is_some_and(|key| !key.is_empty()));
+    }
+
+    #[test]
+    fn profile_crud_commands_parse_without_activation_commands() {
+        let id = "00000000-0000-0000-0000-000000000000".to_owned();
+        for args in [
+            vec!["onera", "profiles", "list", "--game", &id],
+            vec![
+                "onera", "profiles", "create", "--game", &id, "--name", "Survival",
+            ],
+            vec!["onera", "profiles", "show", &id],
+            vec!["onera", "profiles", "enable", &id],
+            vec!["onera", "profiles", "disable", &id],
+            vec!["onera", "profiles", "pin", &id, "--unpin"],
+            vec!["onera", "profiles", "reorder", &id, "--priority", "-10"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        assert!(Cli::try_parse_from(["onera", "profiles", "plan-activate", &id]).is_err());
+        assert!(Cli::try_parse_from(["onera", "profiles", "activate", &id]).is_err());
     }
 }

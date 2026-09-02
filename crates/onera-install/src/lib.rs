@@ -27,8 +27,8 @@ pub mod remove;
 pub mod verify;
 
 pub use baseline::{
-    capture_baseline, verify_baseline, BaselineCapture, BaselineVerificationRequest,
-    BaselineVerificationScan,
+    capture_baseline, quick_verify_baseline, verify_baseline, BaselineCapture,
+    BaselineVerificationRequest, BaselineVerificationScan,
 };
 pub use engine::{InstallReport, Installer};
 pub use fs::RealFileSystem;

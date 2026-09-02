@@ -15,19 +15,22 @@
 use onera_archive::SafeArchiveBackend;
 use onera_core::domain::game::{Game, LocalGameInstall};
 use onera_core::domain::operation::OperationKind;
+use onera_core::domain::profile::{
+    DesiredModState, MemberPin, MemberPriority, Profile, ProfileMember,
+};
 use onera_core::domain::reconcile::{
     reconcile_with_decisions, DesiredGameState, InstallationMapping, MutationPlan, MutationStep,
 };
 use onera_core::domain::release::{ProviderFile, Release};
 use onera_core::hash::FileHash;
 use onera_core::ids::{
-    ArchiveId, InboxRequestId, InstallationId, LocalGameId, ModId, ProviderFileId, ProviderId,
-    ProviderModId, ReleaseId,
+    ArchiveId, InboxRequestId, InstallationId, LocalGameId, ModId, ProfileId, ProfileMemberId,
+    ProviderFileId, ProviderId, ProviderModId, ReleaseId,
 };
 use onera_core::plan::{InstallPlan, ScopedRule, TargetLocation};
 use onera_core::ports::{
     AccountInfo, ArchiveBackend, ArchiveStore, AuthProvider, Credential, DeploymentStore,
-    GameAdapter, ModProvider, OperationJournal, SecretStore,
+    GameAdapter, ModProvider, OperationJournal, ProfileStore, SecretStore,
 };
 use onera_core::progress::{CancelToken, ProgressSink};
 use onera_core::redact::Secret;
@@ -351,6 +354,220 @@ impl Onera {
     /// Propagates database errors.
     pub async fn local_games(&self) -> Result<Vec<LocalGameInstall>> {
         self.db.local_installs().await
+    }
+
+    // -----------------------------------------------------------------------
+    // Profiles (desired state only)
+    // -----------------------------------------------------------------------
+
+    /// List profiles for one concrete game, with the active profile first.
+    pub async fn profiles(&self, game: LocalGameId) -> Result<Vec<Profile>> {
+        self.db.profiles(game).await
+    }
+
+    /// Return one profile and its deterministically ordered members.
+    pub async fn profile_details(&self, id: ProfileId) -> Result<ProfileDetails> {
+        let profile = self
+            .db
+            .profile(id)
+            .await?
+            .ok_or_else(|| CoreError::NotFound {
+                kind: "profile",
+                id: id.to_string(),
+            })?;
+        let members = self.db.members(id).await?;
+        Ok(ProfileDetails { profile, members })
+    }
+
+    /// Create an empty profile or duplicate another profile as desired state.
+    pub async fn create_profile(
+        &self,
+        game: LocalGameId,
+        name: String,
+        description: Option<String>,
+        copy_from: Option<ProfileId>,
+    ) -> Result<Profile> {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return Err(CoreError::InvalidInput(
+                "profile name cannot be empty".into(),
+            ));
+        }
+        let source_members = if let Some(source) = copy_from {
+            let details = self.profile_details(source).await?;
+            if details.profile.local_game_id != game {
+                return Err(CoreError::Conflict(
+                    "a profile can only be duplicated within the same local game".into(),
+                ));
+            }
+            details.members
+        } else {
+            Vec::new()
+        };
+        let timestamp = chrono::Utc::now();
+        let profile = Profile {
+            id: ProfileId::new(),
+            local_game_id: game,
+            name,
+            description,
+            is_active: false,
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        self.db.put_profile(&profile).await?;
+
+        // A failed clone is compensated by deleting the newly-created inactive
+        // profile, so callers never observe a partially duplicated set.
+        for source in source_members {
+            let member = ProfileMember {
+                id: ProfileMemberId::new(),
+                profile_id: profile.id,
+                added_at: timestamp,
+                ..source
+            };
+            if let Err(error) = self.db.put_member(&member).await {
+                let _ = self.db.delete_profile(profile.id).await;
+                return Err(error);
+            }
+        }
+        self.db
+            .profile(profile.id)
+            .await?
+            .ok_or_else(|| CoreError::NotFound {
+                kind: "profile",
+                id: profile.id.to_string(),
+            })
+    }
+
+    /// Rename a profile without changing its members or active deployment.
+    pub async fn rename_profile(&self, id: ProfileId, name: String) -> Result<Profile> {
+        let mut profile = self
+            .db
+            .profile(id)
+            .await?
+            .ok_or_else(|| CoreError::NotFound {
+                kind: "profile",
+                id: id.to_string(),
+            })?;
+        profile.name = name.trim().to_owned();
+        profile.updated_at = chrono::Utc::now();
+        self.db.put_profile(&profile).await?;
+        Ok(profile)
+    }
+
+    /// Delete an inactive profile and all of its desired members.
+    pub async fn delete_profile(&self, id: ProfileId) -> Result<()> {
+        self.db.delete_profile(id).await
+    }
+
+    /// Add one mod lineage to a profile, selecting a cached provider file when
+    /// supplied and linking a retained artifact when one already satisfies it.
+    pub async fn add_profile_member(
+        &self,
+        profile: ProfileId,
+        mod_id: ModId,
+        provider_file: Option<ProviderFileId>,
+    ) -> Result<ProfileMember> {
+        let (selection, installation_id) = self
+            .db
+            .selection_for_profile_member(profile, mod_id, provider_file.as_ref())
+            .await?;
+        let existing = self.db.members(profile).await?;
+        let priority = existing.last().map_or(MemberPriority(10), |member| {
+            MemberPriority(member.priority.0.saturating_add(10))
+        });
+        let member = ProfileMember {
+            id: ProfileMemberId::new(),
+            profile_id: profile,
+            mod_id,
+            selection,
+            installation_id,
+            desired: DesiredModState::Enabled,
+            pin: MemberPin::Unpinned,
+            priority,
+            added_at: chrono::Utc::now(),
+        };
+        self.db.put_member(&member).await?;
+        Ok(member)
+    }
+
+    /// Remove a desired member. Foreign-key cascades also discard any
+    /// member-scoped dependency overrides once the dependency schema exists.
+    pub async fn remove_profile_member(&self, member: ProfileMemberId) -> Result<()> {
+        self.db.remove_member(member).await
+    }
+
+    /// Enable or disable a member in desired state only.
+    pub async fn set_member_state(
+        &self,
+        id: ProfileMemberId,
+        desired: DesiredModState,
+    ) -> Result<ProfileMember> {
+        let mut member = self
+            .db
+            .profile_member(id)
+            .await?
+            .ok_or_else(|| CoreError::NotFound {
+                kind: "profile member",
+                id: id.to_string(),
+            })?;
+        member.desired = desired;
+        self.db.put_member(&member).await?;
+        Ok(member)
+    }
+
+    /// Pin or unpin the selected opaque provider version.
+    pub async fn set_member_pin(
+        &self,
+        id: ProfileMemberId,
+        pinned: bool,
+        reason: Option<String>,
+    ) -> Result<ProfileMember> {
+        let mut member = self
+            .db
+            .profile_member(id)
+            .await?
+            .ok_or_else(|| CoreError::NotFound {
+                kind: "profile member",
+                id: id.to_string(),
+            })?;
+        if pinned && !member.selection.is_resolved() {
+            return Err(CoreError::InvalidInput(
+                "an unresolved provider file cannot be pinned".into(),
+            ));
+        }
+        member.pin = if pinned {
+            MemberPin::Pinned {
+                pinned_at: chrono::Utc::now(),
+                reason: reason.and_then(|value| {
+                    let value = value.trim().to_owned();
+                    (!value.is_empty()).then_some(value)
+                }),
+            }
+        } else {
+            MemberPin::Unpinned
+        };
+        self.db.put_member(&member).await?;
+        Ok(member)
+    }
+
+    /// Change one member's signed provider-stack priority.
+    pub async fn reorder_profile_member(
+        &self,
+        id: ProfileMemberId,
+        priority: MemberPriority,
+    ) -> Result<ProfileMember> {
+        let mut member = self
+            .db
+            .profile_member(id)
+            .await?
+            .ok_or_else(|| CoreError::NotFound {
+                kind: "profile member",
+                id: id.to_string(),
+            })?;
+        member.priority = priority;
+        self.db.put_member(&member).await?;
+        Ok(member)
     }
 
     /// Installed mods for one local game.
@@ -844,6 +1061,15 @@ impl Onera {
     ) -> Result<PreparedInstall> {
         let (roots, adapter) = self.roots_for(request.local_game_id).await?;
 
+        // 0. Check the baseline before doing any work. A changed store build
+        //    means the recorded clean state no longer describes this
+        //    installation; an identity Onera cannot compare means it does not
+        //    know either way. Neither blocks an install — both are reported.
+        let baseline_freshness = self.baseline_freshness(request.local_game_id).await?;
+        if let Some(message) = crate::baseline::freshness_warning(&baseline_freshness) {
+            progress.emit(onera_core::progress::ProgressEvent::Warning { message });
+        }
+
         // 1. Download (or reuse a stored archive).
         let outcome = self
             .download(
@@ -915,6 +1141,7 @@ impl Onera {
             layout_rationale: layout.rationale,
             ignored: layout.ignored.len(),
             rejected_entries: inspection.rejected,
+            baseline_freshness,
         })
     }
 
@@ -1404,6 +1631,12 @@ pub struct PreparedInstall {
     pub ignored: usize,
     /// Entries the archive inspector refused, for the preview.
     pub rejected_entries: Vec<onera_core::domain::archive::RejectedEntry>,
+    /// Whether the game's baseline still describes the installed build.
+    ///
+    /// Read before any work starts, so the preview can warn that the clean
+    /// state Onera would compare against is out of date. Never `Fresh` when the
+    /// store exposes no comparable identity.
+    pub baseline_freshness: onera_core::domain::baseline::BaselineFreshness,
 }
 
 /// A dry-run desired-state plan together with the retained mappings needed to
@@ -1416,6 +1649,15 @@ pub struct PreparedState {
     pub mappings: Vec<InstallationMapping>,
     /// Resolved deployment roots.
     pub roots: RootMap,
+}
+
+/// A profile together with its priority-ordered member table.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProfileDetails {
+    /// Profile card data.
+    pub profile: Profile,
+    /// Desired members, lowest priority first.
+    pub members: Vec<ProfileMember>,
 }
 
 /// A mod as Onera knows it after fetching metadata.

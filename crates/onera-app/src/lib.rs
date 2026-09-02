@@ -10,14 +10,16 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod baseline;
 pub mod flow;
 pub mod logging;
 pub mod paths;
 pub mod secrets;
 
+pub use baseline::{BaselineCapturePreview, BaselineStatusReport};
 pub use flow::{
     DownloadRequest, DownloadedArchive, InstallRequest, InstalledModInfo, Onera, PreparedInstall,
-    PreparedState,
+    PreparedState, ProfileDetails,
 };
 pub use paths::Paths;
 pub use secrets::{InMemorySecretStore, KeyringSecretStore};

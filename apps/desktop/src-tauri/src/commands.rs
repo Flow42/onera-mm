@@ -5,6 +5,7 @@
 //! decision more interesting than that belongs in [`onera_app`] or deeper.
 
 use crate::state::{AppState, CommandError, CommandResult};
+use onera_core::domain::baseline::BaselineSource;
 use onera_core::ids::{InstallationId, LocalGameId, OperationId, ProviderFileId, ProviderModId};
 use onera_core::plan::{ConflictChoice, Decision, DecisionScope, InstallPlan, TargetLocation};
 use onera_core::progress::NullProgress;
@@ -541,6 +542,96 @@ pub async fn verify(
         )
         .await?;
     Ok(serde_json::to_value(&report).unwrap_or(serde_json::Value::Null))
+}
+
+// ---------------------------------------------------------------------------
+// Baseline
+// ---------------------------------------------------------------------------
+
+fn parse_baseline_source(source: Option<String>) -> CommandResult<Option<BaselineSource>> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    Ok(Some(match source.as_str() {
+        "store_verified_capture" => BaselineSource::StoreVerifiedCapture,
+        "local_snapshot" => BaselineSource::LocalSnapshot,
+        "store_manifest" => BaselineSource::StoreManifest,
+        other => {
+            return Err(CommandError {
+                code: "internal".into(),
+                message: format!("{other:?} is not a baseline source"),
+            })
+        }
+    }))
+}
+
+#[tauri::command]
+pub async fn baseline_status(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> CommandResult<serde_json::Value> {
+    let report = state.onera.baseline_status(parse_game(&game_id)?).await?;
+    Ok(serde_json::to_value(&report).unwrap_or(serde_json::Value::Null))
+}
+
+#[tauri::command]
+pub async fn plan_baseline_capture(
+    state: State<'_, AppState>,
+    game_id: String,
+    source: Option<String>,
+) -> CommandResult<serde_json::Value> {
+    let preview = state
+        .onera
+        .plan_baseline_capture(parse_game(&game_id)?, parse_baseline_source(source)?)
+        .await?;
+    Ok(serde_json::to_value(&preview).unwrap_or(serde_json::Value::Null))
+}
+
+/// Capture a baseline.
+///
+/// `storeVerificationConfirmed` is the user's explicit acknowledgement that they
+/// ran the store's own file verification. Onera cannot observe that, so a
+/// store-verified capture without it returns `decision_required` rather than
+/// silently recording a weaker claim as a stronger one.
+#[tauri::command]
+pub async fn capture_baseline(
+    state: State<'_, AppState>,
+    game_id: String,
+    source: Option<String>,
+    store_verification_confirmed: bool,
+) -> CommandResult<serde_json::Value> {
+    let cancel = onera_core::progress::CancelToken::new();
+    let progress = state.progress();
+    let baseline = state
+        .onera
+        .capture_baseline(
+            parse_game(&game_id)?,
+            parse_baseline_source(source)?,
+            store_verification_confirmed,
+            &progress,
+            &cancel,
+        )
+        .await?;
+    Ok(serde_json::to_value(&baseline).unwrap_or(serde_json::Value::Null))
+}
+
+/// Compare an installation with its baseline.
+///
+/// `quick` returns `evidence: "metadata_only"`, which must never be rendered as
+/// clean: only a completed, content-hashed scan over the captured scope can be.
+#[tauri::command]
+pub async fn verify_baseline(
+    state: State<'_, AppState>,
+    game_id: String,
+    quick: bool,
+) -> CommandResult<serde_json::Value> {
+    let cancel = onera_core::progress::CancelToken::new();
+    let progress = state.progress();
+    let verification = state
+        .onera
+        .verify_baseline(parse_game(&game_id)?, quick, &progress, &cancel)
+        .await?;
+    Ok(serde_json::to_value(&verification).unwrap_or(serde_json::Value::Null))
 }
 
 fn removal_view(report: &onera_install::RemovalReport) -> serde_json::Value {

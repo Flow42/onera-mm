@@ -472,12 +472,14 @@ impl DeploymentStore for Database {
     }
 
     async fn rules_for(&self, mod_id: ModId) -> Result<Vec<ScopedRule>> {
-        let rows =
-            sqlx::query("SELECT root_key, path_prefix, choice FROM scoped_rules WHERE mod_id = ?1")
-                .bind(mod_id.to_string())
-                .fetch_all(self.pool())
-                .await
-                .map_err(db_err)?;
+        let rows = sqlx::query(
+            "SELECT root_key, path_prefix, choice FROM scoped_rules
+             WHERE mod_id = ?1 AND profile_id IS NULL",
+        )
+        .bind(mod_id.to_string())
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
         rows.into_iter()
             .map(|row| {
                 let choice: String = row.try_get("choice").map_err(db_err)?;
@@ -495,7 +497,8 @@ impl DeploymentStore for Database {
         sqlx::query(
             "INSERT INTO scoped_rules (id, mod_id, root_key, path_prefix, choice, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(mod_id, root_key, path_prefix) DO UPDATE SET choice = ?5",
+             ON CONFLICT(mod_id, root_key, path_prefix) WHERE profile_id IS NULL
+             DO UPDATE SET choice = ?5",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(rule.mod_id.to_string())

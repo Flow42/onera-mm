@@ -11,7 +11,10 @@ a recoverable state, not a broken game.
 > **Status: early but end-to-end usable.** The initial product slice and the
 > desired-state reconciliation foundation are complete: Onera can preview and
 > atomically apply multi-mod enable/disable sets, retain disabled artifacts for
-> offline reactivation, and recover the complete set after a failed write.
+> offline reactivation, and recover the complete set after a failed write. The
+> baseline milestone is underway: Steam build identity and content-hashed local
+> capture and verification are implemented, but are not yet persisted or exposed
+> through the application, CLI, or desktop UI.
 
 ## Why another mod manager
 
@@ -102,13 +105,16 @@ the extension. See [`docs/architecture.md`](docs/architecture.md).
 
 The next milestones are deliberately still open:
 
-- Profiles, dependency solving, and clean game baselines have their domain
-  types, ports and frontend contracts in place, but almost no behaviour behind
-  them: no persistence, no scanning, no provider calls, no solver, no screens.
-  The exception is Steam build identity, which is read for real — see
-  [`docs/steam-baseline-assumptions.md`](docs/steam-baseline-assumptions.md) —
-  and is not yet stored or shown anywhere. See the implementation plan and
+- Clean game baselines have domain types, ports, Steam build-identity discovery,
+  adapter-declared scope and exclusions, and a read-only content-hashed capture
+  and verification engine. Baseline persistence, application/CLI commands,
+  startup stale detection, return-to-clean orchestration, and desktop screens
+  remain to be implemented. See
+  [`docs/steam-baseline-assumptions.md`](docs/steam-baseline-assumptions.md) and
   [`docs/frontend-contracts.md`](docs/frontend-contracts.md).
+- Profiles and dependency planning have domain types, ports, and frontend
+  contracts, but no database migrations or persistence adapters, application
+  flows, provider dependency calls, working solver, CLI commands, or screens.
 - Update checks report newer same-lineage releases, but compatible bulk update
   and dependency-aware update actions belong to the dependency milestone.
 - Only Cyberpunk 2077 has a game adapter.

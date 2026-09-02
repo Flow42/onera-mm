@@ -321,7 +321,7 @@ pub fn validate_profile_set(profiles: &[Profile]) -> Result<(), ProfileSetError>
 
         let mut names = BTreeSet::new();
         for profile in &scoped {
-            if !names.insert(profile.name.as_str()) {
+            if !names.insert(profile.name.to_ascii_lowercase()) {
                 return Err(ProfileSetError::DuplicateName {
                     local_game_id,
                     name: profile.name.clone(),
@@ -470,7 +470,7 @@ mod tests {
         ];
         assert!(validate_profile_set(&across).is_ok());
 
-        let within = vec![profile(a, "Modded", true), profile(a, "Modded", false)];
+        let within = vec![profile(a, "Modded", true), profile(a, "modded", false)];
         assert!(matches!(
             validate_profile_set(&within),
             Err(ProfileSetError::DuplicateName { .. })

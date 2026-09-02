@@ -417,12 +417,35 @@ impl Database {
     /// # Errors
     /// Propagates database errors.
     pub async fn confirm_local_install(&self, id: LocalGameId) -> Result<()> {
-        sqlx::query("UPDATE local_game_installs SET confirmed = 1 WHERE id = ?1")
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        let result = sqlx::query("UPDATE local_game_installs SET confirmed = 1 WHERE id = ?1")
             .bind(id.to_string())
-            .execute(self.pool())
+            .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-        Ok(())
+        if result.rows_affected() == 0 {
+            return Err(CoreError::NotFound {
+                kind: "local game installation",
+                id: id.to_string(),
+            });
+        }
+        let timestamp = now();
+        sqlx::query(
+            "INSERT INTO profiles
+                (id, local_game_id, name, description, is_active, created_at, updated_at)
+             SELECT ?2, id, ?3, NULL, 1, ?4, ?4 FROM local_game_installs
+             WHERE id = ?1 AND NOT EXISTS (
+                 SELECT 1 FROM profiles WHERE local_game_id = ?1
+             )",
+        )
+        .bind(id.to_string())
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(onera_core::domain::profile::DEFAULT_PROFILE_NAME)
+        .bind(timestamp)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)
     }
 
     /// Cache a mod's metadata.

@@ -22,6 +22,7 @@
 use onera_app::secrets::InMemorySecretStore;
 use onera_app::{InstallRequest, Onera, Paths};
 use onera_core::domain::game::InstallSource;
+use onera_core::domain::profile::{DesiredModState, MemberPin, MemberPriority};
 use onera_core::ids::ProviderModId;
 use onera_core::plan::{
     ConflictChoice, Decision, DecisionScope, FileClassification, TargetLocation,
@@ -227,6 +228,16 @@ fn target(path: &str) -> TargetLocation {
         root_key: "game".into(),
         path: RelPath::normalize(path).unwrap(),
     }
+}
+
+fn game_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    walkdir(root)
+        .into_iter()
+        .map(|path| {
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            (relative, std::fs::read(path).unwrap())
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -734,6 +745,100 @@ async fn a_second_install_of_the_same_archive_is_deduplicated() {
     assert_ne!(first.staging, second.staging);
     let _ = h.archive_bytes.len();
     let _ = &h.server;
+}
+
+#[tokio::test]
+async fn profile_crud_duplicates_desired_state_without_touching_the_game() {
+    let h = Harness::new(&[("Mod/archive/pc/mod/a.archive", b"payload")]).await;
+    let game = h.onera.confirm_game(&h.discovered()).await.unwrap();
+    let before = game_snapshot(&h.game_dir);
+
+    let default = h.onera.profiles(game).await.unwrap();
+    assert_eq!(default.len(), 1);
+    assert!(default[0].is_active);
+    assert_eq!(default[0].name, "Default");
+
+    h.onera.set_api_key(Secret::new(API_KEY)).await.unwrap();
+    let details = h
+        .onera
+        .fetch_mod(GAME_SLUG, &ProviderModId::new(MOD_ID), &CancelToken::new())
+        .await
+        .unwrap();
+    let custom = h
+        .onera
+        .create_profile(game, "Custom".into(), Some("desired only".into()), None)
+        .await
+        .unwrap();
+    let mut member = h
+        .onera
+        .add_profile_member(
+            custom.id,
+            details.mod_id,
+            Some(details.primary_file().unwrap().provider_file_id.clone()),
+        )
+        .await
+        .unwrap();
+    assert!(member.installation_id.is_none());
+
+    member = h
+        .onera
+        .set_member_pin(member.id, true, Some("known good".into()))
+        .await
+        .unwrap();
+    assert!(matches!(member.pin, MemberPin::Pinned { .. }));
+    member = h
+        .onera
+        .set_member_state(member.id, DesiredModState::Disabled)
+        .await
+        .unwrap();
+    assert_eq!(member.desired, DesiredModState::Disabled);
+    member = h
+        .onera
+        .reorder_profile_member(member.id, MemberPriority(-20))
+        .await
+        .unwrap();
+    assert_eq!(member.priority, MemberPriority(-20));
+
+    let copy = h
+        .onera
+        .create_profile(game, "Copy".into(), None, Some(custom.id))
+        .await
+        .unwrap();
+    let copied = h.onera.profile_details(copy.id).await.unwrap();
+    assert_eq!(copied.members.len(), 1);
+    assert_ne!(copied.members[0].id, member.id);
+    assert_eq!(copied.members[0].selection, member.selection);
+    assert_eq!(copied.members[0].priority, member.priority);
+
+    assert!(matches!(
+        h.onera
+            .create_profile(game, "copy".into(), None, None)
+            .await
+            .unwrap_err(),
+        CoreError::Conflict(_)
+    ));
+    assert!(matches!(
+        h.onera.delete_profile(default[0].id).await.unwrap_err(),
+        CoreError::Conflict(_)
+    ));
+    h.onera.remove_profile_member(member.id).await.unwrap();
+    assert!(h
+        .onera
+        .profile_details(custom.id)
+        .await
+        .unwrap()
+        .members
+        .is_empty());
+    h.onera.delete_profile(custom.id).await.unwrap();
+
+    assert_eq!(game_snapshot(&h.game_dir), before);
+    assert!(h
+        .onera
+        .database()
+        .active_installations(game)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 fn walkdir(root: &Path) -> Vec<PathBuf> {

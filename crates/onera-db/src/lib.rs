@@ -20,11 +20,13 @@
 #![warn(missing_docs)]
 
 pub mod backup;
+pub mod baseline;
 pub mod catalog;
 pub mod convert;
 pub mod deployment;
 pub mod jobs;
 pub mod journal;
+pub mod profiles;
 
 use onera_core::{CoreError, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous};
@@ -37,7 +39,7 @@ use std::time::Duration;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The schema version this build understands.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// A pooled SQLite database.
 #[derive(Debug, Clone)]
@@ -174,10 +176,9 @@ mod tests {
         assert!(count > 15, "expected the full schema, found {count} tables");
     }
 
-    #[tokio::test]
-    async fn version_one_database_migrates_without_losing_rows() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("onera.sqlite3");
+    /// Write a populated schema-v1 database at `path`, exactly as a user who
+    /// installed the first Onera release would have.
+    async fn write_populated_v1_database(path: &Path) {
         let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
             .unwrap()
             .create_if_missing(true)
@@ -226,6 +227,7 @@ mod tests {
              INSERT INTO mods VALUES ('mod', 'nexus', '1', 'test', 'Mod', NULL, '2026-01-01');
              INSERT INTO releases VALUES ('release', 'mod', '1', NULL, '{}');
              INSERT INTO archives VALUES ('archive', 'blake3:0000000000000000000000000000000000000000000000000000000000000000', 7, 'mod.zip', 'zip', '/archive', '2026-01-01');
+             INSERT INTO installations VALUES ('inactive-installation', 'local', 'mod', 'release', 'archive', 'installed', 'flat', '2025-01-01');
              INSERT INTO installations VALUES ('installation', 'local', 'mod', 'release', 'archive', 'installed', 'flat', '2026-01-01');
              INSERT INTO deployed_files VALUES ('deployed', 'local', 'game', 'mods/a', 'blake3:1111111111111111111111111111111111111111111111111111111111111111', 5, '2026-01-01');
              INSERT INTO installation_files VALUES ('installation', 'deployed', 'payload/a', 'blake3:1111111111111111111111111111111111111111111111111111111111111111', 'create');",
@@ -234,6 +236,13 @@ mod tests {
         .await
         .unwrap();
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn version_one_database_migrates_without_losing_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("onera.sqlite3");
+        write_populated_v1_database(&path).await;
 
         let db = Database::open(&path).await.unwrap();
         let (version,): (String,) =
@@ -262,6 +271,19 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
+        let default_profile: (String, i64, i64) = sqlx::query_as(
+            "SELECT name, is_active,
+                    (SELECT count(*) FROM profile_members m WHERE m.profile_id = p.id)
+             FROM profiles p WHERE local_game_id = 'local'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let imported: (String, String, i64) =
+            sqlx::query_as("SELECT installation_id, desired, priority FROM profile_members")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
 
         assert_eq!(version, SCHEMA_VERSION.to_string());
         assert_eq!(providers, 1);
@@ -272,6 +294,103 @@ mod tests {
             ("game".into(), "mods/a".into(), "payload/a".into(), 5)
         );
         assert_eq!(active, 1);
+        assert_eq!(default_profile, ("Default".into(), 1, 1));
+        assert_eq!(imported, ("installation".into(), "enabled".into(), 10));
+    }
+
+    /// A user who installed the first Onera release must reach the baseline
+    /// schema with their data intact — and with the new tables actually usable,
+    /// not merely present.
+    #[tokio::test]
+    async fn a_populated_v1_database_reaches_the_baseline_schema() {
+        use crate::convert::to_timestamp;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("onera.sqlite3");
+        write_populated_v1_database(&path).await;
+
+        let db = Database::open(&path).await.unwrap();
+        let (version,): (String,) =
+            sqlx::query_as("SELECT value FROM schema_meta WHERE key = 'schema_version'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+        let (baselines_applied,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM _sqlx_migrations WHERE version = 5 AND success")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            baselines_applied, 1,
+            "0005_baselines.sql must have been applied on top of the v1 fixture"
+        );
+
+        for table in [
+            "game_baselines",
+            "baseline_files",
+            "baseline_scan_runs",
+            "baseline_scan_findings",
+        ] {
+            let (present,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            )
+            .bind(table)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(present, 1, "{table} is missing after migrating from v1");
+        }
+
+        // The v1 rows are still there, and the game they describe can now carry
+        // a baseline through the port rather than through raw SQL.
+        let (installations,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM installations WHERE id = 'installation'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(installations, 1, "the v1 installation survived the upgrade");
+
+        // The v1 fixture uses opaque non-UUID ids, so these rows are written
+        // through SQL rather than through the typed port.
+        sqlx::query(
+            "INSERT INTO game_baselines
+                (id, local_game_id, source, build_identity, adapter_id, reported_version,
+                 status, captured_at, scope_fingerprint, file_count, total_bytes)
+             VALUES ('baseline', 'local', 'local_snapshot', NULL, 'test', NULL,
+                     'current', ?1, 'b3', 1, 7)",
+        )
+        .bind(to_timestamp(chrono::Utc::now()))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO baseline_files (id, baseline_id, root_key, rel_path, hash, size, mode)
+             VALUES ('file', 'baseline', 'game', 'bin/x64/game.exe',
+                     'blake3:1111111111111111111111111111111111111111111111111111111111111111',
+                     7, 420)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let (files,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM baseline_files WHERE baseline_id = 'baseline'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(files, 1);
+
+        // Deleting the migrated game takes its baseline with it, which is what
+        // proves the foreign key survived the v3/v4 table rebuilds.
+        sqlx::query("DELETE FROM local_game_installs WHERE id = 'local'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let (remaining,): (i64,) = sqlx::query_as("SELECT count(*) FROM game_baselines")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[tokio::test]

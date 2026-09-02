@@ -62,7 +62,8 @@ pub struct BaselineVerificationRequest<'a> {
 
 #[derive(Debug)]
 struct DiskFile {
-    hash: FileHash,
+    /// `None` only for a metadata-only scan, which never reports clean.
+    hash: Option<FileHash>,
     size: u64,
     mode: Option<u32>,
 }
@@ -112,18 +113,35 @@ pub async fn capture_baseline(
         total: None,
     });
 
-    let output = scan_scope(roots, exclusions, Stage::Hashing, progress, cancel).await?;
+    let output = scan_scope(
+        roots,
+        exclusions,
+        ScanEvidence::ContentHashed,
+        Stage::Hashing,
+        progress,
+        cancel,
+    )
+    .await?;
     let mut files = Vec::new();
     let mut findings = Vec::new();
     for ((root_key, path), entry) in output.entries {
         match entry {
-            DiskEntry::File(file) => files.push(BaselineFile {
-                root_key,
-                path,
-                hash: file.hash,
-                size: file.size,
-                mode: file.mode,
-            }),
+            DiskEntry::File(file) => {
+                // A capture always content-hashes; a record without a hash
+                // could never be verified against and must not be trusted.
+                let Some(hash) = file.hash else {
+                    return Err(CoreError::InvalidInput(format!(
+                        "{root_key}:{path} was scanned without a content hash"
+                    )));
+                };
+                files.push(BaselineFile {
+                    root_key,
+                    path,
+                    hash,
+                    size: file.size,
+                    mode: file.mode,
+                });
+            }
             DiskEntry::Special(detail) => findings.push(finding(
                 root_key,
                 path,
@@ -177,8 +195,8 @@ pub async fn capture_baseline(
 /// `managed_targets` is normally the result of
 /// [`onera_core::ports::DeploymentStore::all_targets`]. Keeping it as data
 /// rather than a store dependency makes classification independent of SQLite.
-/// Every included regular file is content-hashed; this API intentionally has no
-/// metadata-only clean path.
+/// Every included regular file is content-hashed, which is the only evidence
+/// that can support a clean verdict.
 ///
 /// Cancellation returns a partial result and does not infer `missing` findings
 /// for paths the interrupted scan did not reach.
@@ -189,6 +207,35 @@ pub async fn capture_baseline(
 /// filesystem path that cannot be represented by [`RelPath`].
 pub async fn verify_baseline(
     request: BaselineVerificationRequest<'_>,
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<BaselineVerificationScan> {
+    verify_with_evidence(request, ScanEvidence::ContentHashed, progress, cancel).await
+}
+
+/// Compare sizes and modes without reading file contents.
+///
+/// The responsive scan the UI can run while the user waits. It can prove that
+/// something *changed* — a resized file, a vanished one, an unexpected extra —
+/// but never that nothing did: the result carries
+/// [`ScanEvidence::MetadataOnly`], which [`BaselineVerification::is_clean`]
+/// refuses, and every `matching` finding it reports is only "the same size and
+/// mode as recorded".
+///
+/// # Errors
+///
+/// As [`verify_baseline`].
+pub async fn quick_verify_baseline(
+    request: BaselineVerificationRequest<'_>,
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<BaselineVerificationScan> {
+    verify_with_evidence(request, ScanEvidence::MetadataOnly, progress, cancel).await
+}
+
+async fn verify_with_evidence(
+    request: BaselineVerificationRequest<'_>,
+    evidence: ScanEvidence,
     progress: &dyn ProgressSink,
     cancel: &CancelToken,
 ) -> Result<BaselineVerificationScan> {
@@ -216,7 +263,15 @@ pub async fn verify_baseline(
         total: None,
     });
 
-    let output = scan_scope(roots, exclusions, Stage::Verifying, progress, cancel).await?;
+    let output = scan_scope(
+        roots,
+        exclusions,
+        evidence,
+        Stage::Verifying,
+        progress,
+        cancel,
+    )
+    .await?;
     let mut findings = Vec::new();
     let mut seen = BTreeSet::new();
     for ((root_key, path), entry) in &output.entries {
@@ -227,7 +282,7 @@ pub async fn verify_baseline(
             DiskEntry::File(actual) => {
                 let (classification, expected_hash, detail) = match baseline_file {
                     Some(recorded)
-                        if recorded.hash == actual.hash
+                        if content_matches(recorded, actual)
                             && recorded
                                 .mode
                                 .is_none_or(|expected_mode| Some(expected_mode) == actual.mode) =>
@@ -260,7 +315,7 @@ pub async fn verify_baseline(
                     path.clone(),
                     classification,
                     expected_hash,
-                    Some(actual.hash.clone()),
+                    actual.hash.clone(),
                     detail,
                 ));
             }
@@ -332,7 +387,7 @@ pub async fn verify_baseline(
         baseline_id: baseline.id,
         scan_run_id: run_id,
         state: output.state,
-        evidence: ScanEvidence::ContentHashed,
+        evidence,
         scope_fingerprint,
         findings,
         counts,
@@ -344,7 +399,7 @@ pub async fn verify_baseline(
         baseline_id: Some(baseline.id),
         purpose: ScanPurpose::Verify,
         state: output.state,
-        evidence: ScanEvidence::ContentHashed,
+        evidence,
         started_at,
         finished_at: Some(finished_at),
         files_scanned: output.files_scanned,
@@ -404,6 +459,7 @@ async fn validate_roots(roots: &[BaselineRoot]) -> Result<()> {
 async fn scan_scope(
     roots: &[BaselineRoot],
     exclusions: &[BaselineExclusion],
+    evidence: ScanEvidence,
     stage: Stage,
     progress: &dyn ProgressSink,
     cancel: &CancelToken,
@@ -468,7 +524,7 @@ async fn scan_scope(
             } else if !entry.file_type().is_file() {
                 DiskEntry::Special("non-regular file rejected from the trusted baseline".to_owned())
             } else {
-                match hash_regular_file(entry.path(), cancel, &mut bytes_hashed).await {
+                match read_regular_file(entry.path(), evidence, cancel, &mut bytes_hashed).await {
                     Ok(Some(file)) => DiskEntry::File(file),
                     Ok(None) => {
                         return Ok(ScanOutput {
@@ -532,8 +588,9 @@ fn excluded_entry(
             }))
 }
 
-async fn hash_regular_file(
+async fn read_regular_file(
     path: &Path,
+    evidence: ScanEvidence,
     cancel: &CancelToken,
     bytes_hashed: &mut u64,
 ) -> std::io::Result<Option<DiskFile>> {
@@ -542,6 +599,15 @@ async fn hash_regular_file(
         return Err(std::io::Error::other(
             "entry changed type while it was being scanned",
         ));
+    }
+    if evidence == ScanEvidence::MetadataOnly {
+        // Deliberately no open() and no read(): this is the responsive path,
+        // and the absence of a hash is what stops its result being called clean.
+        return Ok(Some(DiskFile {
+            hash: None,
+            size: before.len(),
+            mode: file_mode(&before),
+        }));
     }
     let mut file = tokio::fs::File::open(path).await?;
     let mut hasher = blake3::Hasher::new();
@@ -574,7 +640,7 @@ async fn hash_regular_file(
         ));
     }
     Ok(Some(DiskFile {
-        hash: FileHash::blake3(*hasher.finalize().as_bytes()),
+        hash: Some(FileHash::blake3(*hasher.finalize().as_bytes())),
         size: after.len(),
         mode: file_mode(&after),
     }))
@@ -660,16 +726,28 @@ fn unreadable_ancestor<'a>(
     })
 }
 
+/// Whether a scanned file's contents still match the recorded ones.
+///
+/// A metadata-only scan has no hash, so the strongest thing it can say is that
+/// the size is unchanged. That is enough to *detect* a change and never enough
+/// to certify its absence — [`BaselineVerification::is_clean`] rejects the
+/// evidence level, not the individual finding.
+fn content_matches(recorded: &BaselineFile, actual: &DiskFile) -> bool {
+    actual.hash.as_ref().map_or_else(
+        || recorded.size == actual.size,
+        |hash| &recorded.hash == hash,
+    )
+}
+
 fn mode_change_detail(expected: &BaselineFile, actual: &DiskFile) -> Option<String> {
-    (expected.hash == actual.hash && expected.mode.is_some() && expected.mode != actual.mode).then(
-        || {
+    (content_matches(expected, actual) && expected.mode.is_some() && expected.mode != actual.mode)
+        .then(|| {
             format!(
                 "file mode changed from {} to {}",
                 display_mode(expected.mode),
                 display_mode(actual.mode)
             )
-        },
-    )
+        })
 }
 
 fn display_mode(mode: Option<u32>) -> String {

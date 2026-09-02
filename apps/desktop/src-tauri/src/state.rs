@@ -121,6 +121,9 @@ impl From<onera_core::CoreError> for CommandError {
             E::RateLimited { .. } => "rate_limited",
             E::NotFound { .. } => "not_found",
             E::DecisionRequired(_) => "decision_required",
+            // A precondition a re-plan would fix: deleting the active profile,
+            // capturing a baseline over active mods, applying a stale preview.
+            E::Conflict(_) => "conflict",
             E::AmbiguousLayout(_) => "ambiguous_layout",
             E::ArchiveRejected { .. } => "archive_rejected",
             E::IntegrityMismatch { .. } => "integrity_mismatch",

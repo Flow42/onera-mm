@@ -302,6 +302,17 @@ impl ScanScopeFingerprint {
     }
 }
 
+impl From<String> for ScanScopeFingerprint {
+    /// Rebuild a fingerprint from a stored value.
+    ///
+    /// Only persistence should use this: a fingerprint that was not produced by
+    /// [`ScanScopeFingerprint::of`] describes no scope and would compare equal
+    /// to nothing.
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
 /// A directory a baseline scan covers.
 ///
 /// Only store-managed locations belong here. User-data roots are excluded by

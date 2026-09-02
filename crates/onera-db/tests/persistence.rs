@@ -652,3 +652,403 @@ async fn version_strings_survive_storage_unchanged() {
         .unwrap();
     assert_eq!(stored, "  v2.0 RC-1 (hotfix) ");
 }
+
+// ---------------------------------------------------------------------------
+// Baselines
+// ---------------------------------------------------------------------------
+
+fn build_identity(build: &str) -> onera_core::domain::baseline::StoreBuildIdentity {
+    use onera_core::domain::baseline::{DepotIdentity, GameStoreKind, StoreBuildIdentity};
+    StoreBuildIdentity {
+        store: GameStoreKind::Steam,
+        app_id: Some("1091500".into()),
+        build_id: Some(build.into()),
+        branch: None,
+        depots: vec![DepotIdentity {
+            depot_id: "1091501".into(),
+            manifest_id: "77".into(),
+        }],
+        manifest_path: Some("/games/steamapps/appmanifest_1091500.acf".into()),
+        observed_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+    }
+}
+
+fn a_baseline(
+    game: LocalGameId,
+    build: &str,
+    captured_at: i64,
+    status: onera_core::domain::baseline::BaselineStatus,
+    files: &[onera_core::domain::baseline::BaselineFile],
+) -> onera_core::domain::baseline::GameBaseline {
+    use onera_core::domain::baseline::{BaselineSource, GameBaseline, ScanScopeFingerprint};
+    GameBaseline {
+        id: BaselineId::new(),
+        local_game_id: game,
+        source: BaselineSource::StoreVerifiedCapture,
+        build_identity: Some(build_identity(build)),
+        adapter_id: "cyberpunk2077".into(),
+        reported_version: Some("2.21".into()),
+        status,
+        captured_at: chrono::DateTime::from_timestamp(captured_at, 0).unwrap(),
+        scope_fingerprint: ScanScopeFingerprint::from("b3fingerprint".to_owned()),
+        file_count: files.len() as u64,
+        total_bytes: files.iter().map(|f| f.size).sum(),
+    }
+}
+
+fn a_baseline_file(path: &str, contents: &[u8]) -> onera_core::domain::baseline::BaselineFile {
+    onera_core::domain::baseline::BaselineFile {
+        root_key: "game".into(),
+        path: RelPath::normalize(path).unwrap(),
+        hash: FileHash::blake3_of(contents),
+        size: contents.len() as u64,
+        mode: Some(0o644),
+    }
+}
+
+fn a_scan_run(
+    game: LocalGameId,
+    state: onera_core::domain::baseline::ScanState,
+) -> onera_core::domain::baseline::BaselineScanRun {
+    use onera_core::domain::baseline::{
+        BaselineScanRun, FindingCounts, ScanEvidence, ScanPurpose, ScanState,
+    };
+    BaselineScanRun {
+        id: BaselineScanRunId::new(),
+        local_game_id: game,
+        baseline_id: None,
+        purpose: ScanPurpose::Capture,
+        state,
+        evidence: ScanEvidence::ContentHashed,
+        started_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        finished_at: (state != ScanState::Running)
+            .then(|| chrono::DateTime::from_timestamp(1_700_000_500, 0).unwrap()),
+        files_scanned: 3,
+        bytes_hashed: 300,
+        counts: FindingCounts::default(),
+        error: None,
+    }
+}
+
+/// A recapture must keep the old baseline and its files: history is the whole
+/// point of superseding rather than overwriting.
+#[tokio::test]
+async fn a_new_current_baseline_supersedes_the_old_one_without_deleting_it() {
+    use onera_core::domain::baseline::BaselineStatus;
+    use onera_core::ports::BaselineStore;
+
+    let f = fixture().await;
+    let first_files = [a_baseline_file("bin/x64/game.exe", b"v1")];
+    let first = a_baseline(
+        f.game,
+        "18320471",
+        1_700_000_000,
+        BaselineStatus::Current,
+        &first_files,
+    );
+    f.db.put_baseline(&first, &first_files).await.unwrap();
+
+    let second_files = [
+        a_baseline_file("bin/x64/game.exe", b"v2"),
+        a_baseline_file("archive/pc/content/basegame.archive", b"content"),
+    ];
+    let second = a_baseline(
+        f.game,
+        "18400000",
+        1_700_100_000,
+        BaselineStatus::Current,
+        &second_files,
+    );
+    f.db.put_baseline(&second, &second_files).await.unwrap();
+
+    let current = f.db.current_baseline(f.game).await.unwrap().unwrap();
+    assert_eq!(current.id, second.id, "the newest capture must be current");
+    assert_eq!(current.build_identity, Some(build_identity("18400000")));
+
+    let history = f.db.baselines(f.game).await.unwrap();
+    assert_eq!(
+        history.iter().map(|b| b.id).collect::<Vec<_>>(),
+        vec![second.id, first.id],
+        "history is newest first and keeps the superseded capture"
+    );
+    assert_eq!(history[1].status, BaselineStatus::Superseded);
+    assert_eq!(
+        f.db.baseline_files(first.id).await.unwrap().len(),
+        1,
+        "superseding must not delete the old baseline's file records"
+    );
+}
+
+/// Writing a baseline twice is a bug in the caller, not an update.
+#[tokio::test]
+async fn a_captured_baseline_cannot_be_rewritten() {
+    use onera_core::domain::baseline::BaselineStatus;
+    use onera_core::ports::BaselineStore;
+
+    let f = fixture().await;
+    let files = [a_baseline_file("bin/x64/game.exe", b"v1")];
+    let baseline = a_baseline(
+        f.game,
+        "18320471",
+        1_700_000_000,
+        BaselineStatus::Current,
+        &files,
+    );
+    f.db.put_baseline(&baseline, &files).await.unwrap();
+
+    let error = f.db.put_baseline(&baseline, &files).await.unwrap_err();
+    assert!(
+        matches!(error, onera_core::CoreError::Conflict(_)),
+        "expected a conflict, got {error:?}"
+    );
+
+    // The schema refuses an in-place edit even when the port is bypassed.
+    let direct = sqlx::query("UPDATE game_baselines SET total_bytes = 0 WHERE id = ?1")
+        .bind(baseline.id.to_string())
+        .execute(f.db.pool())
+        .await;
+    assert!(direct.is_err(), "a baseline's contents must be immutable");
+
+    let direct_file = sqlx::query("UPDATE baseline_files SET size = 0 WHERE baseline_id = ?1")
+        .bind(baseline.id.to_string())
+        .execute(f.db.pool())
+        .await;
+    assert!(
+        direct_file.is_err(),
+        "a baseline's file records must be immutable"
+    );
+}
+
+/// Two reads of the same baseline must produce the same list in the same order,
+/// or a diff between two captures means nothing.
+#[tokio::test]
+async fn baseline_files_come_back_in_a_deterministic_order() {
+    use onera_core::domain::baseline::BaselineStatus;
+    use onera_core::ports::BaselineStore;
+
+    let f = fixture().await;
+    let files = [
+        a_baseline_file("r6/scripts/z.reds", b"z"),
+        a_baseline_file("archive/pc/content/a.archive", b"a"),
+        a_baseline_file("bin/x64/game.exe", b"exe"),
+        a_baseline_file("archive/pc/content/b.archive", b"b"),
+    ];
+    let baseline = a_baseline(
+        f.game,
+        "18320471",
+        1_700_000_000,
+        BaselineStatus::Current,
+        &files,
+    );
+    f.db.put_baseline(&baseline, &files).await.unwrap();
+
+    let stored = f.db.baseline_files(baseline.id).await.unwrap();
+    assert_eq!(
+        stored
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "archive/pc/content/a.archive",
+            "archive/pc/content/b.archive",
+            "bin/x64/game.exe",
+            "r6/scripts/z.reds",
+        ]
+    );
+    assert_eq!(stored, f.db.baseline_files(baseline.id).await.unwrap());
+    assert_eq!(stored[2].mode, Some(0o644));
+    assert_eq!(stored[2].hash, FileHash::blake3_of(b"exe"));
+}
+
+/// A scan is progress, not a verdict: the same run is written repeatedly as it
+/// advances and finally as it stops.
+#[tokio::test]
+async fn a_scan_run_records_progress_and_then_its_terminal_state() {
+    use onera_core::domain::baseline::{FindingCounts, ScanState};
+    use onera_core::ports::BaselineStore;
+
+    let f = fixture().await;
+    let mut run = a_scan_run(f.game, ScanState::Running);
+    run.finished_at = None;
+    run.files_scanned = 12;
+    run.bytes_hashed = 4096;
+    f.db.put_scan_run(&run).await.unwrap();
+
+    let stored = f.db.scan_run(run.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, ScanState::Running);
+    assert_eq!(stored.files_scanned, 12);
+    assert_eq!(stored.finished_at, None);
+
+    run.state = ScanState::Cancelled;
+    run.finished_at = Some(chrono::DateTime::from_timestamp(1_700_000_900, 0).unwrap());
+    run.files_scanned = 20;
+    run.bytes_hashed = 8192;
+    run.counts = FindingCounts {
+        matching: 18,
+        modified: 1,
+        extra_unknown: 1,
+        ..FindingCounts::default()
+    };
+    run.error = Some("the user stopped the scan".into());
+    f.db.put_scan_run(&run).await.unwrap();
+
+    let stored = f.db.scan_run(run.id).await.unwrap().unwrap();
+    assert_eq!(stored, run, "the terminal state replaces the running one");
+    assert!(
+        !stored.state.is_complete(),
+        "a cancelled scan never covered its whole scope"
+    );
+}
+
+/// Findings round-trip in the scanner's own order, and a re-run replaces them
+/// rather than appending a second partial result to the first.
+#[tokio::test]
+async fn findings_round_trip_in_order_and_a_rerun_replaces_them() {
+    use onera_core::domain::baseline::{BaselineFinding, FileClassification as Class, ScanState};
+    use onera_core::ports::BaselineStore;
+
+    let f = fixture().await;
+    let run = a_scan_run(f.game, ScanState::Completed);
+    f.db.put_scan_run(&run).await.unwrap();
+
+    let finding = |path: &str, class: Class, detail: Option<&str>| BaselineFinding {
+        root_key: "game".into(),
+        path: RelPath::normalize(path).unwrap(),
+        classification: class,
+        expected: Some(FileHash::blake3_of(b"expected")),
+        observed: (class != Class::Missing).then(|| FileHash::blake3_of(b"observed")),
+        detail: detail.map(str::to_owned),
+    };
+    let partial = vec![
+        finding("bin/x64/game.exe", Class::Modified, None),
+        finding("r6/scripts/gone.reds", Class::Missing, None),
+    ];
+    f.db.put_findings(run.id, &partial).await.unwrap();
+    assert_eq!(f.db.findings(run.id).await.unwrap(), partial);
+
+    let complete = vec![
+        finding("archive/pc/mod/x.archive", Class::ExtraUnknown, None),
+        finding("bin/x64/game.exe", Class::Modified, None),
+        finding(
+            "bin/x64/link",
+            Class::SpecialFile,
+            Some("symbolic link rejected from the trusted baseline"),
+        ),
+    ];
+    f.db.put_findings(run.id, &complete).await.unwrap();
+    assert_eq!(
+        f.db.findings(run.id).await.unwrap(),
+        complete,
+        "a re-run replaces its findings; a mixed result would be a lie"
+    );
+}
+
+/// The schema, not application discipline, is what stops two current baselines
+/// and orphaned baseline rows.
+#[tokio::test]
+async fn baseline_rows_obey_their_foreign_keys_and_uniqueness() {
+    use onera_core::domain::baseline::{BaselineStatus, ScanState};
+    use onera_core::ports::BaselineStore;
+
+    let f = fixture().await;
+    let files = [a_baseline_file("bin/x64/game.exe", b"v1")];
+    let baseline = a_baseline(
+        f.game,
+        "18320471",
+        1_700_000_000,
+        BaselineStatus::Current,
+        &files,
+    );
+    f.db.put_baseline(&baseline, &files).await.unwrap();
+
+    // A second `current` row for the same game is refused by the partial index.
+    let clash = sqlx::query(
+        "INSERT INTO game_baselines
+            (id, local_game_id, source, build_identity, adapter_id, reported_version,
+             status, captured_at, scope_fingerprint, file_count, total_bytes)
+         VALUES ('clash', ?1, 'local_snapshot', NULL, 'cyberpunk2077', NULL,
+                 'current', '2026-01-01T00:00:00Z', 'b3', 0, 0)",
+    )
+    .bind(f.game.to_string())
+    .execute(f.db.pool())
+    .await;
+    assert!(clash.is_err(), "a game may have only one current baseline");
+
+    // A baseline for a game that does not exist is refused.
+    let orphan = sqlx::query(
+        "INSERT INTO game_baselines
+            (id, local_game_id, source, build_identity, adapter_id, reported_version,
+             status, captured_at, scope_fingerprint, file_count, total_bytes)
+         VALUES ('orphan', 'no-such-game', 'local_snapshot', NULL, 'cyberpunk2077', NULL,
+                 'current', '2026-01-01T00:00:00Z', 'b3', 0, 0)",
+    )
+    .execute(f.db.pool())
+    .await;
+    assert!(orphan.is_err(), "a baseline must belong to a real game");
+
+    // Findings cannot exist without a run.
+    let run = a_scan_run(f.game, ScanState::Completed);
+    let missing_run = f.db.put_findings(run.id, &[]).await;
+    assert!(
+        missing_run.is_err(),
+        "findings need a scan run to belong to"
+    );
+
+    // Deleting the game takes the whole baseline record set with it.
+    f.db.put_scan_run(&run).await.unwrap();
+    sqlx::query("DELETE FROM local_game_installs WHERE id = ?1")
+        .bind(f.game.to_string())
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let (baselines,): (i64,) = sqlx::query_as("SELECT count(*) FROM game_baselines")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    let (baseline_files,): (i64,) = sqlx::query_as("SELECT count(*) FROM baseline_files")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    let (runs,): (i64,) = sqlx::query_as("SELECT count(*) FROM baseline_scan_runs")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!((baselines, baseline_files, runs), (0, 0, 0));
+}
+
+/// Superseding is a lifecycle change, and a failed capture was never
+/// authoritative enough to have one.
+#[tokio::test]
+async fn only_a_usable_baseline_can_be_superseded() {
+    use onera_core::domain::baseline::BaselineStatus;
+    use onera_core::ports::BaselineStore;
+
+    let f = fixture().await;
+    let files = [a_baseline_file("bin/x64/game.exe", b"v1")];
+    let current = a_baseline(
+        f.game,
+        "18320471",
+        1_700_000_000,
+        BaselineStatus::Current,
+        &files,
+    );
+    f.db.put_baseline(&current, &files).await.unwrap();
+    f.db.supersede_baseline(current.id).await.unwrap();
+    assert_eq!(f.db.current_baseline(f.game).await.unwrap(), None);
+
+    let failed = a_baseline(
+        f.game,
+        "18320471",
+        1_700_000_100,
+        BaselineStatus::Failed,
+        &[],
+    );
+    f.db.put_baseline(&failed, &[]).await.unwrap();
+    assert!(f.db.supersede_baseline(failed.id).await.is_err());
+
+    let absent =
+        f.db.supersede_baseline(BaselineId::new())
+            .await
+            .unwrap_err();
+    assert!(matches!(absent, onera_core::CoreError::NotFound { .. }));
+}
