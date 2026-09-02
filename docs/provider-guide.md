@@ -16,12 +16,46 @@ pub trait ModProvider: Send + Sync {
     async fn resolve_download(&self, game_slug: &str, mod_id: &ProviderModId,
                               file_id: &ProviderFileId, cancel: &CancelToken)
         -> Result<DownloadTarget>;
+
+    // Both have defaults; see "Dependencies" below.
+    fn dependency_capability(&self) -> DependencyCapability;
+    async fn dependencies(&self, sources: &[DependencySource], cancel: &CancelToken)
+        -> Result<Vec<DependencySnapshot>>;
 }
 ```
 
-`ProviderModId` and `ProviderFileId` are opaque strings. Whatever your service
-uses as a key — an integer, a UUID, a slug — becomes one of these and is never
-interpreted by anything downstream.
+`ProviderModId`, `ProviderFileId`, `ProviderVersionId` and `ProviderFileGroupId`
+are opaque strings. Whatever your service uses as a key — an integer, a UUID, a
+slug — becomes one of these and is never interpreted by anything downstream.
+
+The last two exist for dependency work: `ProviderVersionId` identifies one
+version of a file, `ProviderFileGroupId` groups the files that supersede each
+other. Onera selects at most one version per group and orders them by the
+`position` you report, because it will not parse an author's version string.
+
+## Dependencies
+
+Both methods have defaults — `Unsupported`, and one unsupported snapshot per
+requested source — so a provider that has no dependency concept implements
+nothing and is still correctly represented.
+
+If yours does, the one rule that matters is that **an empty answer is not a
+missing one**:
+
+- return `Fetched` with no groups when the service says a mod requires nothing;
+- return `Unavailable { reason }` for a failed request, an endpoint that has
+  disappeared, or an experimental API you could not reach;
+- never let the second case produce the first.
+
+`dependencies` returns one snapshot per requested source, in the order
+requested. Reserve `Err` for failures that abort the whole call, such as
+cancellation or a lost credential — a single source that could not be answered
+gets an `Unavailable` snapshot instead, so one gap does not discard the rest.
+
+Preserve the raw response in `raw` and compute a `DependencyFingerprint` over
+the normalized requirements. The fingerprint is what a user's "ignore this
+requirement" decision is scoped to, so it must change when the _meaning_ of a
+requirement changes and stay stable when only ordering or cosmetics do.
 
 ## Authentication is separate
 

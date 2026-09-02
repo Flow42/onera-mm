@@ -13,16 +13,26 @@
 //!   a staging directory; those are always [`RelPath`] plus a root.
 
 use crate::domain::archive::{ArchiveInspection, ArchiveManifest};
+use crate::domain::baseline::{
+    BaselineExclusion, BaselineFile, BaselineFinding, BaselineRoot, BaselineScanRun, GameBaseline,
+    StoreBuildIdentity, StoreDlc,
+};
+use crate::domain::dependency::{
+    DependencyCapability, DependencyOverride, DependencySnapshot, DependencySource,
+};
 use crate::domain::game::{DeployRoot, Game, InstallValidation, LocalGameInstall};
+use crate::domain::profile::{Profile, ProfileActivation, ProfileMember};
 use crate::domain::release::{Mod, ProviderFile, Release};
 use crate::hash::FileHash;
 use crate::ids::{ProviderFileId, ProviderId, ProviderModId};
+use crate::paths::DeployRootKind;
 use crate::paths::RelPath;
 use crate::plan::TargetLocation;
 use crate::progress::{CancelToken, ProgressSink};
 use crate::redact::Secret;
 use crate::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// A page of results from a provider.
@@ -176,6 +186,42 @@ pub trait ModProvider: Send + Sync {
         file_id: &ProviderFileId,
         cancel: &CancelToken,
     ) -> Result<DownloadTarget>;
+
+    /// What this provider can say about dependencies, before anything is asked.
+    ///
+    /// Lets the UI tell "this source has no such concept" apart from "we asked
+    /// and it failed". The default is
+    /// [`DependencyCapability::Unsupported`], so a provider that models no
+    /// dependencies needs no code at all and can never be mistaken for one that
+    /// reported none.
+    fn dependency_capability(&self) -> DependencyCapability {
+        DependencyCapability::Unsupported
+    }
+
+    /// Provider-neutral dependency definitions for a set of versions.
+    ///
+    /// Implementations return exactly one [`DependencySnapshot`] per requested
+    /// source, in the order requested. A source the provider could not answer
+    /// for gets a snapshot with
+    /// [`crate::domain::dependency::DependencyAvailability::Unavailable`] — an
+    /// empty group list must never be used to mean "we do not know". Returning
+    /// `Err` is reserved for failures that abort the whole request, such as
+    /// cancellation or a lost credential.
+    ///
+    /// # Errors
+    /// Fails on authentication errors and cancellation.
+    async fn dependencies(
+        &self,
+        sources: &[DependencySource],
+        cancel: &CancelToken,
+    ) -> Result<Vec<DependencySnapshot>> {
+        let _ = cancel;
+        let now = chrono::Utc::now();
+        Ok(sources
+            .iter()
+            .map(|source| DependencySnapshot::unsupported(source.clone(), now))
+            .collect())
+    }
 }
 
 /// A game-specific adapter.
@@ -217,6 +263,46 @@ pub trait GameAdapter: Send + Sync {
     /// # Errors
     /// Returns [`crate::CoreError::InvalidInput`] with a displayable reason.
     fn validate_target(&self, target: &TargetLocation) -> Result<()>;
+
+    /// Directories a baseline capture may scan.
+    ///
+    /// Only store-managed locations belong here. The default derives them from
+    /// [`GameAdapter::deploy_roots`] by keeping the install directory and the
+    /// adapter's auxiliary roots and dropping user-data and compatibility-prefix
+    /// roots, which is the documented default: saves, per-user configuration and
+    /// prefix internals are not part of what "clean" means and change constantly
+    /// on their own.
+    ///
+    /// # Errors
+    /// Fails if a required root cannot be derived from the installation.
+    fn baseline_roots(&self, install: &LocalGameInstall) -> Result<Vec<BaselineRoot>> {
+        Ok(self
+            .deploy_roots(install)?
+            .into_iter()
+            .filter(|root| {
+                matches!(
+                    root.kind,
+                    DeployRootKind::GameInstall | DeployRootKind::Auxiliary
+                )
+            })
+            .map(|root| BaselineRoot {
+                key: root.key,
+                kind: root.kind,
+                path: root.path,
+            })
+            .collect())
+    }
+
+    /// Paths inside the baseline roots that are never part of a baseline.
+    ///
+    /// Caches, logs, shader caches and configuration the game rewrites at
+    /// runtime. Declaring one here is what stops a routine rewrite from being
+    /// reported as a modified game file. The declarations are fingerprinted into
+    /// every baseline, so narrowing this list later invalidates the comparison
+    /// rather than silently producing an easier "clean".
+    fn baseline_exclusions(&self) -> Vec<BaselineExclusion> {
+        Vec::new()
+    }
 }
 
 /// The outcome of mapping an archive onto deployment roots.
@@ -380,6 +466,95 @@ mod tests {
         assert_object_safe::<dyn ReconciliationStore>();
         assert_object_safe::<dyn AuthProvider>();
         assert_object_safe::<dyn ProgressSink>();
+        assert_object_safe::<dyn GameStore>();
+        assert_object_safe::<dyn GameManifestProvider>();
+        assert_object_safe::<dyn ProfileStore>();
+        assert_object_safe::<dyn BaselineStore>();
+        assert_object_safe::<dyn DependencyStore>();
+    }
+
+    /// A store that cannot answer must be distinguishable from one that answered
+    /// "nothing", including after a round trip to the frontend.
+    #[test]
+    fn an_unknown_store_capability_is_not_an_empty_one() {
+        let empty: StoreCapability<Vec<u8>> = StoreCapability::known(vec![]);
+        let unknown: StoreCapability<Vec<u8>> = StoreCapability::unknown("Steam is not running");
+        assert_ne!(empty, unknown);
+        assert!(empty.is_known());
+        assert_eq!(empty.value(), Some(&vec![]));
+        assert!(!unknown.is_known());
+        assert_eq!(unknown.value(), None);
+
+        let json = serde_json::to_string(&unknown).unwrap();
+        assert!(json.contains("\"kind\":\"unknown\""), "{json}");
+        assert_eq!(
+            serde_json::from_str::<StoreCapability<Vec<u8>>>(&json).unwrap(),
+            unknown
+        );
+    }
+
+    /// The default [`ModProvider::dependencies`] must answer for every source it
+    /// was given, and must not pass an empty group list off as "no dependencies".
+    #[tokio::test]
+    async fn the_default_provider_reports_unsupported_rather_than_none() {
+        use crate::domain::dependency::DependencyAvailability;
+
+        struct Bare;
+
+        #[async_trait]
+        impl ModProvider for Bare {
+            fn id(&self) -> ProviderId {
+                ProviderId::new("bare")
+            }
+            async fn games(&self, _: Option<&str>, _: &CancelToken) -> Result<Page<Game>> {
+                Ok(Page::single(vec![]))
+            }
+            async fn mod_metadata(
+                &self,
+                _: &str,
+                _: &ProviderModId,
+                _: &CancelToken,
+            ) -> Result<(Mod, Vec<Release>)> {
+                Err(crate::CoreError::Unsupported("test".into()))
+            }
+            async fn files(
+                &self,
+                _: &str,
+                _: &ProviderModId,
+                _: Option<&str>,
+                _: &CancelToken,
+            ) -> Result<Page<ProviderFile>> {
+                Ok(Page::single(vec![]))
+            }
+            async fn resolve_download(
+                &self,
+                _: &str,
+                _: &ProviderModId,
+                _: &ProviderFileId,
+                _: &CancelToken,
+            ) -> Result<DownloadTarget> {
+                Err(crate::CoreError::Unsupported("test".into()))
+            }
+        }
+
+        assert!(!Bare.dependency_capability().is_supported());
+        let sources = vec![DependencySource {
+            provider: ProviderId::new("bare"),
+            game_slug: "cyberpunk2077".into(),
+            provider_mod_id: ProviderModId::new("1"),
+            provider_file_id: None,
+            provider_version_id: None,
+        }];
+        let snapshots = Bare
+            .dependencies(&sources, &CancelToken::new())
+            .await
+            .unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots[0].availability,
+            DependencyAvailability::Unsupported
+        );
+        assert!(!snapshots[0].declares_no_dependencies());
     }
 }
 
@@ -391,7 +566,10 @@ use crate::domain::operation::{Operation, OperationKind, OperationState};
 use crate::domain::provider_stack::{ProviderStack, StackEntry};
 use crate::domain::reconcile::InstallationMapping;
 use crate::domain::reconcile::MutationPlan;
-use crate::ids::{ArchiveId, BackupId, InstallationId, LocalGameId, ModId, OperationId, ReleaseId};
+use crate::ids::{
+    ArchiveId, BackupId, BaselineId, BaselineScanRunId, DependencyGroupId, InstallationId,
+    LocalGameId, ModId, OperationId, ProfileId, ProfileMemberId, ReleaseId,
+};
 use crate::plan::{InstallPlan, ScopedRule, TargetLocation as PlanTargetLocation};
 
 /// One file's recorded progress inside a journaled operation.
@@ -605,4 +783,307 @@ pub trait BackupStore: Send + Sync {
 
     /// Drop a backup's record and its bytes.
     async fn delete(&self, id: BackupId) -> Result<()>;
+}
+
+// ---------------------------------------------------------------------------
+// Store identity
+// ---------------------------------------------------------------------------
+
+/// Something a store may or may not be able to tell us.
+///
+/// The whole point of this type is that a missing answer is *not* an empty one.
+/// A store that exposes no ownership list returns
+/// [`StoreCapability::Unknown`], never `Known(vec![])`, because the second would
+/// let a solver conclude that the user owns no DLC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StoreCapability<T> {
+    /// The store answered.
+    Known {
+        /// The answer.
+        value: T,
+    },
+    /// The store cannot answer, or was not reachable.
+    Unknown {
+        /// Displayable reason.
+        reason: String,
+    },
+}
+
+impl<T> StoreCapability<T> {
+    /// Wrap a known answer.
+    pub fn known(value: T) -> Self {
+        Self::Known { value }
+    }
+
+    /// Wrap a missing answer.
+    pub fn unknown(reason: impl Into<String>) -> Self {
+        Self::Unknown {
+            reason: reason.into(),
+        }
+    }
+
+    /// The answer, if there is one.
+    ///
+    /// Callers that turn this into a default value must say so in the UI; this
+    /// method deliberately does not offer `unwrap_or_default`.
+    pub fn value(&self) -> Option<&T> {
+        match self {
+            Self::Known { value } => Some(value),
+            Self::Unknown { .. } => None,
+        }
+    }
+
+    /// Whether the store answered.
+    pub fn is_known(&self) -> bool {
+        matches!(self, Self::Known { .. })
+    }
+}
+
+/// The store that manages a game installation.
+///
+/// Steam is the first implementation, reading its own local `appmanifest` file.
+/// Nothing here requires store credentials or scraping a client's internals.
+#[async_trait]
+pub trait GameStore: Send + Sync {
+    /// Stable slug of this store adapter, e.g. `steam`.
+    fn id(&self) -> &str;
+
+    /// Best-effort build identity for an installation.
+    ///
+    /// # Errors
+    /// Fails only on I/O errors that prevent even attempting the read. A store
+    /// that simply does not publish an identity returns
+    /// [`StoreCapability::Unknown`].
+    async fn build_identity(
+        &self,
+        install: &LocalGameInstall,
+    ) -> Result<StoreCapability<StoreBuildIdentity>>;
+
+    /// Store extras the user owns.
+    ///
+    /// # Errors
+    /// Fails only on I/O errors. Unknown ownership is
+    /// [`StoreCapability::Unknown`], never an empty list.
+    async fn owned_dlc(&self, install: &LocalGameInstall)
+        -> Result<StoreCapability<Vec<StoreDlc>>>;
+}
+
+/// One file as an authoritative store manifest describes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpectedFile {
+    /// Baseline root the file belongs to.
+    pub root_key: String,
+    /// Path relative to that root.
+    pub path: RelPath,
+    /// Size in bytes, when the manifest states one.
+    pub size: Option<u64>,
+    /// Digest as the store published it.
+    pub digest: Option<ManifestDigest>,
+}
+
+/// A digest published by a store, in the store's own algorithm.
+///
+/// Deliberately not a [`FileHash`]: that type is Onera's own integrity currency
+/// and stores use algorithms Onera does not compute — Steam documents SHA-1 for
+/// depot manifests. Keeping them separate stops a store-supplied digest from
+/// being mistaken for a hash Onera verified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestDigest {
+    /// Algorithm name as the store publishes it, lowercase.
+    pub algorithm: String,
+    /// Lowercase hex digest.
+    pub hex: String,
+}
+
+/// The complete expected file set for one build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpectedManifest {
+    /// Build the manifest describes.
+    pub build_identity: StoreBuildIdentity,
+    /// Every file the store says the build contains.
+    pub files: Vec<ExpectedFile>,
+}
+
+/// Whether an authoritative manifest could be obtained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ManifestAvailability {
+    /// The store publishes no manifest Onera may consume.
+    Unsupported,
+    /// It does, but this request did not get one.
+    Unavailable {
+        /// Displayable reason.
+        reason: String,
+    },
+    /// A manifest was obtained.
+    Available {
+        /// The expected file set.
+        manifest: Box<ExpectedManifest>,
+    },
+}
+
+/// A source of authoritative expected-file manifests.
+///
+/// Future-facing on purpose, and nothing implements it today. Steam documents
+/// depot manifests as carrying file paths, sizes, flags and SHA-1 hashes, but
+/// publishes no supported consumer API for retrieving them, so Onera's first
+/// release captures a local baseline instead. This port exists so that if such
+/// an API appears, a manifest can replace local capture without changing the
+/// baseline domain, the scanner or the UI.
+///
+/// Implementations must never require store credentials from the user or scrape
+/// a store client's internal state.
+#[async_trait]
+pub trait GameManifestProvider: Send + Sync {
+    /// Stable slug of this manifest source.
+    fn id(&self) -> &str;
+
+    /// Fetch the expected file set for an installed build.
+    ///
+    /// # Errors
+    /// Fails on cancellation. A missing or unsupported manifest is reported as
+    /// [`ManifestAvailability`], not as an error.
+    async fn expected_manifest(
+        &self,
+        install: &LocalGameInstall,
+        identity: &StoreBuildIdentity,
+        cancel: &CancelToken,
+    ) -> Result<ManifestAvailability>;
+}
+
+// ---------------------------------------------------------------------------
+// Profile, baseline and dependency persistence
+// ---------------------------------------------------------------------------
+
+/// Profiles and their members.
+///
+/// Everything here is desired state. No implementation of this port touches the
+/// game directory; a profile only reaches disk through a previewed, journaled
+/// [`MutationPlan`].
+#[async_trait]
+pub trait ProfileStore: Send + Sync {
+    /// Every profile for a local game.
+    async fn profiles(&self, game: LocalGameId) -> Result<Vec<Profile>>;
+
+    /// One profile by identifier.
+    async fn profile(&self, id: ProfileId) -> Result<Option<Profile>>;
+
+    /// The one active profile for a local game, if the game has profiles.
+    async fn active_profile(&self, game: LocalGameId) -> Result<Option<Profile>>;
+
+    /// Insert or update a profile.
+    ///
+    /// # Errors
+    /// Returns [`crate::CoreError::Conflict`] if the name is already used by
+    /// another profile of the same local game.
+    async fn put_profile(&self, profile: &Profile) -> Result<()>;
+
+    /// Delete a profile and its members.
+    ///
+    /// # Errors
+    /// Returns [`crate::CoreError::Conflict`] if the profile is the active one.
+    /// Another profile must be activated first, so a game is never left without
+    /// an active profile.
+    async fn delete_profile(&self, id: ProfileId) -> Result<()>;
+
+    /// Make one profile the active one for its game, atomically.
+    ///
+    /// Callers apply this only after the filesystem matches the target profile.
+    async fn set_active_profile(&self, game: LocalGameId, profile: ProfileId) -> Result<()>;
+
+    /// Members of a profile, in priority order.
+    async fn members(&self, profile: ProfileId) -> Result<Vec<ProfileMember>>;
+
+    /// Insert or update one member.
+    async fn put_member(&self, member: &ProfileMember) -> Result<()>;
+
+    /// Remove one member.
+    ///
+    /// Dependency overrides scoped to that membership go with it: a risk the
+    /// user accepted for a mod they have removed must not survive re-adding it.
+    async fn remove_member(&self, member: ProfileMemberId) -> Result<()>;
+
+    /// Record an activation attempt or update its state.
+    async fn record_activation(&self, activation: &ProfileActivation) -> Result<()>;
+
+    /// Recent activation attempts for a game, newest first.
+    async fn activation_history(
+        &self,
+        game: LocalGameId,
+        limit: u32,
+    ) -> Result<Vec<ProfileActivation>>;
+}
+
+/// Captured baselines, their files, and scan runs.
+#[async_trait]
+pub trait BaselineStore: Send + Sync {
+    /// The baseline Onera currently compares against, if any.
+    async fn current_baseline(&self, game: LocalGameId) -> Result<Option<GameBaseline>>;
+
+    /// Every baseline recorded for a game, newest first.
+    ///
+    /// History is retained across game updates so a superseded capture remains
+    /// inspectable.
+    async fn baselines(&self, game: LocalGameId) -> Result<Vec<GameBaseline>>;
+
+    /// Store a baseline and its file records together.
+    ///
+    /// A baseline is immutable once written; a recapture is a new record that
+    /// supersedes the old one rather than an update in place.
+    async fn put_baseline(&self, baseline: &GameBaseline, files: &[BaselineFile]) -> Result<()>;
+
+    /// Files recorded in a baseline.
+    async fn baseline_files(&self, baseline: BaselineId) -> Result<Vec<BaselineFile>>;
+
+    /// Mark a baseline superseded, keeping it and its files.
+    async fn supersede_baseline(&self, baseline: BaselineId) -> Result<()>;
+
+    /// Insert or update a scan run's progress and result counts.
+    async fn put_scan_run(&self, run: &BaselineScanRun) -> Result<()>;
+
+    /// One scan run by identifier.
+    async fn scan_run(&self, id: BaselineScanRunId) -> Result<Option<BaselineScanRun>>;
+
+    /// Persist the findings of a scan run.
+    async fn put_findings(
+        &self,
+        run: BaselineScanRunId,
+        findings: &[BaselineFinding],
+    ) -> Result<()>;
+
+    /// Findings recorded for a scan run.
+    async fn findings(&self, run: BaselineScanRunId) -> Result<Vec<BaselineFinding>>;
+}
+
+/// Cached provider dependency data and the user's accepted risks.
+#[async_trait]
+pub trait DependencyStore: Send + Sync {
+    /// The most recent snapshot for a provider version, if one is cached.
+    ///
+    /// Returning `None` means "nothing cached", which callers must not confuse
+    /// with a snapshot that declares no dependencies.
+    async fn snapshot(&self, source: &DependencySource) -> Result<Option<DependencySnapshot>>;
+
+    /// Cached snapshots for several versions, in the order requested.
+    async fn snapshots(
+        &self,
+        sources: &[DependencySource],
+    ) -> Result<Vec<Option<DependencySnapshot>>>;
+
+    /// Store a snapshot, replacing any previous one for the same version.
+    async fn put_snapshot(&self, snapshot: &DependencySnapshot) -> Result<()>;
+
+    /// Overrides recorded for a profile's members.
+    async fn overrides(&self, profile: ProfileId) -> Result<Vec<DependencyOverride>>;
+
+    /// Record an accepted risk.
+    async fn put_override(&self, decision: &DependencyOverride) -> Result<()>;
+
+    /// Withdraw an accepted risk.
+    async fn delete_override(
+        &self,
+        member: ProfileMemberId,
+        group: DependencyGroupId,
+    ) -> Result<()>;
 }

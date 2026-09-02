@@ -22,6 +22,7 @@
 //! than guessing, and the caller asks the user.
 
 use onera_core::domain::archive::ArchiveManifest;
+use onera_core::domain::baseline::{BaselineExclusion, ExclusionPattern, ExclusionReason};
 use onera_core::domain::game::{DeployRoot, InstallValidation, LocalGameInstall};
 use onera_core::paths::DeployRootKind;
 use onera_core::plan::TargetLocation;
@@ -182,6 +183,63 @@ impl GameAdapter for Cyberpunk2077 {
             ));
         }
         Ok(())
+    }
+
+    /// Everything the game rewrites on its own.
+    ///
+    /// Cyberpunk regenerates `r6/cache/final.redscripts` on almost every launch,
+    /// writes crash reports and logs beside its executables, and keeps a
+    /// per-machine shader cache. None of that says anything about whether the
+    /// installation is clean, so including it would make every baseline
+    /// verification report a modified game within one play session.
+    ///
+    /// The default deployment roots already keep the compatibility prefix and
+    /// the user-data root out of the baseline; these are the exclusions *inside*
+    /// the game directory.
+    fn baseline_exclusions(&self) -> Vec<BaselineExclusion> {
+        let prefix = |path: &str, reason: ExclusionReason, note: &str| BaselineExclusion {
+            root_key: Some(ROOT_GAME.to_owned()),
+            pattern: ExclusionPattern::Prefix {
+                path: RelPath::normalize(path).expect("static exclusion path is valid"),
+            },
+            reason,
+            note: Some(note.to_owned()),
+        };
+        vec![
+            prefix(
+                "r6/cache",
+                ExclusionReason::Cache,
+                "Redscript recompiles this on launch",
+            ),
+            prefix("r6/logs", ExclusionReason::Logs, "script and mod logs"),
+            prefix(
+                "r6/storage",
+                ExclusionReason::GeneratedConfig,
+                "per-mod configuration written at runtime",
+            ),
+            prefix(
+                "bin/x64/plugins/cyber_engine_tweaks",
+                ExclusionReason::GeneratedConfig,
+                "CET keeps its bindings and mod settings here",
+            ),
+            prefix("red4ext/logs", ExclusionReason::Logs, "RED4ext logs"),
+            BaselineExclusion {
+                root_key: Some(ROOT_GAME.to_owned()),
+                pattern: ExclusionPattern::Extension {
+                    extension: "log".to_owned(),
+                },
+                reason: ExclusionReason::Logs,
+                note: Some("logs are written throughout the game directory".to_owned()),
+            },
+            BaselineExclusion {
+                root_key: Some(ROOT_GAME.to_owned()),
+                pattern: ExclusionPattern::DirectoryName {
+                    name: "ShaderCache".to_owned(),
+                },
+                reason: ExclusionReason::ShaderCache,
+                note: Some("shader caches differ per driver and per machine".to_owned()),
+            },
+        ]
     }
 }
 
@@ -481,5 +539,62 @@ mod tests {
             ..install
         };
         assert_eq!(Cyberpunk2077.deploy_roots(&bare).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_baseline_scope_covers_the_install_but_not_user_data() {
+        use onera_core::domain::game::InstallSource;
+        use onera_core::ids::{GameId, LocalGameId};
+
+        let install = LocalGameInstall {
+            id: LocalGameId::new(),
+            game_id: GameId::new(),
+            adapter_id: "cyberpunk2077".into(),
+            source: InstallSource::SteamNative,
+            install_root: "/games/Cyberpunk 2077".into(),
+            compat_prefix: Some("/steam/compatdata/1091500/pfx".into()),
+            user_data_roots: vec![],
+            confirmed: true,
+        };
+
+        // deploy_roots offers two roots; only the store-managed one is scanned.
+        assert_eq!(Cyberpunk2077.deploy_roots(&install).unwrap().len(), 2);
+        let roots = Cyberpunk2077.baseline_roots(&install).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].key, ROOT_GAME);
+        assert_eq!(roots[0].kind, DeployRootKind::GameInstall);
+    }
+
+    #[test]
+    fn regenerated_files_are_excluded_from_the_baseline_but_real_content_is_not() {
+        use onera_core::domain::baseline::excluded_by;
+
+        let exclusions = Cyberpunk2077.baseline_exclusions();
+        for excluded in [
+            "r6/cache/final.redscripts",
+            "r6/logs/scc.log",
+            "r6/storage/mymod/settings.json",
+            "bin/x64/plugins/cyber_engine_tweaks/mods/thing/init.lua",
+            "red4ext/logs/red4ext.log",
+            "bin/x64/ShaderCache/a.bin",
+        ] {
+            let path = RelPath::normalize(excluded).unwrap();
+            assert!(
+                excluded_by(&exclusions, ROOT_GAME, &path).is_some(),
+                "{excluded} should not be part of a baseline"
+            );
+        }
+
+        for included in [
+            "bin/x64/Cyberpunk2077.exe",
+            "archive/pc/content/basegame_1_engine.archive",
+            "r6/config/inputUserMappings.xml",
+        ] {
+            let path = RelPath::normalize(included).unwrap();
+            assert!(
+                excluded_by(&exclusions, ROOT_GAME, &path).is_none(),
+                "{included} belongs in the baseline"
+            );
+        }
     }
 }

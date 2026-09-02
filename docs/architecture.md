@@ -15,6 +15,7 @@ database, a network, a filesystem, a browser — is an adapter behind a trait.
 | `onera-discovery` | Steam library parsing, game matching                             | `onera-core`     |
 | `onera-games`     | Game adapters (currently Cyberpunk 2077)                         | `onera-core`     |
 | `onera-provider`  | Provider registry                                                | `onera-core`     |
+| `onera-resolver`  | Pure dependency solver (scaffolded; see Milestone 4)             | `onera-core`     |
 | `onera-nexus`     | Nexus Mods API v3 client and personal-API-key auth               | `onera-core`     |
 | `onera-download`  | Streaming downloader, content-addressed archive store            | `onera-core`     |
 | `onera-app`       | Wiring: which database, which provider, which secret store       | all of the above |
@@ -47,6 +48,9 @@ Declared in `onera_core::ports`:
 | `ArchiveStore`                                         | `onera-download`                | Content addressing is a policy, not a detail                               |
 | `OperationJournal` / `DeploymentStore` / `BackupStore` | `onera-db`                      | Crash recovery is testable without SQLite                                  |
 | `ReconciliationStore`                                  | `onera-db`                      | Final stacks, activation flags and operation completion publish atomically |
+| `GameStore`                                            | (Milestone 2)                   | Build identity and DLC ownership differ per store, and may be unknowable   |
+| `GameManifestProvider`                                 | (nothing yet)                   | An authoritative manifest must be able to replace local capture            |
+| `ProfileStore` / `BaselineStore` / `DependencyStore`   | (Milestone 2–4)                 | Desired state, observations and cached provider data persist separately    |
 
 Every port is object-safe and stored as `Arc<dyn Trait>`; a test in
 `ports.rs` asserts that, because losing object safety would quietly force the
@@ -55,9 +59,19 @@ whole application to become generic over its adapters.
 ## Rules the code enforces
 
 **No provider-specific identifier reaches the installation domain.** Providers
-are addressed through `ProviderId`, `ProviderModId` and `ProviderFileId`, which
-are opaque newtypes over `String`. Nothing in `onera-install` can ask "which
-Nexus mod is this?" because the type does not carry the answer.
+are addressed through `ProviderId`, `ProviderModId`, `ProviderFileId`,
+`ProviderVersionId` and `ProviderFileGroupId`, which are opaque newtypes over
+`String`. Nothing in `onera-install` can ask "which Nexus mod is this?" because
+the type does not carry the answer. The last two exist so dependency
+compatibility is decided on provider version identity and provider ordering
+rather than on parsing an author's version string.
+
+**A missing answer is not an empty one.** `StoreCapability::Unknown`,
+`DependencyAvailability::Unavailable`, `DependencyHealth::Unknown` and
+`BaselineFreshness::Unknown` all exist so that "we could not find out" cannot be
+stored, returned or rendered as "there is nothing to find". A provider that does
+not model dependencies, one that failed to answer, and one that answered "none"
+are three different states.
 
 **No raw path crosses a boundary.** Anything derived from an archive or from a
 message is a `RelPath` — normalized, relative, traversal-free by construction.

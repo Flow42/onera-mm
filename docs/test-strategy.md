@@ -4,7 +4,7 @@
 
 | Suite                        | Command                  | Count |
 | ---------------------------- | ------------------------ | ----- |
-| Rust unit and integration    | `cargo test --workspace` | 332   |
+| Rust unit and integration    | `cargo test --workspace` | 366   |
 | Frontend and extension units | `pnpm test`              | 50    |
 | Frontend end-to-end          | `pnpm test:e2e`          | 11    |
 
@@ -28,6 +28,18 @@ normalized `RelPath` can never escape its root. Three properties, in
   `\` separators or by padding.
 
 ### Unit
+
+The Milestone 2–4 domain types are contract-tested where they live, before any
+behaviour exists behind them: profile invariants (one active profile per game,
+per-game name uniqueness, priority ordering, and that an enabled member with no
+artifact is reported rather than dropped), baseline identity (build identity is
+compared and never ordered, an incomparable identity is `Unknown` rather than
+`Same`, a metadata-only scan can never report clean, and unknown extras always
+need a decision), and dependency states (a fetched empty set, an unavailable
+one and an unsupported one are three distinct values; a changed definition
+fingerprint invalidates an ignore decision; unknown DLC ownership never counts
+as owned). `onera-resolver` is asserted never to report `Compatible` while it
+is a scaffold.
 
 Pure logic is tested where it lives: the provider stack (11 tests covering every
 push/remove combination including shared identical content, downgrade and buried

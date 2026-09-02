@@ -1670,6 +1670,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "onera-resolver"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "onera-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

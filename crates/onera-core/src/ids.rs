@@ -149,6 +149,30 @@ uuid_id!(
     /// A stored copy of a file Onera was about to overwrite.
     BackupId
 );
+uuid_id!(
+    /// A named, game-scoped selection of mods.
+    ProfileId
+);
+uuid_id!(
+    /// One mod's membership in a profile.
+    ProfileMemberId
+);
+uuid_id!(
+    /// An immutable capture of a game's clean file set.
+    BaselineId
+);
+uuid_id!(
+    /// One run of a baseline capture or verification scan.
+    BaselineScanRunId
+);
+uuid_id!(
+    /// One fetch of a provider's dependency definition for a version.
+    DependencySnapshotId
+);
+uuid_id!(
+    /// One independent requirement inside a dependency snapshot.
+    DependencyGroupId
+);
 
 string_id!(
     /// Stable slug of a provider implementation, e.g. `nexus`.
@@ -161,6 +185,31 @@ string_id!(
 string_id!(
     /// Provider-scoped file identifier. Opaque to the installation domain.
     ProviderFileId
+);
+string_id!(
+    /// Provider-scoped identifier for one *version* of a file.
+    ///
+    /// Providers that model dependencies do so against a version identity rather
+    /// than an author-written version string. Onera stores that identity opaquely
+    /// and only ever compares it for equality — never for ordering, and never by
+    /// parsing it. Ordering within a lineage comes from
+    /// [`crate::domain::dependency::DependencyCandidate::position`], which the
+    /// provider supplies.
+    ProviderVersionId
+);
+string_id!(
+    /// Provider-scoped identifier for a group of files that supersede each other.
+    ///
+    /// Nexus calls this an update chain; other providers may call it something
+    /// else. It answers "which files are alternative versions of the same thing?"
+    /// so the solver can select exactly one version per group.
+    ProviderFileGroupId
+);
+string_id!(
+    /// Store-scoped identifier for a downloadable extra (DLC).
+    ///
+    /// Opaque: a Steam AppID and another store's SKU are both just strings here.
+    StoreDlcId
 );
 
 impl ProviderId {

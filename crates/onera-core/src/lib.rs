@@ -31,8 +31,9 @@ pub mod redact;
 pub use error::{CoreError, Result};
 pub use hash::{FileHash, HashAlgorithm};
 pub use ids::{
-    AccountId, ArchiveId, BackupId, ConflictId, DeployedFileId, DownloadJobId, GameId,
-    InboxRequestId, InstallationId, LocalGameId, ModId, OperationId, ProviderFileId, ProviderId,
-    ProviderModId, ReleaseId,
+    AccountId, ArchiveId, BackupId, BaselineId, BaselineScanRunId, ConflictId, DependencyGroupId,
+    DependencySnapshotId, DeployedFileId, DownloadJobId, GameId, InboxRequestId, InstallationId,
+    LocalGameId, ModId, OperationId, ProfileId, ProfileMemberId, ProviderFileGroupId,
+    ProviderFileId, ProviderId, ProviderModId, ProviderVersionId, ReleaseId, StoreDlcId,
 };
 pub use paths::{DeployRootKind, RelPath, RelPathError};

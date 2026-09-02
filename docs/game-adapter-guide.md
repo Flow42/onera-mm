@@ -18,6 +18,10 @@ pub trait GameAdapter: Send + Sync {
     fn deploy_roots(&self, install: &LocalGameInstall) -> Result<Vec<DeployRoot>>;
     fn resolve_layout(&self, manifest: &ArchiveManifest) -> Result<LayoutResolution>;
     fn validate_target(&self, target: &TargetLocation) -> Result<()>;
+
+    // Both have defaults; see step 6.
+    fn baseline_roots(&self, install: &LocalGameInstall) -> Result<Vec<BaselineRoot>>;
+    fn baseline_exclusions(&self) -> Vec<BaselineExclusion>;
 }
 ```
 
@@ -103,7 +107,27 @@ Refuse targets that must never be written. For Cyberpunk:
 Rejected targets appear in the preview as `InvalidTarget` with your message, so
 be specific about _why_ and where the file should have gone.
 
-## 6. Register and test
+## 6. Baseline scope
+
+These two have working defaults, so a new adapter can ignore them at first.
+
+`baseline_roots` defaults to the deployment roots of kind `GameInstall` and
+`Auxiliary` — the store-managed locations. User-data and compatibility-prefix
+roots are dropped, because saves and per-user configuration are not part of what
+"clean" means. Override it only if your game keeps store-managed content
+somewhere `deploy_roots` does not mention.
+
+`baseline_exclusions` defaults to empty and is worth filling in: anything the
+game rewrites by itself — caches, logs, shader caches, configuration written at
+runtime — will otherwise be reported as a modified game file after the first
+launch. Declare each one with a reason, so the capture summary can explain what
+was skipped and why.
+
+The declarations are fingerprinted into every baseline. Narrowing the list later
+invalidates existing baselines rather than quietly making "clean" easier to
+reach, so prefer a precise `Prefix` over a broad `DirectoryName`.
+
+## 7. Register and test
 
 ```rust
 pub fn all_adapters() -> Vec<&'static dyn GameAdapter> {
