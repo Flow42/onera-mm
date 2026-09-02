@@ -20,6 +20,7 @@ use onera_app::{InstallRequest, Onera, Paths};
 use onera_core::domain::game::InstallSource;
 use onera_core::domain::profile::{ActivationBlocker, DesiredModState, ProfileActivationState};
 use onera_core::ids::{ProfileId, ProviderModId};
+use onera_core::ports::ModProvider;
 use onera_core::progress::{CancelToken, NullProgress};
 use onera_core::redact::Secret;
 use onera_core::CoreError;
@@ -98,6 +99,66 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         .collect()
 }
 
+/// A provider that delegates everything but reports no dependency concept.
+///
+/// The activation mechanics — download, prepare, publish, roll back — have
+/// nothing to do with whether the provider models dependencies, and coupling
+/// them to it makes every one of these tests fail the moment an adapter gains
+/// the capability. What a *capable* provider with no ingested data does is
+/// pinned separately, by
+/// [`a_capable_provider_with_no_ingested_dependencies_blocks_the_switch`].
+struct DependencyBlindProvider(Arc<dyn ModProvider>);
+
+#[async_trait::async_trait]
+impl ModProvider for DependencyBlindProvider {
+    fn id(&self) -> onera_core::ids::ProviderId {
+        self.0.id()
+    }
+    async fn games(
+        &self,
+        cursor: Option<&str>,
+        cancel: &CancelToken,
+    ) -> onera_core::Result<onera_core::ports::Page<onera_core::domain::game::Game>> {
+        self.0.games(cursor, cancel).await
+    }
+    async fn mod_metadata(
+        &self,
+        game_slug: &str,
+        mod_id: &ProviderModId,
+        cancel: &CancelToken,
+    ) -> onera_core::Result<(
+        onera_core::domain::release::Mod,
+        Vec<onera_core::domain::release::Release>,
+    )> {
+        self.0.mod_metadata(game_slug, mod_id, cancel).await
+    }
+    async fn files(
+        &self,
+        game_slug: &str,
+        mod_id: &ProviderModId,
+        cursor: Option<&str>,
+        cancel: &CancelToken,
+    ) -> onera_core::Result<onera_core::ports::Page<onera_core::domain::release::ProviderFile>>
+    {
+        self.0.files(game_slug, mod_id, cursor, cancel).await
+    }
+    async fn resolve_download(
+        &self,
+        game_slug: &str,
+        mod_id: &ProviderModId,
+        file_id: &onera_core::ids::ProviderFileId,
+        cancel: &CancelToken,
+    ) -> onera_core::Result<onera_core::ports::DownloadTarget> {
+        self.0
+            .resolve_download(game_slug, mod_id, file_id, cancel)
+            .await
+    }
+    // The one override: the trait's own default, restated deliberately.
+    fn dependency_capability(&self) -> onera_core::domain::dependency::DependencyCapability {
+        onera_core::domain::dependency::DependencyCapability::Unsupported
+    }
+}
+
 struct Harness {
     onera: Onera,
     _dir: tempfile::TempDir,
@@ -106,7 +167,18 @@ struct Harness {
 }
 
 impl Harness {
+    /// A harness whose provider models no dependencies, for mechanics tests.
     async fn new() -> Self {
+        Self::build(true).await
+    }
+
+    /// A harness on the real adapter, which reports the dependency capability
+    /// it actually has.
+    async fn dependency_aware() -> Self {
+        Self::build(false).await
+    }
+
+    async fn build(dependency_blind: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let game_dir = fake_game_dir(dir.path());
         let archive = build_mod_archive(&[
@@ -183,7 +255,13 @@ impl Harness {
         let auth = Arc::new(
             ApiKeyAuth::new_for_tests(secrets, config.v1_base.clone(), &config.user_agent).unwrap(),
         );
-        let provider = Arc::new(NexusClient::new_for_tests(config, auth.clone()).unwrap());
+        let nexus: Arc<dyn ModProvider> =
+            Arc::new(NexusClient::new_for_tests(config, auth.clone()).unwrap());
+        let provider: Arc<dyn ModProvider> = if dependency_blind {
+            Arc::new(DependencyBlindProvider(nexus))
+        } else {
+            nexus
+        };
         let onera = Onera::assemble_with(
             Paths::rooted_at(dir.path().join("xdg")),
             auth,
@@ -333,7 +411,40 @@ async fn a_member_with_no_chosen_file_blocks_the_switch() {
 
 #[tokio::test]
 async fn dependency_status_is_a_real_profile_command_before_the_solver_exists() {
-    let h = Harness::new().await;
+    use onera_core::domain::dependency::{DependencyHealth, ResolutionOutcome};
+
+    // A provider with no dependency concept: nothing to check, so nothing is
+    // claimed. `not_applicable` is not a satisfied tick, and the outcome is
+    // compatible because there is genuinely nothing outstanding.
+    let blind = Harness::new().await;
+    let (game, mod_id) = registered(&blind).await;
+    let profile = blind.active_profile(game).await;
+    let member = blind
+        .onera
+        .add_profile_member(
+            profile,
+            mod_id,
+            Some(onera_core::ids::ProviderFileId::new(FILE_ID)),
+        )
+        .await
+        .unwrap();
+
+    let resolution = blind
+        .onera
+        .resolve_profile_dependencies(profile)
+        .await
+        .unwrap();
+    assert!(matches!(resolution.outcome, ResolutionOutcome::Compatible));
+    assert_eq!(resolution.health.len(), 1);
+    assert_eq!(resolution.health[0].profile_member_id, member.id);
+    assert_eq!(resolution.health[0].health, DependencyHealth::NotApplicable);
+    assert_eq!(resolution.evidence.unsupported, 1);
+    assert_eq!(resolution.evidence.unavailable, 0);
+
+    // A provider that *does* model dependencies, with nothing ingested yet.
+    // The honest answer is `unknown` — "we have not checked" — and never
+    // `compatible`, which would mean "we checked and it is fine".
+    let h = Harness::dependency_aware().await;
     let (game, mod_id) = registered(&h).await;
     let profile = h.active_profile(game).await;
     let member = h
@@ -347,17 +458,18 @@ async fn dependency_status_is_a_real_profile_command_before_the_solver_exists() 
         .unwrap();
 
     let resolution = h.onera.resolve_profile_dependencies(profile).await.unwrap();
-    assert!(matches!(
-        resolution.outcome,
-        onera_core::domain::dependency::ResolutionOutcome::Compatible
-    ));
-    assert_eq!(resolution.health.len(), 1);
-    assert_eq!(resolution.health[0].profile_member_id, member.id);
-    assert_eq!(
-        resolution.health[0].health,
-        onera_core::domain::dependency::DependencyHealth::NotApplicable
+    assert!(
+        matches!(resolution.outcome, ResolutionOutcome::Unknown { .. }),
+        "an unasked question is not a satisfied one: {:?}",
+        resolution.outcome
     );
-    assert_eq!(resolution.evidence.unsupported, 1);
+    assert_eq!(resolution.health[0].profile_member_id, member.id);
+    assert_eq!(resolution.health[0].health, DependencyHealth::Unknown);
+    assert!(resolution.health[0].health.blocks_apply());
+    // The evidence says the data was not available, not that it was empty.
+    assert_eq!(resolution.evidence.unavailable, 1);
+    assert_eq!(resolution.evidence.unsupported, 0);
+    assert!(!resolution.evidence.is_complete_and_current());
 
     let missing = h
         .onera
@@ -620,6 +732,70 @@ async fn a_cancelled_activation_keeps_the_old_profile_active() {
         !history[0].state.target_is_active(),
         "only Applied may claim the target"
     );
+}
+
+/// A capable provider with nothing ingested must refuse the switch.
+///
+/// This is the "unknown is not empty" rule reaching all the way to an apply.
+/// Nexus now reports `Supported { batch, dlc }`, but no application code
+/// fetches definitions or reads them back through `DependencyStore` yet, so
+/// every enabled member is honestly `unknown` — and unknown blocks.
+///
+/// The test exists to keep that gap *visible and pinned* rather than papered
+/// over: when dependency ingestion lands, this is the test that has to change,
+/// and it should change to "a satisfied member no longer blocks", never to "we
+/// stopped asking".
+#[tokio::test]
+async fn a_capable_provider_with_no_ingested_dependencies_blocks_the_switch() {
+    let h = Harness::dependency_aware().await;
+    let (game, mod_id) = registered(&h).await;
+    let before = snapshot(&h.game_dir);
+    let default = h.active_profile(game).await;
+
+    let modded = h
+        .onera
+        .create_profile(game, "Modded".into(), None, None)
+        .await
+        .unwrap();
+    let member = h
+        .onera
+        .add_profile_member(
+            modded.id,
+            mod_id,
+            Some(onera_core::ids::ProviderFileId::new(FILE_ID)),
+        )
+        .await
+        .unwrap();
+
+    let preview = h.onera.plan_profile_activation(modded.id).await.unwrap();
+    assert!(!preview.ready);
+    assert_eq!(
+        preview.blockers,
+        vec![ActivationBlocker::DependencyUnsatisfied {
+            member_id: member.id
+        }]
+    );
+    // The member is still a download, not an omission: the two states are
+    // independent, and a dependency problem never hides the work to be done.
+    assert_eq!(preview.downloads.len(), 1);
+    assert_eq!(preview.downloads[0].member_id, member.id);
+
+    let error = h
+        .onera
+        .activate_profile(modded.id, None, &NullProgress, &CancelToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CoreError::DecisionRequired(_)));
+
+    // Refused before anything was acquired or written.
+    assert_eq!(h.active_profile(game).await, default);
+    assert_eq!(snapshot(&h.game_dir), before);
+    assert!(h
+        .onera
+        .profile_activation_history(game, 10)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 // ---------------------------------------------------------------------------

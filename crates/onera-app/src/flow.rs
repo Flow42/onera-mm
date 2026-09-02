@@ -1778,6 +1778,9 @@ mod tests {
         ProviderFile {
             provider: ProviderId::nexus(),
             provider_file_id: ProviderFileId::new(name),
+            provider_version_id: None,
+            provider_file_group_id: None,
+            position: None,
             release_id: ReleaseId::new(),
             name: name.to_owned(),
             size_bytes: Some(1),

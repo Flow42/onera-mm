@@ -19,3 +19,5 @@ blob-report/
 *.db
 *.db-shm
 *.db-wal
+
+.agents

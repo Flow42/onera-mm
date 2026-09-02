@@ -10,7 +10,10 @@
 //! cross-mod comparison is meaningless.
 
 use crate::hash::FileHash;
-use crate::ids::{ModId, ProviderFileId, ProviderId, ProviderModId, ReleaseId};
+use crate::ids::{
+    ModId, ProviderFileGroupId, ProviderFileId, ProviderId, ProviderModId, ProviderVersionId,
+    ReleaseId,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -95,6 +98,15 @@ pub struct ProviderFile {
     pub provider: ProviderId,
     /// Provider's opaque file identifier.
     pub provider_file_id: ProviderFileId,
+    /// Provider's opaque version identity for this file, when exposed.
+    pub provider_version_id: Option<ProviderVersionId>,
+    /// Provider's opaque group of mutually superseding files, when exposed.
+    pub provider_file_group_id: Option<ProviderFileGroupId>,
+    /// Provider-defined ordering position within the file group.
+    ///
+    /// Higher is newer. `None` is explicitly unresolved; callers must never
+    /// derive this value from a version string or identifier.
+    pub position: Option<i64>,
     /// Release this file belongs to.
     pub release_id: ReleaseId,
     /// Filename as published, used for display and for archive-format sniffing.

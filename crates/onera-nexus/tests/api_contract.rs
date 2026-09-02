@@ -161,6 +161,16 @@ async fn walks_mod_files_and_their_versions() {
     let primary = files.items.iter().find(|f| f.is_primary).unwrap();
     assert_eq!(primary.name, "CET 1.31");
     assert_eq!(primary.size_bytes, Some(4096));
+    assert_eq!(primary.provider_file_id.as_str(), "100");
+    assert_eq!(
+        primary.provider_version_id.as_ref().unwrap().as_str(),
+        "100"
+    );
+    assert_eq!(
+        primary.provider_file_group_id.as_ref().unwrap().as_str(),
+        "10"
+    );
+    assert_eq!(primary.position, None);
     assert_eq!(
         primary.category,
         onera_core::domain::release::FileCategory::Main

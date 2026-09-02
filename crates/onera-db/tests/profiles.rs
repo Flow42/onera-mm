@@ -89,6 +89,9 @@ async fn fixture() -> Fixture {
     db.upsert_provider_file(&ProviderFile {
         provider: provider.clone(),
         provider_file_id: provider_file.clone(),
+        provider_version_id: Some(ProviderVersionId::new("opaque-version")),
+        provider_file_group_id: Some(ProviderFileGroupId::new("opaque-group")),
+        position: Some(17),
         release_id: release,
         name: "example.zip".into(),
         size_bytes: Some(4),
@@ -97,14 +100,6 @@ async fn fixture() -> Fixture {
         uploaded_at: None,
         is_primary: true,
     })
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE provider_files SET provider_version_id = 'opaque-version',
-         provider_file_group_id = 'opaque-group'
-         WHERE provider_id = 'nexus' AND provider_file_id = 'file-42'",
-    )
-    .execute(db.pool())
     .await
     .unwrap();
     let archive = db

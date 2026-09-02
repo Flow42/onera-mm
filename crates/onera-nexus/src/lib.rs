@@ -27,10 +27,11 @@
 
 pub mod auth;
 pub mod client;
+pub mod dependencies;
 pub mod error;
 pub mod models;
 pub mod retry;
 
 pub use auth::{ApiKeyAuth, SECRET_KEY};
-pub use client::{NexusClient, NexusConfig, DEFAULT_V1_BASE, DEFAULT_V3_BASE};
+pub use client::{DependencyLimits, NexusClient, NexusConfig, DEFAULT_V1_BASE, DEFAULT_V3_BASE};
 pub use retry::{RateLimit, RetryPolicy};

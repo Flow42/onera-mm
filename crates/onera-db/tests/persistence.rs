@@ -80,6 +80,9 @@ async fn fixture() -> Fixture {
     db.upsert_provider_file(&ProviderFile {
         provider: provider.clone(),
         provider_file_id: provider_file.clone(),
+        provider_version_id: None,
+        provider_file_group_id: None,
+        position: None,
         release_id: release,
         name: "cet-1.2.3.zip".into(),
         size_bytes: Some(13),

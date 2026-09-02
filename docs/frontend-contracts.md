@@ -45,6 +45,7 @@ required" or "nothing changed" is a bug, not a simplification:
 | `freshness.kind = "unknown"`        | "baseline is fresh"     |
 | `dlc_ownership = "unknown"`         | owned                   |
 | `outcome.kind = "unknown"`          | "compatible", or a plan |
+| `game_slug = ""` (`status: unknown`) | a game name, or this game |
 
 Each of those has its own visual state. The plan-view tests already establish
 the precedent: an unrecognized classification fails safe by demanding a
@@ -410,11 +411,22 @@ operation shows labelled cached data and never calls it current.
           "game_slug": "cyberpunk2077",
           "provider_mod_id": "107",
           "provider_file_id": "9001",
-          "provider_version_id": "v-9001",
-          "provider_file_group_id": "g-107",
-          "position": 12,
+          "provider_version_id": "9001",
+          "provider_file_group_id": "4210",
+          "position": 2500000,
           "status": "available",
           "display_name": "CET 1.35.0"
+        },
+        {
+          "provider": "nexus",
+          "game_slug": "",
+          "provider_mod_id": "",
+          "provider_file_id": "9002",
+          "provider_version_id": "9002",
+          "provider_file_group_id": "4210",
+          "position": null,
+          "status": "unknown",
+          "display_name": null
         }
       ]
     }
@@ -422,8 +434,7 @@ operation shows labelled cached data and never calls it current.
   "dlc": [{ "id": "56…", "label": "Phantom Liberty", "alternatives": ["1091501"] }],
   "provider_revision": null,
   "fingerprint": "b3…",
-  "fetched_at": "2026-09-01T08:00:00Z",
-  "raw": null
+  "fetched_at": "2026-09-01T08:00:00Z"
 }
 ```
 
@@ -434,11 +445,39 @@ empty `candidates` array is a requirement nothing can satisfy, not a satisfied
 one.
 
 `kind` on a group is `required`, `recommended` or `incompatible`; `recommended`
-is advisory and never blocks. `position` is the provider's own ordering within
-`provider_file_group_id` — the only ordering that exists. There is no version
-string to compare, and the frontend must not invent one.
+is advisory and never blocks.
 
-`raw` is diagnostic and is not rendered.
+**`position` is an opaque ordering key, and is never displayed.** It orders
+candidates against other candidates in the same `provider_file_group_id` and
+means nothing anywhere else — not across groups, not across providers, and not
+as a number a user should see. Adapters scale the provider's own value to fit an
+integer (the Nexus adapter multiplies a decimal by 10⁶, so real values look like
+`2500000`), so its magnitude carries no meaning. `null` means the provider gave
+no position; such a candidate cannot be ordered and must not be presented as
+newest or oldest. There is no version string to compare and the frontend must
+not invent one.
+
+**`provider_file_id` and `provider_version_id` may be equal, and neither can be
+derived from the other.** They are separate fields because a provider may
+distinguish a downloadable file from a version of it; the Nexus adapter carries
+the same id in both. Never key on whether they differ, never construct one from
+the other, and never parse either.
+
+**An empty `game_slug` or `provider_mod_id` is a real value**, paired with
+`"status": "unknown"`, and means the provider did not say what the candidate
+targets. Render the `unknown` status, not the empty string: an empty slug is
+never a game name and is never the current game. `status` is `available`,
+`hidden`, `removed` or `unknown`, and only `available` is selectable.
+
+An `available` candidate the user is not on, alongside a `hidden` one they are,
+is how "the version you are on is no longer offered" is distinguished from "no
+candidate exists" — say which, rather than showing an unexplained conflict.
+
+The snapshot's own `raw` field — the provider's unmodified response — is
+**omitted from this payload**. It is diagnostic, it is never rendered, and for
+Nexus it carries the raw declaration plus every materialized candidate row, which
+can reach megabytes. Sending it to the webview would be pure cost, so the command
+strips it at the boundary. Read it from the store when diagnosing, not from here.
 
 ### `set_dependency_override` / `clear_dependency_override`
 

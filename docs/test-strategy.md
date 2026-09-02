@@ -4,7 +4,7 @@
 
 | Suite                        | Command                  | Count |
 | ---------------------------- | ------------------------ | ----- |
-| Rust unit and integration    | `cargo test --workspace` | 453   |
+| Rust unit and integration    | `cargo test --workspace` | 493   |
 | Frontend and extension units | `pnpm test`              | 76    |
 | Frontend end-to-end          | `pnpm test:e2e`          | 20    |
 

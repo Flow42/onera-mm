@@ -691,6 +691,9 @@ async fn activate_a_fake_mod(onera: &Onera, game: LocalGameId) {
     db.upsert_provider_file(&ProviderFile {
         provider: ProviderId::nexus(),
         provider_file_id: ProviderFileId::new("9001"),
+        provider_version_id: None,
+        provider_file_group_id: None,
+        position: None,
         release_id: release,
         name: "a-mod.zip".into(),
         size_bytes: Some(4),

@@ -23,6 +23,7 @@ pub mod backup;
 pub mod baseline;
 pub mod catalog;
 pub mod convert;
+pub mod dependency;
 pub mod deployment;
 pub mod jobs;
 pub mod journal;
@@ -39,7 +40,7 @@ use std::time::Duration;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The schema version this build understands.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// A pooled SQLite database.
 #[derive(Debug, Clone)]
@@ -296,6 +297,116 @@ mod tests {
         assert_eq!(active, 1);
         assert_eq!(default_profile, ("Default".into(), 1, 1));
         assert_eq!(imported, ("installation".into(), "enabled".into(), 10));
+    }
+
+    /// A populated profile database from the immediately preceding release
+    /// gains dependency tables without rewriting desired state or inventing
+    /// provider candidate metadata.
+    #[tokio::test]
+    async fn populated_version_six_database_migrates_to_dependencies() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("onera-v6.sqlite3");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        for sql in [
+            include_str!("../migrations/0001_initial.sql"),
+            include_str!("../migrations/0002_product_completion.sql"),
+            include_str!("../migrations/0003_desired_state.sql"),
+            include_str!("../migrations/0004_active_lineage.sql"),
+            include_str!("../migrations/0005_baselines.sql"),
+            include_str!("../migrations/0006_profiles.sql"),
+        ] {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        }
+        sqlx::query(
+            "CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for migration in MIGRATOR.iter().filter(|migration| migration.version <= 6) {
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations
+                    (version, description, success, checksum, execution_time)
+                 VALUES (?1, ?2, 1, ?3, 0)",
+            )
+            .bind(migration.version)
+            .bind(migration.description.as_ref())
+            .bind(migration.checksum.as_ref())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::raw_sql(
+            "INSERT INTO providers VALUES
+                ('nexus', 'Nexus', 'https://example.invalid', '2026-01-01T00:00:00Z');
+             INSERT INTO games VALUES
+                ('game', 'nexus', 'test', 'Test', NULL, '2026-01-01T00:00:00Z');
+             INSERT INTO local_game_installs VALUES
+                ('local', 'game', 'test', 'manual', '/game', NULL, '[]', 1,
+                 '2026-01-01T00:00:00Z');
+             INSERT INTO mods VALUES
+                ('mod', 'nexus', '42', 'test', 'Mod', NULL, '2026-01-01T00:00:00Z');
+             INSERT INTO releases VALUES ('release', 'mod', 'v1', NULL, '{}');
+             INSERT INTO provider_files
+                (id, release_id, provider_id, provider_file_id, name, category, is_primary)
+             VALUES ('stored-file', 'release', 'nexus', 'file-42', 'mod.zip', 'main', 1);
+             INSERT INTO profiles VALUES
+                ('profile', 'local', 'Populated', NULL, 1,
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO profile_members
+                (id, profile_id, mod_id, provider_id, provider_mod_id,
+                 provider_file_id, desired, pinned, priority, added_at)
+             VALUES ('member', 'profile', 'mod', 'nexus', '42', 'file-42',
+                     'enabled', 0, 10, '2026-01-01T00:00:00Z');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = Database::open(&path).await.unwrap();
+        let (version,): (String,) =
+            sqlx::query_as("SELECT value FROM schema_meta WHERE key = 'schema_version'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let member: (String, String) = sqlx::query_as(
+            "SELECT profile_id, provider_file_id FROM profile_members WHERE id = 'member'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let position: (Option<i64>,) =
+            sqlx::query_as("SELECT provider_position FROM provider_files WHERE id = 'stored-file'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let (dependency_tables,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN ('dependency_snapshots', 'dependency_overrides')",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(version, "7");
+        assert_eq!(member, ("profile".into(), "file-42".into()));
+        assert_eq!(position.0, None, "legacy position must remain unresolved");
+        assert_eq!(dependency_tables, 2);
     }
 
     /// A user who installed the first Onera release must reach the baseline

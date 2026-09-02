@@ -12,8 +12,8 @@ use onera_core::domain::game::{Game, InstallSource, LocalGameInstall};
 use onera_core::domain::release::{FileCategory, Mod, ProviderFile, Release};
 use onera_core::hash::FileHash;
 use onera_core::ids::{
-    ArchiveId, GameId, InstallationId, LocalGameId, ModId, ProviderFileId, ProviderId,
-    ProviderModId, ReleaseId,
+    ArchiveId, GameId, InstallationId, LocalGameId, ModId, ProviderFileGroupId, ProviderFileId,
+    ProviderId, ProviderModId, ProviderVersionId, ReleaseId,
 };
 use onera_core::{CoreError, Result};
 use sqlx::Row as _;
@@ -566,7 +566,8 @@ impl Database {
         provider_file_id: &ProviderFileId,
     ) -> Result<Option<ProviderFile>> {
         let row = sqlx::query(
-            "SELECT release_id, name, size_bytes, category, published_hash,
+            "SELECT release_id, provider_version_id, provider_file_group_id,
+                    provider_position, name, size_bytes, category, published_hash,
                     uploaded_at, is_primary
              FROM provider_files WHERE provider_id = ?1 AND provider_file_id = ?2",
         )
@@ -585,6 +586,15 @@ impl Database {
             Ok(ProviderFile {
                 provider: provider.clone(),
                 provider_file_id: provider_file_id.clone(),
+                provider_version_id: row
+                    .try_get::<Option<String>, _>("provider_version_id")
+                    .map_err(db_err)?
+                    .map(ProviderVersionId::new),
+                provider_file_group_id: row
+                    .try_get::<Option<String>, _>("provider_file_group_id")
+                    .map_err(db_err)?
+                    .map(ProviderFileGroupId::new),
+                position: row.try_get("provider_position").map_err(db_err)?,
                 release_id: ReleaseId::from(uuid(&release)?),
                 name: row.try_get("name").map_err(db_err)?,
                 size_bytes: size.map(|s| s as u64),
@@ -639,17 +649,31 @@ impl Database {
     pub async fn upsert_provider_file(&self, f: &ProviderFile) -> Result<()> {
         sqlx::query(
             "INSERT INTO provider_files
-               (id, release_id, provider_id, provider_file_id, name, size_bytes,
+               (id, release_id, provider_id, provider_file_id, provider_version_id,
+                provider_file_group_id, provider_position, name, size_bytes,
                 category, published_hash, uploaded_at, is_primary)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(provider_id, provider_file_id) DO UPDATE SET
-               release_id = ?2, name = ?5, size_bytes = ?6, category = ?7,
-               published_hash = ?8, uploaded_at = ?9, is_primary = ?10",
+               release_id = ?2, provider_version_id = ?5,
+               provider_file_group_id = ?6, provider_position = ?7,
+               name = ?8, size_bytes = ?9, category = ?10,
+               published_hash = ?11, uploaded_at = ?12, is_primary = ?13",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(f.release_id.to_string())
         .bind(f.provider.as_str())
         .bind(f.provider_file_id.as_str())
+        .bind(
+            f.provider_version_id
+                .as_ref()
+                .map(ProviderVersionId::as_str),
+        )
+        .bind(
+            f.provider_file_group_id
+                .as_ref()
+                .map(ProviderFileGroupId::as_str),
+        )
+        .bind(f.position)
         .bind(&f.name)
         .bind(f.size_bytes.map(|s| s as i64))
         .bind(category_str(f.category))
@@ -668,8 +692,9 @@ impl Database {
     /// Propagates database errors.
     pub async fn provider_files(&self, release: ReleaseId) -> Result<Vec<ProviderFile>> {
         let rows = sqlx::query(
-            "SELECT provider_id, provider_file_id, name, size_bytes, category,
-                    published_hash, uploaded_at, is_primary
+            "SELECT provider_id, provider_file_id, provider_version_id,
+                    provider_file_group_id, provider_position, name, size_bytes,
+                    category, published_hash, uploaded_at, is_primary
              FROM provider_files WHERE release_id = ?1 ORDER BY name",
         )
         .bind(release.to_string())
@@ -688,6 +713,15 @@ impl Database {
                 Ok(ProviderFile {
                     provider: ProviderId::new(provider),
                     provider_file_id: ProviderFileId::new(file_id),
+                    provider_version_id: row
+                        .try_get::<Option<String>, _>("provider_version_id")
+                        .map_err(db_err)?
+                        .map(ProviderVersionId::new),
+                    provider_file_group_id: row
+                        .try_get::<Option<String>, _>("provider_file_group_id")
+                        .map_err(db_err)?
+                        .map(ProviderFileGroupId::new),
+                    position: row.try_get("provider_position").map_err(db_err)?,
                     release_id: release,
                     name: row.try_get("name").map_err(db_err)?,
                     size_bytes: size.map(|s| s as u64),

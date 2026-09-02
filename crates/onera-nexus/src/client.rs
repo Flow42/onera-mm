@@ -9,6 +9,7 @@ use crate::error::{map_status, parse_problem};
 use crate::models::*;
 use crate::retry::{parse_retry_after, RateLimit, RetryPolicy};
 use async_trait::async_trait;
+use onera_core::domain::dependency::{DependencyCapability, DependencySnapshot, DependencySource};
 use onera_core::domain::game::Game;
 use onera_core::domain::release::{FileCategory, Mod, ProviderFile, Release};
 use onera_core::hash::FileHash;
@@ -30,6 +31,13 @@ pub const DEFAULT_V1_BASE: &str = "https://api.nexusmods.com/v1";
 /// Header the personal-API-key scheme uses, per the v3 specification.
 const API_KEY_HEADER: &str = "apikey";
 
+/// Largest response body Onera will read from Nexus.
+///
+/// A batch dependency page is a few hundred kilobytes. Reading is bounded rather
+/// than trusted because a hostile or broken server that answers a small request
+/// with an endless body would otherwise exhaust memory before any parser sees it.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Configuration for the client.
 #[derive(Debug, Clone)]
 pub struct NexusConfig {
@@ -43,6 +51,60 @@ pub struct NexusConfig {
     pub retry: RetryPolicy,
     /// Per-request timeout.
     pub timeout: Duration,
+    /// Bounds on the dependency batch endpoints.
+    pub dependency_limits: DependencyLimits,
+}
+
+/// Bounds applied to the paginated dependency batch endpoints.
+///
+/// Every one of these is a refusal to trust a remote server about how much work
+/// it may ask Onera to do. The defaults are the documented request limits; the
+/// page and row ceilings exist so a server that keeps reporting "one more page"
+/// produces an honest `Unavailable` rather than an infinite loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DependencyLimits {
+    /// Source version ids per materialized batch request. The specification
+    /// caps `version_ids` at 5000.
+    pub max_sources_per_request: usize,
+    /// Version ids per version-detail batch request. The specification caps it
+    /// at 2000.
+    pub max_details_per_request: usize,
+    /// Candidate rows requested per page. The specification caps it at 5000.
+    pub page_size: u32,
+    /// Pages Onera will fetch for one chunk before giving up.
+    pub max_pages: u32,
+    /// Candidate rows Onera will hold for one chunk before giving up.
+    pub max_rows: usize,
+}
+
+impl Default for DependencyLimits {
+    fn default() -> Self {
+        Self {
+            max_sources_per_request: 5000,
+            max_details_per_request: 2000,
+            page_size: 1000,
+            max_pages: 64,
+            max_rows: 100_000,
+        }
+    }
+}
+
+impl DependencyLimits {
+    /// The limits with every zero replaced by a usable minimum.
+    ///
+    /// A zero page size would ask for empty pages forever, and a zero chunk size
+    /// would never send a request at all; both are configuration mistakes rather
+    /// than reasons to hang.
+    #[must_use]
+    pub fn sanitized(self) -> Self {
+        Self {
+            max_sources_per_request: self.max_sources_per_request.clamp(1, 5000),
+            max_details_per_request: self.max_details_per_request.clamp(1, 2000),
+            page_size: self.page_size.clamp(1, 5000),
+            max_pages: self.max_pages.max(1),
+            max_rows: self.max_rows.max(1),
+        }
+    }
 }
 
 impl Default for NexusConfig {
@@ -56,6 +118,7 @@ impl Default for NexusConfig {
             ),
             retry: RetryPolicy::default(),
             timeout: Duration::from_secs(30),
+            dependency_limits: DependencyLimits::default(),
         }
     }
 }
@@ -131,18 +194,50 @@ impl NexusClient {
         url: &str,
         cancel: &CancelToken,
     ) -> Result<T> {
-        let body = self.send(url, cancel).await?;
-        serde_json::from_str(&body).map_err(|e| {
+        let body = self.send(url, None, cancel).await?;
+        Self::decode(url, &body)
+    }
+
+    /// Perform an authenticated JSON `POST` and deserialize the body.
+    ///
+    /// Shares every guarantee of [`NexusClient::get_json`] — timeout, retry with
+    /// jittered backoff, rate-limit accounting, cancellation, redaction and
+    /// error mapping — because both go through the same `send`. The request body
+    /// is serialized once and replayed byte for byte on each attempt, so a retry
+    /// can never send a different request from the one that failed.
+    ///
+    /// # Errors
+    /// Returns a mapped [`CoreError`] for any non-success status, or
+    /// [`CoreError::Provider`] if the request cannot be serialized or the
+    /// response does not deserialize.
+    pub async fn post_json<B: serde::Serialize + ?Sized, T: DeserializeOwned>(
+        &self,
+        url: &str,
+        payload: &B,
+        cancel: &CancelToken,
+    ) -> Result<T> {
+        let encoded = serde_json::to_string(payload).map_err(|e| {
+            CoreError::Provider(format!(
+                "cannot encode request for {}: {e}",
+                redact_url(url)
+            ))
+        })?;
+        let body = self.send(url, Some(&encoded), cancel).await?;
+        Self::decode(url, &body)
+    }
+
+    fn decode<T: DeserializeOwned>(url: &str, body: &str) -> Result<T> {
+        serde_json::from_str(body).map_err(|e| {
             // The URL is logged redacted: query strings can carry credentials.
             CoreError::Provider(format!("unreadable response from {}: {e}", redact_url(url)))
         })
     }
 
-    async fn send(&self, url: &str, cancel: &CancelToken) -> Result<String> {
+    async fn send(&self, url: &str, payload: Option<&str>, cancel: &CancelToken) -> Result<String> {
         let mut attempt = 0_u32;
         loop {
             cancel.check()?;
-            match self.attempt(url).await {
+            match self.attempt(url, payload).await {
                 Ok(body) => return Ok(body),
                 Err(error) => {
                     if !self.config.retry.should_retry(attempt, &error) {
@@ -174,8 +269,15 @@ impl NexusClient {
         }
     }
 
-    async fn attempt(&self, url: &str) -> Result<String> {
-        let mut request = self.http.get(url);
+    async fn attempt(&self, url: &str, payload: Option<&str>) -> Result<String> {
+        let mut request = match payload {
+            Some(body) => self
+                .http
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.to_owned()),
+            None => self.http.get(url),
+        };
         match self.auth.credential().await? {
             Credential::ApiKey(key) => {
                 request = request.header(API_KEY_HEADER, key.expose());
@@ -198,10 +300,7 @@ impl NexusClient {
         *self.rate_limit.lock().expect("rate limit mutex poisoned") =
             RateLimit::from_headers(&headers);
 
-        let body = response
-            .text()
-            .await
-            .map_err(|e| CoreError::Provider(format!("cannot read response body: {e}")))?;
+        let body = read_bounded(response, url).await?;
 
         if status.is_success() {
             return Ok(body);
@@ -217,9 +316,45 @@ impl NexusClient {
         format!("{}{path}", self.config.v3_base.trim_end_matches('/'))
     }
 
+    /// A v3 URL, for the sibling modules that build their own paths.
+    pub(crate) fn v3_url(&self, path: &str) -> String {
+        self.v3(path)
+    }
+
+    /// The configured dependency bounds, with any nonsense value corrected.
+    pub(crate) fn dependency_limits(&self) -> DependencyLimits {
+        self.config.dependency_limits.sanitized()
+    }
+
     fn v1(&self, path: &str) -> String {
         format!("{}{path}", self.config.v1_base.trim_end_matches('/'))
     }
+}
+
+/// Read a response body, refusing to buffer more than [`MAX_RESPONSE_BYTES`].
+///
+/// The size is enforced while streaming rather than after the fact, so an
+/// oversized body is abandoned instead of being allocated and then rejected.
+/// The failure is [`CoreError::Unsupported`] and therefore not retried: asking
+/// the same endpoint again would produce the same oversized answer.
+async fn read_bounded(mut response: reqwest::Response, url: &str) -> Result<String> {
+    let mut buffer: Vec<u8> = Vec::new();
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|e| CoreError::Provider(format!("cannot read response body: {e}")))?;
+        let Some(chunk) = chunk else { break };
+        if buffer.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(CoreError::Unsupported(format!(
+                "response from {} exceeds the {MAX_RESPONSE_BYTES}-byte limit",
+                redact_url(url)
+            )));
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buffer)
+        .map_err(|_| CoreError::Provider(format!("response from {} is not UTF-8", redact_url(url))))
 }
 
 /// Resolve when the token is cancelled.
@@ -326,21 +461,30 @@ impl ModProvider for NexusClient {
 
         let items = versions
             .into_iter()
-            .map(|v| ProviderFile {
-                provider: ProviderId::nexus(),
-                provider_file_id: ProviderFileId::new(v.id),
-                // Filled in by the caller once the release is persisted; the
-                // provider does not own Onera's release identity.
-                release_id: ReleaseId::new(),
-                name: v.name.unwrap_or_else(|| "download".to_owned()),
-                size_bytes: v.size,
-                category: map_category(v.category),
-                published_hash: v
-                    .md5_hash
-                    .as_deref()
-                    .and_then(|h| FileHash::md5_from_hex(h).ok()),
-                uploaded_at: v.uploaded_at,
-                is_primary: v.is_primary.unwrap_or(false),
+            .map(|v| {
+                let provider_file_group_id = v
+                    .file
+                    .as_ref()
+                    .map(|file| onera_core::ids::ProviderFileGroupId::new(file.id.clone()));
+                ProviderFile {
+                    provider: ProviderId::nexus(),
+                    provider_file_id: ProviderFileId::new(v.id.clone()),
+                    provider_version_id: Some(onera_core::ids::ProviderVersionId::new(v.id)),
+                    provider_file_group_id,
+                    position: None,
+                    // Filled in by the caller once the release is persisted; the
+                    // provider does not own Onera's release identity.
+                    release_id: ReleaseId::new(),
+                    name: v.name.unwrap_or_else(|| "download".to_owned()),
+                    size_bytes: v.size,
+                    category: map_category(v.category),
+                    published_hash: v
+                        .md5_hash
+                        .as_deref()
+                        .and_then(|h| FileHash::md5_from_hex(h).ok()),
+                    uploaded_at: v.uploaded_at,
+                    is_primary: v.is_primary.unwrap_or(false),
+                }
             })
             .collect();
         Ok(Page::single(items))
@@ -376,6 +520,25 @@ impl ModProvider for NexusClient {
             filename: file_id.to_string(),
         })
     }
+
+    fn dependency_capability(&self) -> DependencyCapability {
+        // Nexus models both halves: version-range dependencies resolvable in one
+        // batch request, and store DLC requirements.
+        DependencyCapability::Supported {
+            batch: true,
+            dlc: true,
+        }
+    }
+
+    async fn dependencies(
+        &self,
+        sources: &[DependencySource],
+        cancel: &CancelToken,
+    ) -> Result<Vec<DependencySnapshot>> {
+        // See `crate::dependencies` for why this needs three endpoints and why
+        // a missing candidate row is never read as "nothing required".
+        self.fetch_dependencies(sources, cancel).await
+    }
 }
 
 impl NexusClient {
@@ -392,8 +555,15 @@ impl NexusClient {
         for file in files.data.mod_files {
             cancel.check()?;
             let versions_url = self.v3(&format!("/mod-files/{}/versions", urlencode(&file.id)));
-            let versions: Envelope<WireVersionsResponse> =
+            let mut versions: Envelope<WireVersionsResponse> =
                 self.get_json(&versions_url, cancel).await?;
+            for version in &mut versions.data.versions {
+                // Some responses omit the back-reference even though the outer
+                // request already established the exact file/update chain.
+                // Carry that opaque provider identity forward; never recreate
+                // it from the version string or display name.
+                version.file.get_or_insert_with(|| file.clone());
+            }
             out.extend(versions.data.versions);
         }
         Ok(out)
@@ -444,7 +614,7 @@ fn map_category(category: WireCategory) -> FileCategory {
 /// Mod and game identifiers come from a browser extension and are therefore
 /// untrusted; a slug containing `../` must not be able to reach a different
 /// endpoint.
-fn urlencode(segment: &str) -> String {
+pub(crate) fn urlencode(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for byte in segment.bytes() {
         match byte {

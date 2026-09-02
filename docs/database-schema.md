@@ -34,7 +34,31 @@ understands. Downgrading is the one migration direction that cannot be made safe
 | `games`          | Provider game catalogue            | Unique on `(provider_id, provider_slug)`, so re-fetching updates in place |
 | `mods`           | Mod lineages                       | Unique on `(provider_id, game_slug, provider_mod_id)`                     |
 | `releases`       | One published version              | `version` stored **verbatim**, never parsed; ordering uses `published_at` |
-| `provider_files` | Downloadable artifacts             | `published_hash` is advisory; Onera always computes its own               |
+| `provider_files` | Downloadable artifacts             | Provider version/file-group IDs and position remain opaque and nullable; `published_hash` is advisory |
+
+Existing provider-file rows with null version, file-group, or position are
+explicitly unresolved. Onera never reconstructs these values by parsing a file
+name, identifier, or author-written version string.
+
+### Dependency metadata and accepted risks
+
+| Table                   | Holds                                      | Notes |
+| ----------------------- | ------------------------------------------ | ----- |
+| `dependency_snapshots`  | Latest provider observation for one source | Unique on the exact provider/game/mod/file/version source identity |
+| `dependency_overrides`  | Profile member's accepted dependency risk  | Unique on `(profile_member_id, group_id)`; writing a changed fingerprint replaces the obsolete acceptance |
+
+Snapshots store availability, normalized dependency groups, DLC alternatives,
+provider revision, canonical fingerprint, fetch time, and the provider's raw
+JSON as distinct values. A fetched authoritative empty definition therefore
+stays distinguishable from unsupported or unavailable data. Availability and
+requirement data use checked JSON columns so variant-specific and unknown raw
+provider fields are not flattened.
+
+The database is deliberately not responsible for dependency-cache TTL policy.
+It returns the stored timestamp exactly; the application decides whether the
+observation is fresh or stale and labels cached data accordingly. Replacing a
+snapshot updates only the row with the same full source identity, including the
+distinction between absent and present provider file/version IDs.
 
 ### Local installations
 
@@ -92,6 +116,12 @@ files, and from installations to their provider-stack rows. Deleting an
 installation therefore releases every claim it held in one statement. Normal
 removal does not use that destructive path: it deactivates the installation
 while retaining its archive and mappings for offline reactivation.
+
+Dependency snapshots cascade from their provider. Dependency overrides cascade
+from `profile_members`, so removing a member—or deleting its profile—withdraws
+every accepted risk for that membership. Snapshot replacement does not delete
+overrides directly: the exact fingerprint scope makes old decisions inapplicable
+when provider dependency meaning changes.
 
 `backups.id` is referenced with `ON DELETE SET NULL` rather than cascade: losing
 a backup record must not delete the stack entry that documents an unmanaged
