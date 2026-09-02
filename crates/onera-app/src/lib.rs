@@ -11,12 +11,17 @@
 #![warn(missing_docs)]
 
 pub mod baseline;
+pub mod clean;
 pub mod flow;
 pub mod logging;
 pub mod paths;
 pub mod secrets;
 
 pub use baseline::{BaselineCapturePreview, BaselineStatusReport};
+pub use clean::{
+    CleanRestorePreview, CleanRestoreReport, RestorableFile, RestoreSource, StoreRepair,
+    UnknownExtra,
+};
 pub use flow::{
     DownloadRequest, DownloadedArchive, InstallRequest, InstalledModInfo, Onera, PreparedInstall,
     PreparedState, ProfileDetails,

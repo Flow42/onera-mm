@@ -117,6 +117,7 @@ impl OperationJournal for Database {
     async fn begin_reconciliation(
         &self,
         plan: &onera_core::domain::reconcile::MutationPlan,
+        kind: OperationKind,
     ) -> Result<Operation> {
         let id = OperationId::new();
         let encoded = serde_json::to_string(plan)
@@ -124,19 +125,20 @@ impl OperationJournal for Database {
         let timestamp = now();
         sqlx::query(
             "INSERT INTO operations (id, local_game_id, kind, state, plan, created_at, updated_at)
-             VALUES (?1, ?2, 'reconcile', 'planned', ?3, ?4, ?4)",
+             VALUES (?1, ?2, ?5, 'planned', ?3, ?4, ?4)",
         )
         .bind(id.to_string())
         .bind(plan.desired.local_game_id.to_string())
         .bind(encoded)
         .bind(&timestamp)
+        .bind(kind_str(kind))
         .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(Operation {
             id,
             local_game_id: plan.desired.local_game_id,
-            kind: OperationKind::Reconcile,
+            kind,
             state: OperationState::Planned,
             created_at: from_timestamp(&timestamp)?,
             updated_at: from_timestamp(&timestamp)?,

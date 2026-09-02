@@ -168,3 +168,147 @@ export interface InterruptedOperation {
   staged_files: number;
   created_at: string;
 }
+
+// ---------------------------------------------------------------------------
+// Baseline
+// ---------------------------------------------------------------------------
+
+/** Where a baseline's authority comes from. */
+export type BaselineSource = 'store_verified_capture' | 'local_snapshot' | 'store_manifest';
+
+/** Lifecycle of a captured baseline. */
+export type BaselineStatusKind = 'capturing' | 'current' | 'superseded' | 'failed';
+
+/** Best-effort build identity read from the store's own local metadata. */
+export interface StoreBuildIdentity {
+  store: 'steam' | 'manual';
+  app_id: string | null;
+  build_id: string | null;
+  branch: string | null;
+  depots: { depot_id: string; manifest_id: string }[];
+  manifest_path: string | null;
+  observed_at: string;
+}
+
+/**
+ * Whether the current baseline still describes the installed build.
+ *
+ * `unknown` is a state of its own and must never be rendered as `fresh`.
+ */
+export type BaselineFreshness =
+  | { kind: 'none' }
+  | { kind: 'fresh' }
+  | { kind: 'stale'; captured: StoreBuildIdentity; observed: StoreBuildIdentity }
+  | { kind: 'unknown'; reason: string };
+
+export interface GameBaseline {
+  id: string;
+  local_game_id: string;
+  source: BaselineSource;
+  build_identity: StoreBuildIdentity | null;
+  adapter_id: string;
+  reported_version: string | null;
+  status: BaselineStatusKind;
+  captured_at: string;
+  scope_fingerprint: string;
+  file_count: number;
+  total_bytes: number;
+}
+
+export interface BaselineStatus {
+  baseline: GameBaseline | null;
+  freshness: BaselineFreshness;
+  observed_build_identity: StoreBuildIdentity | null;
+  active_mod_count: number;
+  capture_blocked_reason: string | null;
+}
+
+export interface BaselineExclusionView {
+  root_key: string | null;
+  pattern: Record<string, unknown> & { kind: string };
+  reason: string;
+  note: string | null;
+}
+
+export interface BaselineCapturePreview {
+  roots: { key: string; kind: string; path: string }[];
+  exclusions: BaselineExclusionView[];
+  estimated_files: number;
+  estimated_bytes: number;
+  source: BaselineSource;
+  requires_store_verification: boolean;
+  capture_blocked_reason: string | null;
+}
+
+/** How one path compares with the baseline. */
+export type FileClassification =
+  | 'matching'
+  | 'modified'
+  | 'missing'
+  | 'extra_managed'
+  | 'extra_unknown'
+  | 'unreadable'
+  | 'special_file';
+
+export interface BaselineFinding {
+  root_key: string;
+  path: string;
+  classification: FileClassification;
+  expected: string | null;
+  observed: string | null;
+  detail: string | null;
+}
+
+export interface FindingCounts {
+  matching: number;
+  modified: number;
+  missing: number;
+  extra_managed: number;
+  extra_unknown: number;
+  unreadable: number;
+  special: number;
+}
+
+export interface BaselineVerification {
+  baseline_id: string;
+  scan_run_id: string;
+  state: 'running' | 'completed' | 'cancelled' | 'failed';
+  evidence: 'content_hashed' | 'metadata_only';
+  scope_fingerprint: string;
+  findings: BaselineFinding[];
+  counts: FindingCounts;
+  verified_at: string;
+}
+
+export interface RestorableFile {
+  root_key: string;
+  path: string;
+  from: 'backup';
+}
+
+export interface StoreRepair {
+  root_key: string;
+  path: string;
+  classification: FileClassification;
+}
+
+export interface UnknownExtra {
+  root_key: string;
+  path: string;
+}
+
+export interface CleanRestorePreview {
+  plan: { steps: unknown[] };
+  restorable: RestorableFile[];
+  needs_store_repair: StoreRepair[];
+  unknown_extras: UnknownExtra[];
+}
+
+export interface CleanRestoreReport {
+  plan: { steps: unknown[] };
+  restored: RestorableFile[];
+  needs_store_repair: StoreRepair[];
+  unknown_extras: UnknownExtra[];
+  verification: BaselineVerification;
+  clean: boolean;
+}

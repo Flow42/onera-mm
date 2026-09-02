@@ -4,9 +4,9 @@
 
 | Suite                        | Command                  | Count |
 | ---------------------------- | ------------------------ | ----- |
-| Rust unit and integration    | `cargo test --workspace` | 390   |
-| Frontend and extension units | `pnpm test`              | 50    |
-| Frontend end-to-end          | `pnpm test:e2e`          | 11    |
+| Rust unit and integration    | `cargo test --workspace` | 431   |
+| Frontend and extension units | `pnpm test`              | 67    |
+| Frontend end-to-end          | `pnpm test:e2e`          | 20    |
 
 **No default test needs network access, an API key, a keyring, a real game or a
 built desktop binary.** That is a hard rule: a suite that needs credentials is a
@@ -58,7 +58,8 @@ retry curve, redaction, VDF parsing, and the Cyberpunk layout resolver.
 | `onera-nexus/tests/api_contract.rs`         | Auth header, pagination, rate limits, retries, cancellation during backoff, malformed bodies, missing required fields, hostile identifiers                                                                                   |
 | `onera-download/tests/streaming.rs`         | Streaming, hashing, dedup, hash mismatch, truncated responses, size limits, retries, cancellation, bounded concurrency, byte-range resume, safe non-range restart                                                            |
 | `onera-discovery/tests/steam_identity.rs`   | Build identity from real-shaped `appmanifest` fixtures: normal manifests, beta branches, multiple depots, missing and malformed optional fields, native/Flatpak/second-drive layouts, manual installs, unknown DLC ownership |
-| `onera-app/tests/end_to_end.rs`             | The full documented flow, plus conflict handling, malicious archives, and secret redaction across the whole stack                                                                                                            |
+| `onera-app/tests/end_to_end.rs`             | The full documented flow, plus conflict handling, malicious archives, secret redaction, and return-to-clean across the whole stack                                                                                           |
+| `onera-app/tests/baseline.rs`               | Baseline status, capture and verification against a real `appmanifest`: capture leaves the scope untouched, symlinks are reported not followed, a build change is stale, a missing identity is unknown, recapture supersedes |
 
 ### Fault injection
 
@@ -88,8 +89,12 @@ fails safe by requiring a decision.
 
 Playwright drives the real SvelteKit build against a stubbed Tauri bridge, so
 onboarding, masking of the key field, recovery-first startup, the durable
-browser inbox, installed-mod read model, and persisted downloads are covered
-without a compiled desktop binary.
+browser inbox, installed-mod read model, persisted downloads, and the whole Game
+Integrity panel are covered without a compiled desktop binary. The integrity
+specs exist to pin the claims the panel must never make: unknown freshness is
+not freshness, a local snapshot says so, a quick check is never clean, a capture
+cannot start over active mods or without the store-verification confirmation,
+and returning to clean names what it refuses to touch.
 
 ## Coverage of the required cases
 
@@ -114,6 +119,8 @@ without a compiled desktop binary.
 | Secret redaction                   | `redact.rs`, `end_to_end.rs`                                           |
 | Native Messaging validation        | `onera-nmhost/src/protocol.rs`                                         |
 | Steam build identity and layouts   | `onera-discovery/tests/steam_identity.rs`                              |
+| Baseline capture and verification  | `onera-app/tests/baseline.rs`, `onera-install/tests/baseline.rs`       |
+| Return to clean                    | `end_to_end.rs`, `tests/e2e/integrity.spec.ts`                         |
 | Browser-extension flows            | `tests/js/`, `tests/e2e/`                                              |
 
 ## Gaps

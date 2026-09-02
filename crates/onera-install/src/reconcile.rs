@@ -1,7 +1,7 @@
 //! Journaled desired-state reconciliation.
 
 use crate::planner::RootMap;
-use onera_core::domain::operation::OperationState;
+use onera_core::domain::operation::{OperationKind, OperationState};
 use onera_core::domain::reconcile::{InstallationMapping, MutationPlan, MutationStep};
 use onera_core::ids::{InstallationId, OperationId};
 use onera_core::ports::{
@@ -39,6 +39,9 @@ impl ReconciliationEngine {
     }
 
     /// Apply a ready plan. Extracted roots contain validated artifacts.
+    ///
+    /// # Errors
+    /// As [`ReconciliationEngine::apply_as`].
     #[allow(clippy::too_many_arguments)]
     pub async fn apply(
         &self,
@@ -49,12 +52,44 @@ impl ReconciliationEngine {
         progress: &dyn ProgressSink,
         cancel: &CancelToken,
     ) -> Result<()> {
+        self.apply_as(
+            plan,
+            mappings,
+            extracted,
+            roots,
+            OperationKind::Reconcile,
+            progress,
+            cancel,
+        )
+        .await
+    }
+
+    /// Apply a ready plan, journaled under an explicit operation kind.
+    ///
+    /// A return-to-clean reaches the same empty desired state as any other
+    /// reconciliation, but recovery and history must be able to say which one it
+    /// was, so the kind is chosen by the caller rather than assumed here.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::DecisionRequired`] when cross-mod conflicts remain
+    /// unresolved. Any failure after work begins rolls the whole operation back.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_as(
+        &self,
+        plan: &MutationPlan,
+        mappings: &[InstallationMapping],
+        extracted: &BTreeMap<InstallationId, PathBuf>,
+        roots: &RootMap,
+        kind: OperationKind,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<()> {
         if !plan.is_ready() {
             return Err(CoreError::DecisionRequired(
                 "reconciliation has unresolved cross-mod conflicts".into(),
             ));
         }
-        let operation = self.journal.begin_reconciliation(plan).await?;
+        let operation = self.journal.begin_reconciliation(plan, kind).await?;
         progress.emit(ProgressEvent::Started {
             operation: Some(operation.id),
             stage: Stage::Deploying,

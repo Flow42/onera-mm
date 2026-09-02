@@ -11,6 +11,7 @@
     { href: '/updates', label: 'Updates' },
     { href: '/downloads', label: 'Downloads' },
     { href: '/verify', label: 'Verify' },
+    { href: '/integrity', label: 'Integrity' },
     { href: '/recovery', label: 'Recovery' },
     { href: '/settings', label: 'Settings' },
   ];

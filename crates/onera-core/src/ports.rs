@@ -626,7 +626,15 @@ pub trait OperationJournal: Send + Sync {
     async fn begin(&self, plan: &InstallPlan, kind: OperationKind) -> Result<Operation>;
 
     /// Persist a desired-state reconciliation before it stages any file.
-    async fn begin_reconciliation(&self, plan: &MutationPlan) -> Result<Operation>;
+    ///
+    /// `kind` distinguishes an ordinary desired-state change from a
+    /// return-to-clean, which reaches the same empty stack for a different
+    /// reason and must be recoverable as what it was.
+    async fn begin_reconciliation(
+        &self,
+        plan: &MutationPlan,
+        kind: OperationKind,
+    ) -> Result<Operation>;
 
     /// Move an operation to a new state.
     ///

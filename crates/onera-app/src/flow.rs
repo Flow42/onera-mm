@@ -68,6 +68,7 @@ pub struct Onera {
     installer: Arc<Installer>,
     remover: Arc<Remover>,
     reconciler: Arc<ReconciliationEngine>,
+    backups: Arc<dyn onera_core::ports::BackupStore>,
     locks: GameLocks,
     download_lock: tokio::sync::Mutex<()>,
     expired_prepared_plans: u64,
@@ -178,9 +179,10 @@ impl Onera {
             reconciler: Arc::new(ReconciliationEngine::new(
                 fs,
                 Arc::new(db.clone()),
-                backups,
+                backups.clone(),
                 Arc::new(db.clone()),
             )),
+            backups,
             locks: GameLocks::new(),
             download_lock: tokio::sync::Mutex::new(()),
             expired_prepared_plans,
@@ -192,6 +194,13 @@ impl Onera {
     #[must_use]
     pub fn database(&self) -> &Database {
         &self.db
+    }
+
+    /// The backup store, for callers that must ask whether Onera can restore
+    /// bytes it once set aside.
+    #[must_use]
+    pub fn backups(&self) -> &Arc<dyn onera_core::ports::BackupStore> {
+        &self.backups
     }
 
     /// Number of abandoned preparation directories removed during startup.
@@ -1266,6 +1275,22 @@ impl Onera {
         progress: &dyn ProgressSink,
         cancel: &CancelToken,
     ) -> Result<()> {
+        self.apply_state_as(prepared, OperationKind::Reconcile, progress, cancel)
+            .await
+    }
+
+    /// Apply an approved state preview, journaled under an explicit kind.
+    ///
+    /// A return-to-clean is a reconciliation to the empty desired state, but the
+    /// journal must record *why* it happened so recovery and history can tell a
+    /// clean restore from an ordinary profile change.
+    pub async fn apply_state_as(
+        &self,
+        prepared: &PreparedState,
+        kind: OperationKind,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<()> {
         let game = prepared.plan.desired.local_game_id;
         let _guard = self.locks.acquire(game).await;
         let mut needed = std::collections::BTreeSet::new();
@@ -1322,11 +1347,12 @@ impl Onera {
                 }
             }
             self.reconciler
-                .apply(
+                .apply_as(
                     &prepared.plan,
                     &prepared.mappings,
                     &extracted,
                     &prepared.roots,
+                    kind,
                     progress,
                     cancel,
                 )

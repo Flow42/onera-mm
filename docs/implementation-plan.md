@@ -276,6 +276,20 @@ the same path, including offline reactivation.
 **Purpose:** know what "clean" means for this specific installation and game
 build before Onera starts changing it.
 
+**Status: complete (2026-09-02).** Schema v5 stores immutable baselines, their
+file records, scan runs and findings; a recapture supersedes its predecessor
+without deleting it. Steam build identity is read from the `appmanifest` alone,
+and a missing or incomparable one is `Unknown` rather than `Fresh`. Capture is
+refused over active mods and, for a store-managed installation, without the
+user's explicit confirmation that the store verified its own files; a manual
+installation always gets a clearly labelled local snapshot. Verification hashes
+the adapter-declared scope, rejects symlinks instead of following them, and
+refuses to call a metadata-only scan clean. Return-to-clean reconciles to the
+empty desired state as one journaled `clean_restore`, restores Onera's own
+backups, reports damage it cannot repair for the store, and never deletes an
+unknown extra. The Game Integrity panel, the CLI `baseline` commands and the
+Tauri commands are all the same application methods.
+
 ### Steam identity
 
 Extend Steam discovery to retain:

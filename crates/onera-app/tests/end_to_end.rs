@@ -856,3 +856,246 @@ fn walkdir(root: &Path) -> Vec<PathBuf> {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// Return to clean
+// ---------------------------------------------------------------------------
+
+/// The Milestone 2 exit criterion, end to end: returning to clean removes every
+/// active Onera mod and restores every original Onera backed up, while never
+/// silently deleting a file it did not deploy.
+#[tokio::test]
+async fn returning_to_clean_restores_backups_and_never_deletes_an_unknown_file() {
+    let h = Harness::new(&[("Mod/archive/pc/mod/conflict.archive", b"from the mod")]).await;
+    h.onera.set_api_key(Secret::new(API_KEY)).await.unwrap();
+    let game = h.onera.confirm_game(&h.discovered()).await.unwrap();
+
+    // A file the user put there before Onera ever ran. It is part of the clean
+    // state, so it belongs in the baseline.
+    std::fs::write(
+        h.game_dir.join("archive/pc/mod/conflict.archive"),
+        b"the user put this here",
+    )
+    .unwrap();
+
+    // --- capture the baseline before anything is installed --------------
+    let baseline = h
+        .onera
+        .capture_baseline(game, None, true, &NullProgress, &CancelToken::new())
+        .await
+        .unwrap();
+
+    // --- install over it, keeping a backup ------------------------------
+    let details = h
+        .onera
+        .fetch_mod(GAME_SLUG, &ProviderModId::new(MOD_ID), &CancelToken::new())
+        .await
+        .unwrap();
+    let mut prepared = h
+        .onera
+        .prepare_install(
+            &install_request(&h, game, &details),
+            &NullProgress,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+    let conflicted = prepared.plan.files[0].target.clone();
+    prepared.plan.apply_decision(
+        &conflicted,
+        &Decision {
+            choice: ConflictChoice::ReplaceAfterBackup,
+            scope: DecisionScope::ThisFile,
+        },
+    );
+    h.onera
+        .apply(&prepared, &NullProgress, &CancelToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        h.game_file("archive/pc/mod/conflict.archive").unwrap(),
+        b"from the mod"
+    );
+
+    // Something nobody claims turns up in the game directory.
+    std::fs::write(h.game_dir.join("r6/scripts/mystery.reds"), b"not ours").unwrap();
+
+    // --- preview ---------------------------------------------------------
+    let preview = h
+        .onera
+        .plan_return_to_clean(game, &NullProgress, &CancelToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        preview
+            .restorable
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["archive/pc/mod/conflict.archive"],
+        "the covered original is restorable from Onera's own backup"
+    );
+    assert_eq!(preview.restorable[0].from, onera_app::RestoreSource::Backup);
+    assert_eq!(
+        preview
+            .unknown_extras
+            .iter()
+            .map(|extra| extra.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["r6/scripts/mystery.reds"]
+    );
+    assert!(
+        preview.needs_store_repair.is_empty(),
+        "nothing is damaged: {:?}",
+        preview.needs_store_repair
+    );
+    assert!(
+        !preview.plan.steps.is_empty(),
+        "the preview must describe real work"
+    );
+    // A preview writes nothing.
+    assert_eq!(
+        h.game_file("archive/pc/mod/conflict.archive").unwrap(),
+        b"from the mod"
+    );
+
+    // --- apply -----------------------------------------------------------
+    let report = h
+        .onera
+        .apply_return_to_clean(game, &NullProgress, &CancelToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        h.game_file("archive/pc/mod/conflict.archive").unwrap(),
+        b"the user put this here",
+        "the original bytes are back"
+    );
+    assert!(
+        h.game_file("r6/scripts/mystery.reds").is_some(),
+        "an unknown extra is never deleted by returning to clean"
+    );
+    assert!(h
+        .onera
+        .database()
+        .active_installations(game)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        report
+            .restored
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["archive/pc/mod/conflict.archive"]
+    );
+    assert_eq!(
+        report
+            .unknown_extras
+            .iter()
+            .map(|extra| extra.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["r6/scripts/mystery.reds"],
+        "it is still reported after the restore, because it is still there"
+    );
+    assert!(report.needs_store_repair.is_empty());
+    assert!(
+        !report.clean,
+        "an unresolved unknown extra is a difference, not a clean result"
+    );
+    assert_eq!(report.verification.counts.extra_unknown, 1);
+    assert_eq!(report.verification.counts.modified, 0);
+    assert_eq!(report.verification.counts.missing, 0);
+
+    // Once the user removes their own file — their decision, never Onera's —
+    // the installation matches the baseline byte for byte.
+    std::fs::remove_file(h.game_dir.join("r6/scripts/mystery.reds")).unwrap();
+    let confirmation = h
+        .onera
+        .verify_baseline(game, false, &NullProgress, &CancelToken::new())
+        .await
+        .unwrap();
+    assert!(
+        confirmation.is_clean(&baseline),
+        "counts: {:?}",
+        confirmation.counts
+    );
+
+    // The restore is journaled as what it was, and left nothing half-done.
+    let kinds: Vec<(String,)> =
+        sqlx::query_as("SELECT kind FROM operations WHERE local_game_id = ?1")
+            .bind(game.to_string())
+            .fetch_all(h.onera.database().pool())
+            .await
+            .unwrap();
+    assert!(
+        kinds.iter().any(|(kind,)| kind == "clean_restore"),
+        "a return to clean must be recoverable as one: {kinds:?}"
+    );
+    assert!(h.onera.interrupted_operations().await.unwrap().is_empty());
+}
+
+/// Damage Onera has no backup for is handed to the store, never invented.
+#[tokio::test]
+async fn a_damaged_game_file_is_reported_for_store_repair_and_never_synthesized() {
+    let h = Harness::new(&[("Mod/archive/pc/mod/testmod.archive", b"payload")]).await;
+    let game = h.onera.confirm_game(&h.discovered()).await.unwrap();
+    h.onera
+        .capture_baseline(game, None, true, &NullProgress, &CancelToken::new())
+        .await
+        .unwrap();
+
+    // Two kinds of damage Onera did not cause and cannot fix.
+    std::fs::write(h.game_dir.join("bin/x64/Cyberpunk2077.exe"), b"corrupted").unwrap();
+    std::fs::remove_file(h.game_dir.join("version.txt")).unwrap();
+
+    let report = h
+        .onera
+        .apply_return_to_clean(game, &NullProgress, &CancelToken::new())
+        .await
+        .unwrap();
+
+    let reported: Vec<(&str, onera_core::domain::baseline::FileClassification)> = report
+        .needs_store_repair
+        .iter()
+        .map(|repair| (repair.path.as_str(), repair.classification))
+        .collect();
+    assert_eq!(
+        reported,
+        vec![
+            (
+                "bin/x64/Cyberpunk2077.exe",
+                onera_core::domain::baseline::FileClassification::Modified
+            ),
+            (
+                "version.txt",
+                onera_core::domain::baseline::FileClassification::Missing
+            ),
+        ]
+    );
+    assert!(report.restored.is_empty(), "there was nothing to restore");
+    assert!(!report.clean);
+
+    // The damaged file keeps its damaged bytes and the missing one stays
+    // missing: Onera reports, the store repairs.
+    assert_eq!(
+        h.game_file("bin/x64/Cyberpunk2077.exe").unwrap(),
+        b"corrupted"
+    );
+    assert!(h.game_file("version.txt").is_none());
+}
+
+/// Without a baseline there is nothing to define "clean", and empty repair and
+/// extras lists would read as "nothing is wrong".
+#[tokio::test]
+async fn returning_to_clean_without_a_baseline_is_refused() {
+    let h = Harness::new(&[("Mod/archive/pc/mod/testmod.archive", b"payload")]).await;
+    let game = h.onera.confirm_game(&h.discovered()).await.unwrap();
+    let error = h
+        .onera
+        .plan_return_to_clean(game, &NullProgress, &CancelToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CoreError::NotFound { .. }), "{error:?}");
+}

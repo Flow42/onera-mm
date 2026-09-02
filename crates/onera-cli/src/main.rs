@@ -231,6 +231,18 @@ enum BaselineAction {
         #[arg(long)]
         quick: bool,
     },
+    /// Remove every active Onera mod and restore what Onera backed up.
+    ///
+    /// Never deletes a file Onera did not deploy, and never invents content for
+    /// a damaged game file: both are reported for you or the store to resolve.
+    Clean {
+        /// Registered game installation id.
+        #[arg(long)]
+        game: String,
+        /// Actually apply the restore. Without it, only the preview is printed.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1455,6 +1467,47 @@ async fn baseline(
             });
             Ok(())
         }
+        BaselineAction::Clean { game, apply } => {
+            let game = LocalGameId::from_str(&game).context("invalid game id")?;
+            if apply {
+                let report = onera.apply_return_to_clean(game, progress, cancel).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!(
+                        "restored {} file(s) from Onera backups",
+                        report.restored.len()
+                    );
+                    print_clean_context(&report.needs_store_repair, &report.unknown_extras);
+                    println!(
+                        "{}",
+                        if report.clean {
+                            "clean: the installation matches its baseline"
+                        } else {
+                            "not clean: the differences above remain"
+                        }
+                    );
+                }
+                if !report.clean {
+                    // A non-zero exit lets a script notice without parsing output.
+                    std::process::exit(2);
+                }
+                return Ok(());
+            }
+            let preview = onera.plan_return_to_clean(game, progress, cancel).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&preview)?);
+            } else {
+                println!("{} filesystem step(s) planned", preview.plan.steps.len());
+                println!(
+                    "{} file(s) restorable from Onera backups",
+                    preview.restorable.len()
+                );
+                print_clean_context(&preview.needs_store_repair, &preview.unknown_extras);
+                println!("pass --apply to carry this out");
+            }
+            Ok(())
+        }
         BaselineAction::Verify { game, quick } => {
             let game = LocalGameId::from_str(&game).context("invalid game id")?;
             let verification = onera.verify_baseline(game, quick, progress, cancel).await?;
@@ -1504,6 +1557,34 @@ async fn baseline(
                 std::process::exit(2);
             }
             Ok(())
+        }
+    }
+}
+
+/// The two lists a return-to-clean reports rather than acts on.
+fn print_clean_context(
+    needs_store_repair: &[onera_app::StoreRepair],
+    unknown_extras: &[onera_app::UnknownExtra],
+) {
+    if !needs_store_repair.is_empty() {
+        println!(
+            "{} file(s) need the store's own repair — Onera has no trusted copy:",
+            needs_store_repair.len()
+        );
+        for repair in needs_store_repair {
+            println!(
+                "  {:?} {}:{}",
+                repair.classification, repair.root_key, repair.path
+            );
+        }
+    }
+    if !unknown_extras.is_empty() {
+        println!(
+            "{} unknown extra file(s), which Onera never deletes:",
+            unknown_extras.len()
+        );
+        for extra in unknown_extras {
+            println!("  {}:{}", extra.root_key, extra.path);
         }
     }
 }

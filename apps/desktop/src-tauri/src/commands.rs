@@ -634,6 +634,38 @@ pub async fn verify_baseline(
     Ok(serde_json::to_value(&verification).unwrap_or(serde_json::Value::Null))
 }
 
+/// Preview reconciling to an empty active mod set, with baseline context.
+///
+/// `needs_store_repair` is reported, never repaired, and `unknown_extras` are
+/// never deleted by this flow — with or without confirmation.
+#[tauri::command]
+pub async fn plan_return_to_clean(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> CommandResult<serde_json::Value> {
+    let cancel = onera_core::progress::CancelToken::new();
+    let progress = state.progress();
+    let preview = state
+        .onera
+        .plan_return_to_clean(parse_game(&game_id)?, &progress, &cancel)
+        .await?;
+    Ok(serde_json::to_value(&preview).unwrap_or(serde_json::Value::Null))
+}
+
+#[tauri::command]
+pub async fn apply_return_to_clean(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> CommandResult<serde_json::Value> {
+    let cancel = onera_core::progress::CancelToken::new();
+    let progress = state.progress();
+    let report = state
+        .onera
+        .apply_return_to_clean(parse_game(&game_id)?, &progress, &cancel)
+        .await?;
+    Ok(serde_json::to_value(&report).unwrap_or(serde_json::Value::Null))
+}
+
 fn removal_view(report: &onera_install::RemovalReport) -> serde_json::Value {
     let render = |items: &[TargetLocation]| {
         items

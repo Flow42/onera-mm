@@ -21,7 +21,7 @@
 use crate::flow::Onera;
 use onera_core::domain::baseline::{
     BaselineExclusion, BaselineFreshness, BaselineRoot, BaselineScanRun, BaselineSource,
-    BaselineStatus, BaselineVerification, GameBaseline, ScanState, StoreBuildIdentity,
+    BaselineStatus, BaselineVerification, GameBaseline, ScanPurpose, ScanState, StoreBuildIdentity,
 };
 use onera_core::domain::game::{InstallSource, LocalGameInstall};
 use onera_core::ids::{BaselineId, LocalGameId};
@@ -257,6 +257,25 @@ impl Onera {
         progress: &dyn ProgressSink,
         cancel: &CancelToken,
     ) -> Result<BaselineVerification> {
+        self.verify_baseline_for(game, quick, ScanPurpose::Verify, progress, cancel)
+            .await
+    }
+
+    /// As [`Onera::verify_baseline`], recording why the scan ran.
+    ///
+    /// The confirmation pass after a return-to-clean is the same comparison
+    /// asking a different question, and the persisted run says which.
+    ///
+    /// # Errors
+    /// As [`Onera::verify_baseline`].
+    pub(crate) async fn verify_baseline_for(
+        &self,
+        game: LocalGameId,
+        quick: bool,
+        purpose: ScanPurpose,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<BaselineVerification> {
         let install = self.local_install(game).await?;
         let adapter = adapter_for(&install)?;
         let baseline = BaselineStore::current_baseline(self.database(), game)
@@ -281,11 +300,12 @@ impl Onera {
             exclusions: &exclusions,
             managed_targets: &managed,
         };
-        let scan = if quick {
+        let mut scan = if quick {
             quick_verify_baseline(request, progress, cancel).await?
         } else {
             scan_verify(request, progress, cancel).await?
         };
+        scan.run.purpose = purpose;
 
         self.persist_run(&scan.run, &scan.verification.findings)
             .await?;
@@ -293,7 +313,7 @@ impl Onera {
     }
 
     /// A scan run and its findings, recorded together.
-    async fn persist_run(
+    pub(crate) async fn persist_run(
         &self,
         run: &BaselineScanRun,
         findings: &[onera_core::domain::baseline::BaselineFinding],
@@ -303,7 +323,7 @@ impl Onera {
     }
 
     /// One registered installation by id.
-    async fn local_install(&self, game: LocalGameId) -> Result<LocalGameInstall> {
+    pub(crate) async fn local_install(&self, game: LocalGameId) -> Result<LocalGameInstall> {
         self.database()
             .local_installs()
             .await?

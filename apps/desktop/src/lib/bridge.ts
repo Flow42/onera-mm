@@ -16,8 +16,15 @@
 
 import type {
   AccountInfo,
+  BaselineCapturePreview,
+  BaselineSource,
+  BaselineStatus,
+  BaselineVerification,
+  CleanRestorePreview,
+  CleanRestoreReport,
   DownloadJob,
   DownloadOutcome,
+  GameBaseline,
   DiscoveredGame,
   InstallPlanView,
   InstalledMod,
@@ -190,6 +197,23 @@ export const commands = {
     call<RemovalPreview>('remove_mod', { gameId, installationId, force }),
   ownership: (gameId: string, rootKey: string, path: string) =>
     call<ProviderStackView>('ownership', { gameId, rootKey, path }),
+
+  /* baseline */
+  baselineStatus: (gameId: string) => call<BaselineStatus>('baseline_status', { gameId }),
+  planBaselineCapture: (gameId: string, source?: BaselineSource) =>
+    call<BaselineCapturePreview>('plan_baseline_capture', { gameId, source: source ?? null }),
+  captureBaseline: (gameId: string, storeVerificationConfirmed: boolean, source?: BaselineSource) =>
+    call<GameBaseline>('capture_baseline', {
+      gameId,
+      source: source ?? null,
+      storeVerificationConfirmed,
+    }),
+  verifyBaseline: (gameId: string, quick: boolean) =>
+    call<BaselineVerification>('verify_baseline', { gameId, quick }),
+  planReturnToClean: (gameId: string) =>
+    call<CleanRestorePreview>('plan_return_to_clean', { gameId }),
+  applyReturnToClean: (gameId: string) =>
+    call<CleanRestoreReport>('apply_return_to_clean', { gameId }),
 
   /* recovery and diagnostics */
   interruptedOperations: () => call<InterruptedOperation[]>('interrupted_operations'),

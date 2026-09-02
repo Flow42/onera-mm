@@ -61,6 +61,8 @@ fn main() {
             commands::plan_baseline_capture,
             commands::capture_baseline,
             commands::verify_baseline,
+            commands::plan_return_to_clean,
+            commands::apply_return_to_clean,
             commands::preview_removal,
             commands::remove_mod,
             commands::ownership,
