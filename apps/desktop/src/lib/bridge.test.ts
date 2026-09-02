@@ -80,7 +80,7 @@ describe('commands', () => {
     await commands.reorderProfileMember('member-1', -12);
     await commands.resolveDependencies('profile-1');
     await commands.planProfileActivation('profile-1');
-    await commands.activateProfile('profile-1');
+    await commands.activateProfile('profile-1', 'b3:approved-preview');
 
     expect(invoke.mock.calls).toEqual([
       ['profiles', { gameId: 'game-1' }],
@@ -103,7 +103,7 @@ describe('commands', () => {
       ['reorder_profile_member', { memberId: 'member-1', priority: -12 }],
       ['resolve_dependencies', { profileId: 'profile-1' }],
       ['plan_profile_activation', { profileId: 'profile-1' }],
-      ['activate_profile', { profileId: 'profile-1' }],
+      ['activate_profile', { profileId: 'profile-1', expectedFingerprint: 'b3:approved-preview' }],
     ]);
 
     setBridge(null);

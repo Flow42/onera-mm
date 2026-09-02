@@ -364,6 +364,17 @@ that Steam independently attested every byte.
 
 **Purpose:** let users maintain and safely switch between reusable mod sets.
 
+**Status: complete (2026-09-02).** Schema v6 creates one game-scoped Default
+profile, imports active installations, persists reusable desired members and
+activation history, and scopes remembered conflict rules to a profile. Profile
+CRUD, duplication, enable/disable, pinning and priority changes are exposed
+through the application, CLI and desktop. Activation previews include downloads,
+file mutations, conflicts, conservative dependency evidence, byte totals and
+baseline freshness; missing artifacts are acquired before one journaled
+reconciliation, and the target profile is published only after filesystem
+verification. Interrupted and failed switches retain the prior active profile
+and route through recovery.
+
 ### Domain and persistence
 
 - Create the Default profile when confirming a game and import currently active

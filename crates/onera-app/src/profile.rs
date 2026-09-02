@@ -192,6 +192,26 @@ impl Onera {
         self.database().activation_history(game, limit).await
     }
 
+    /// Report the dependency health currently known for a profile.
+    ///
+    /// Milestone 3 exposes the complete profile contract even though dependency
+    /// ingestion and solving belong to Milestone 4. Providers without that
+    /// capability are reported as unsupported; providers that advertise it but
+    /// have not supplied definitions are reported as unknown. Neither state is
+    /// fabricated as a successful dependency check.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::NotFound`] for an unknown profile and propagates
+    /// database errors while loading its members.
+    pub async fn resolve_profile_dependencies(
+        &self,
+        profile: ProfileId,
+    ) -> Result<ResolutionResult> {
+        self.require_profile(profile).await?;
+        let members = self.database().members(profile).await?;
+        Ok(self.dependency_evidence(&members))
+    }
+
     /// Finish activation records left behind by a process that died mid switch.
     ///
     /// Called on startup, *after* journal recovery: an activation whose

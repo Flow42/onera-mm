@@ -2,5 +2,6 @@ target/
 build/
 dist/
 .svelte-kit/
+apps/desktop/src-tauri/gen/schemas/
 pnpm-lock.yaml
 nexus_openapi.yaml

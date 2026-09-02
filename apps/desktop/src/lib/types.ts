@@ -440,7 +440,7 @@ export interface MutationPlan {
 export interface ActivationDownload {
   member_id: string;
   name: string;
-  bytes: number;
+  bytes: number | null;
 }
 
 export interface ActivationBlocker {
@@ -460,6 +460,7 @@ export interface ProfileActivationPreview {
   bytes_to_write: number;
   ready: boolean;
   blockers: ActivationBlocker[];
+  fingerprint: string;
 }
 
 export type ProfileActivationState =

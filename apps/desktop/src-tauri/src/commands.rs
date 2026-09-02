@@ -731,6 +731,23 @@ pub async fn reorder_profile_member(
     Ok(serde_json::to_value(&member).unwrap_or(serde_json::Value::Null))
 }
 
+/// Dependency health currently known for a profile.
+///
+/// Until Milestone 4 supplies provider ingestion and the solver, this returns
+/// the conservative unsupported/unknown result produced by the application
+/// layer rather than leaving the desktop command unresolved.
+#[tauri::command]
+pub async fn resolve_dependencies(
+    state: State<'_, AppState>,
+    profile_id: String,
+) -> CommandResult<serde_json::Value> {
+    let resolution = state
+        .onera
+        .resolve_profile_dependencies(parse_profile(&profile_id)?)
+        .await?;
+    Ok(serde_json::to_value(&resolution).unwrap_or(serde_json::Value::Null))
+}
+
 /// Preview a profile switch without touching the game directory.
 ///
 /// `ready` is false whenever `blockers` is non-empty. Cross-mod conflicts are

@@ -232,15 +232,14 @@ export const commands = {
     }),
   renameProfile: (profileId: string, name: string) =>
     call<Profile>('rename_profile', { profileId, name }),
-  deleteProfile: (profileId: string) => call<Profile>('delete_profile', { profileId }),
+  deleteProfile: (profileId: string) => call<void>('delete_profile', { profileId }),
   addProfileMember: (profileId: string, modId: string, providerFileId?: string) =>
     call<ProfileMember>('add_profile_member', {
       profileId,
       modId,
       providerFileId: providerFileId ?? null,
     }),
-  removeProfileMember: (memberId: string) =>
-    call<ProfileMember>('remove_profile_member', { memberId }),
+  removeProfileMember: (memberId: string) => call<void>('remove_profile_member', { memberId }),
   setMemberState: (memberId: string, desired: 'enabled' | 'disabled') =>
     call<ProfileMember>('set_member_state', { memberId, desired }),
   setMemberPin: (memberId: string, pinned: boolean, reason?: string) =>
@@ -251,8 +250,8 @@ export const commands = {
     call<ResolutionResult>('resolve_dependencies', { profileId }),
   planProfileActivation: (profileId: string) =>
     call<ProfileActivationPreview>('plan_profile_activation', { profileId }),
-  activateProfile: (profileId: string) =>
-    call<ProfileActivation>('activate_profile', { profileId }),
+  activateProfile: (profileId: string, expectedFingerprint: string) =>
+    call<ProfileActivation>('activate_profile', { profileId, expectedFingerprint }),
 
   /* recovery and diagnostics */
   interruptedOperations: () => call<InterruptedOperation[]>('interrupted_operations'),

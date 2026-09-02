@@ -67,6 +67,7 @@ fn main() {
             commands::set_member_state,
             commands::set_member_pin,
             commands::reorder_profile_member,
+            commands::resolve_dependencies,
             commands::plan_profile_activation,
             commands::activate_profile,
             commands::profile_activation_history,

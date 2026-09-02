@@ -349,7 +349,7 @@
     activation = null;
     progress = initial();
     try {
-      activation = await commands.activateProfile(selectedProfile);
+      activation = await commands.activateProfile(selectedProfile, activationPreview.fingerprint);
       if (activation.state === 'applied' && selectedGame !== null) {
         const activatedId = selectedProfile;
         profiles = await commands.profiles(selectedGame);
@@ -692,7 +692,11 @@
       {:else}
         <ul>
           {#each activationPreview.downloads as download (download.member_id)}
-            <li>{download.name} — {formatBytes(download.bytes)}</li>
+            <li>
+              {download.name} — {download.bytes === null
+                ? 'size unknown'
+                : formatBytes(download.bytes)}
+            </li>
           {/each}
         </ul>
       {/if}

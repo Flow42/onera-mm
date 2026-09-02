@@ -42,6 +42,7 @@ const preview = (over: Partial<ProfileActivationPreview> = {}): ProfileActivatio
   bytes_to_write: 0,
   ready: true,
   blockers: [],
+  fingerprint: 'b3:preview',
   ...over,
 });
 

@@ -8,13 +8,12 @@ what was there before, and nothing the user did not put there is ever
 overwritten without being asked. A power cut in the middle of an install leaves
 a recoverable state, not a broken game.
 
-> **Status: early but end-to-end usable.** The initial product slice and the
-> desired-state reconciliation foundation are complete: Onera can preview and
-> atomically apply multi-mod enable/disable sets, retain disabled artifacts for
-> offline reactivation, and recover the complete set after a failed write. The
-> baseline milestone is underway: Steam build identity and content-hashed local
-> capture and verification are implemented, but are not yet persisted or exposed
-> through the application, CLI, or desktop UI.
+> **Status: early but end-to-end usable.** The initial product slice,
+> desired-state reconciler, clean-game baselines, and reusable mod profiles are
+> complete. Onera can capture and verify a local baseline, preview and atomically
+> switch multi-mod profiles, retain disabled artifacts for offline reactivation,
+> return a game to its recorded clean state, and recover the complete set after a
+> failed write. Dependency-aware compatible planning is the next milestone.
 
 ## Why another mod manager
 
@@ -103,18 +102,12 @@ the extension. See [`docs/architecture.md`](docs/architecture.md).
 
 ## Known gaps
 
-The next milestones are deliberately still open:
+The remaining roadmap work is deliberately still open:
 
-- Clean game baselines have domain types, ports, Steam build-identity discovery,
-  adapter-declared scope and exclusions, and a read-only content-hashed capture
-  and verification engine. Baseline persistence, application/CLI commands,
-  startup stale detection, return-to-clean orchestration, and desktop screens
-  remain to be implemented. See
-  [`docs/steam-baseline-assumptions.md`](docs/steam-baseline-assumptions.md) and
-  [`docs/frontend-contracts.md`](docs/frontend-contracts.md).
-- Profiles and dependency planning have domain types, ports, and frontend
-  contracts, but no database migrations or persistence adapters, application
-  flows, provider dependency calls, working solver, CLI commands, or screens.
+- Dependency planning has domain types, provider/store ports, profile-facing
+  contracts, and a pure solver boundary. Dependency persistence, Nexus ingestion,
+  a working solver, compatible bulk updates, overrides, and actionable desktop
+  flows remain to be implemented.
 - Update checks report newer same-lineage releases, but compatible bulk update
   and dependency-aware update actions belong to the dependency milestone.
 - Only Cyberpunk 2077 has a game adapter.

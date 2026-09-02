@@ -72,6 +72,7 @@ const preview = (over: Record<string, unknown> = {}) => ({
   bytes_to_write: 0,
   ready: true,
   blockers: [],
+  fingerprint: 'b3:approved-preview',
   ...over,
 });
 
@@ -235,6 +236,9 @@ async function stubProfiles(page: Page, supplied: MockConfig = {}) {
               to_profile_id: args?.profileId,
             };
           case 'activate_profile': {
+            if (args?.expectedFingerprint !== 'b3:approved-preview') {
+              throw { code: 'conflict', message: 'activation preview is stale' };
+            }
             emit({ type: 'started', stage: 'downloading', total: 4096 });
             emit({
               type: 'advanced',

@@ -331,6 +331,42 @@ async fn a_member_with_no_chosen_file_blocks_the_switch() {
     assert_eq!(snapshot(&h.game_dir), before);
 }
 
+#[tokio::test]
+async fn dependency_status_is_a_real_profile_command_before_the_solver_exists() {
+    let h = Harness::new().await;
+    let (game, mod_id) = registered(&h).await;
+    let profile = h.active_profile(game).await;
+    let member = h
+        .onera
+        .add_profile_member(
+            profile,
+            mod_id,
+            Some(onera_core::ids::ProviderFileId::new(FILE_ID)),
+        )
+        .await
+        .unwrap();
+
+    let resolution = h.onera.resolve_profile_dependencies(profile).await.unwrap();
+    assert!(matches!(
+        resolution.outcome,
+        onera_core::domain::dependency::ResolutionOutcome::Compatible
+    ));
+    assert_eq!(resolution.health.len(), 1);
+    assert_eq!(resolution.health[0].profile_member_id, member.id);
+    assert_eq!(
+        resolution.health[0].health,
+        onera_core::domain::dependency::DependencyHealth::NotApplicable
+    );
+    assert_eq!(resolution.evidence.unsupported, 1);
+
+    let missing = h
+        .onera
+        .resolve_profile_dependencies(ProfileId::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(missing, CoreError::NotFound { .. }));
+}
+
 // ---------------------------------------------------------------------------
 // Activation
 // ---------------------------------------------------------------------------
