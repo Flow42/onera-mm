@@ -5,8 +5,8 @@
 //! 1. find Steam's root (native install, or the Flatpak sandbox);
 //! 2. read `steamapps/libraryfolders.vdf` for every library, including ones on
 //!    other drives;
-//! 3. read each `steamapps/appmanifest_<appid>.acf` for the app's name and its
-//!    `installdir`;
+//! 3. read each `steamapps/appmanifest_<appid>.acf` for the app's name, its
+//!    `installdir` and its best-effort build identity (see [`crate::identity`]);
 //! 4. derive the compatibility prefix from `steamapps/compatdata/<appid>/pfx`
 //!    when one exists.
 //!
@@ -14,6 +14,7 @@
 //! is installed, and the caller matches app ids against game adapters and the
 //! provider's catalogue.
 
+use crate::identity::{self, SteamBuildIdentity};
 use crate::vdf;
 use onera_core::domain::game::InstallSource;
 use onera_core::Result;
@@ -34,6 +35,12 @@ pub struct SteamApp {
     pub user_data_roots: Vec<PathBuf>,
     /// Which Steam installation reported it.
     pub source: InstallSource,
+    /// Best-effort build identity from the same `appmanifest`.
+    ///
+    /// Retained at discovery time because this is the one moment Onera is
+    /// already holding the manifest. Its optional fields may all be `None`; see
+    /// [`crate::identity`].
+    pub build_identity: SteamBuildIdentity,
 }
 
 /// A Steam installation and the libraries it knows about.
@@ -143,31 +150,16 @@ pub fn installed_apps(install: &SteamInstall) -> Result<Vec<SteamApp>> {
         };
 
         for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with("appmanifest_") || !name.ends_with(".acf") {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            if !identity::is_app_manifest_name(&file_name) {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(entry.path()) else {
-                continue;
-            };
-            let Ok(parsed) = vdf::parse(&text) else {
-                continue;
-            };
-            let Some(state) = parsed.get("AppState") else {
+            let Some(manifest) = identity::read_app_manifest(&entry.path()) else {
                 continue;
             };
 
-            let Some(app_id) = state
-                .string("appid")
-                .and_then(|s| s.trim().parse::<u32>().ok())
-            else {
-                continue;
-            };
-            let Some(install_dir) = state.string("installdir") else {
-                continue;
-            };
-            let install_root = steamapps.join("common").join(install_dir);
+            let install_root = steamapps.join("common").join(&manifest.install_dir);
             if !install_root.is_dir() {
                 // Steam keeps manifests for apps that are queued or removed.
                 continue;
@@ -175,7 +167,7 @@ pub fn installed_apps(install: &SteamInstall) -> Result<Vec<SteamApp>> {
 
             let prefix = steamapps
                 .join("compatdata")
-                .join(app_id.to_string())
+                .join(manifest.app_id.to_string())
                 .join("pfx");
             let compat_prefix = prefix.is_dir().then_some(prefix.clone());
             let user_data_roots = compat_prefix
@@ -184,12 +176,15 @@ pub fn installed_apps(install: &SteamInstall) -> Result<Vec<SteamApp>> {
                 .unwrap_or_default();
 
             apps.push(SteamApp {
-                app_id,
-                name: state.string("name").unwrap_or(install_dir).to_owned(),
+                app_id: manifest.app_id,
+                name: manifest
+                    .name
+                    .unwrap_or_else(|| manifest.install_dir.clone()),
                 install_root,
                 compat_prefix,
                 user_data_roots,
                 source: install.source,
+                build_identity: manifest.identity,
             });
         }
     }

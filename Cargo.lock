@@ -1561,6 +1561,8 @@ dependencies = [
 name = "onera-discovery"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "chrono",
  "dirs",
  "onera-core",
  "serde",
@@ -1607,6 +1609,7 @@ name = "onera-install"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "chrono",
  "onera-archive",
  "onera-core",
@@ -1620,6 +1623,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

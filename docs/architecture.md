@@ -12,7 +12,7 @@ database, a network, a filesystem, a browser — is an adapter behind a trait.
 | `onera-db`        | SQLite persistence, migrations, repositories                     | `onera-core`     |
 | `onera-archive`   | Safe inspection and extraction of zip, tar variants, 7z, rar     | `onera-core`     |
 | `onera-install`   | Planner, journaled installer, rollback, verify, remove, recovery | `onera-core`     |
-| `onera-discovery` | Steam library parsing, game matching                             | `onera-core`     |
+| `onera-discovery` | Steam library parsing, game matching, Steam build identity       | `onera-core`     |
 | `onera-games`     | Game adapters (currently Cyberpunk 2077)                         | `onera-core`     |
 | `onera-provider`  | Provider registry                                                | `onera-core`     |
 | `onera-resolver`  | Pure dependency solver (scaffolded; see Milestone 4)             | `onera-core`     |
@@ -48,8 +48,8 @@ Declared in `onera_core::ports`:
 | `ArchiveStore`                                         | `onera-download`                | Content addressing is a policy, not a detail                               |
 | `OperationJournal` / `DeploymentStore` / `BackupStore` | `onera-db`                      | Crash recovery is testable without SQLite                                  |
 | `ReconciliationStore`                                  | `onera-db`                      | Final stacks, activation flags and operation completion publish atomically |
-| `GameStore`                                            | (Milestone 2)                   | Build identity and DLC ownership differ per store, and may be unknowable   |
-| `GameManifestProvider`                                 | (nothing yet)                   | An authoritative manifest must be able to replace local capture            |
+| `GameStore`                                            | `onera-discovery` (Steam)       | Build identity and DLC ownership differ per store, and may be unknowable   |
+| `GameManifestProvider`                                 | `onera-discovery` (unsupported) | An authoritative manifest must be able to replace local capture            |
 | `ProfileStore` / `BaselineStore` / `DependencyStore`   | (Milestone 2–4)                 | Desired state, observations and cached provider data persist separately    |
 
 Every port is object-safe and stored as `Arc<dyn Trait>`; a test in
@@ -65,6 +65,15 @@ are addressed through `ProviderId`, `ProviderModId`, `ProviderFileId`,
 the type does not carry the answer. The last two exist so dependency
 compatibility is decided on provider version identity and provider ordering
 rather than on parsing an author's version string.
+
+**A store identity is read, never inferred.** The Steam adapter parses one
+`appmanifest_<appid>.acf` that Steam itself wrote — no credentials, no running
+client, no undocumented service. Any optional field it cannot read with
+confidence becomes `None`, because a fabricated identifier would compare equal
+to the next fabricated one and report a changed build as unchanged.
+`GameManifestProvider` is implemented and reports `Unsupported`: the boundary is
+real, and the capability is honestly absent. See
+[`docs/steam-baseline-assumptions.md`](steam-baseline-assumptions.md).
 
 **A missing answer is not an empty one.** `StoreCapability::Unknown`,
 `DependencyAvailability::Unavailable`, `DependencyHealth::Unknown` and

@@ -4,11 +4,19 @@
 //! finds against the game adapters Onera ships and the provider's game
 //! catalogue, and returns *candidates*. Nothing is registered until the user
 //! confirms it — a wrong match would point deployments at the wrong directory.
+//!
+//! The same metadata answers a second question: *which build* is installed.
+//! [`identity`] parses that out of Steam's own `appmanifest`, and [`store`]
+//! exposes it through [`onera_core::ports::GameStore`] so a baseline can be
+//! stamped with the build it was captured from. No Steam credential, running
+//! client or undocumented service is involved in either.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod identity;
 pub mod steam;
+pub mod store;
 pub mod vdf;
 
 use onera_core::domain::game::{Game, InstallSource, InstallValidation};

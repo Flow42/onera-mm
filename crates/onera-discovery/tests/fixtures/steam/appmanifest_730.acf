@@ -1,0 +1,34 @@
+"AppState"
+{
+	"appid"		"730"
+	"name"		"   "
+	"installdir"		"Counter-Strike Global Offensive"
+	"buildid"		"0"
+	"InstalledDepots"
+	{
+		"731"
+		{
+			"size"		"1000"
+		}
+		"not-a-depot"
+		{
+			"manifest"		"7000000000000000002"
+		}
+		"733"
+		{
+			"manifest"		"beta-manifest"
+		}
+		"734"
+		{
+			"manifest"		"0"
+		}
+		"735"
+		{
+			"manifest"		"  7000000000000000003  "
+		}
+	}
+	"UserConfig"
+	{
+		"betakey"		""
+	}
+}

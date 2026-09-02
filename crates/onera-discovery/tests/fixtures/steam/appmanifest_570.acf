@@ -1,0 +1,25 @@
+"AppState"
+{
+	"appid"		"570"
+	"name"		"Dota 2"
+	"installdir"		"dota 2 beta"
+	"buildid"		"19004512"
+	"InstalledDepots"
+	{
+		"373301"
+		{
+			"manifest"		"7000000000000000001"
+			"size"		"1000"
+		}
+	}
+	"UserConfig"
+	{
+		"betakey"		"experimental"
+		"language"		"english"
+	}
+	"MountedConfig"
+	{
+		"betakey"		"experimental"
+		"language"		"english"
+	}
+}

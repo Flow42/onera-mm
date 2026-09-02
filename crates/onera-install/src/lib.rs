@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod baseline;
 pub mod engine;
 pub mod fs;
 pub mod lock;
@@ -25,6 +26,10 @@ pub mod recovery;
 pub mod remove;
 pub mod verify;
 
+pub use baseline::{
+    capture_baseline, verify_baseline, BaselineCapture, BaselineVerificationRequest,
+    BaselineVerificationScan,
+};
 pub use engine::{InstallReport, Installer};
 pub use fs::RealFileSystem;
 pub use lock::GameLocks;

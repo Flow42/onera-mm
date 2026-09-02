@@ -72,22 +72,23 @@ the extension. See [`docs/architecture.md`](docs/architecture.md).
 
 ## Documentation
 
-| Document                                                   | What it covers                                                              |
-| ---------------------------------------------------------- | --------------------------------------------------------------------------- |
-| [Architecture](docs/architecture.md)                       | Crate layout, ports, and the rules that keep adapters thin                  |
-| [Threat model](docs/threat-model.md)                       | What Onera defends against and how                                          |
-| [Database schema](docs/database-schema.md)                 | Every table and why it exists                                               |
-| [Operation state machine](docs/operation-state-machine.md) | The journal and its transitions                                             |
-| [File-provider stack](docs/file-provider-stack.md)         | How restoration actually works                                              |
-| [Game adapter guide](docs/game-adapter-guide.md)           | Adding a game                                                               |
-| [Provider guide](docs/provider-guide.md)                   | Adding a mod source                                                         |
-| [Nexus API assumptions](docs/nexus-api-assumptions.md)     | What Onera relies on, and what breaks if it changes                         |
-| [Native Messaging setup](docs/native-messaging.md)         | Wiring the browser extension to the host                                    |
-| [Packaging](docs/packaging.md)                             | AppImage and `.deb`                                                         |
-| [Recovery behaviour](docs/recovery.md)                     | What happens after a crash, plus the manual smoke test                      |
-| [Frontend contracts](docs/frontend-contracts.md)           | Baseline, profile and dependency request/response shapes, fixed in advance  |
-| [Test strategy](docs/test-strategy.md)                     | What is tested, how, and what is deliberately not                           |
-| [Implementation plan](docs/implementation-plan.md)         | Roadmap for product completion, profiles, dependencies, and clean baselines |
+| Document                                                         | What it covers                                                              |
+| ---------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| [Architecture](docs/architecture.md)                             | Crate layout, ports, and the rules that keep adapters thin                  |
+| [Threat model](docs/threat-model.md)                             | What Onera defends against and how                                          |
+| [Database schema](docs/database-schema.md)                       | Every table and why it exists                                               |
+| [Operation state machine](docs/operation-state-machine.md)       | The journal and its transitions                                             |
+| [File-provider stack](docs/file-provider-stack.md)               | How restoration actually works                                              |
+| [Game adapter guide](docs/game-adapter-guide.md)                 | Adding a game                                                               |
+| [Provider guide](docs/provider-guide.md)                         | Adding a mod source                                                         |
+| [Nexus API assumptions](docs/nexus-api-assumptions.md)           | What Onera relies on, and what breaks if it changes                         |
+| [Steam baseline assumptions](docs/steam-baseline-assumptions.md) | Which Steam build identity is trustworthy, and which is best effort         |
+| [Native Messaging setup](docs/native-messaging.md)               | Wiring the browser extension to the host                                    |
+| [Packaging](docs/packaging.md)                                   | AppImage and `.deb`                                                         |
+| [Recovery behaviour](docs/recovery.md)                           | What happens after a crash, plus the manual smoke test                      |
+| [Frontend contracts](docs/frontend-contracts.md)                 | Baseline, profile and dependency request/response shapes, fixed in advance  |
+| [Test strategy](docs/test-strategy.md)                           | What is tested, how, and what is deliberately not                           |
+| [Implementation plan](docs/implementation-plan.md)               | Roadmap for product completion, profiles, dependencies, and clean baselines |
 
 ## Requirements
 
@@ -102,9 +103,12 @@ the extension. See [`docs/architecture.md`](docs/architecture.md).
 The next milestones are deliberately still open:
 
 - Profiles, dependency solving, and clean game baselines have their domain
-  types, ports and frontend contracts in place, but no behaviour behind them:
-  no persistence, no scanning, no provider calls, no solver, no screens. See
-  the implementation plan and [`docs/frontend-contracts.md`](docs/frontend-contracts.md).
+  types, ports and frontend contracts in place, but almost no behaviour behind
+  them: no persistence, no scanning, no provider calls, no solver, no screens.
+  The exception is Steam build identity, which is read for real — see
+  [`docs/steam-baseline-assumptions.md`](docs/steam-baseline-assumptions.md) —
+  and is not yet stored or shown anywhere. See the implementation plan and
+  [`docs/frontend-contracts.md`](docs/frontend-contracts.md).
 - Update checks report newer same-lineage releases, but compatible bulk update
   and dependency-aware update actions belong to the dependency milestone.
 - Only Cyberpunk 2077 has a game adapter.

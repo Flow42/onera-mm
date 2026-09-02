@@ -1,0 +1,15 @@
+"AppState"
+{
+	"appid"		"400"
+	"name"		"Portal"
+	"installdir"		"Portal"
+	"buildid"		"1234567"
+	"UserConfig"
+	{
+		"betakey"		"requested_but_not_downloaded"
+	}
+	"MountedConfig"
+	{
+		"betakey"		"steam_legacy"
+	}
+}
