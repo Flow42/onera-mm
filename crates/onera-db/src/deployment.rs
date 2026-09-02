@@ -9,12 +9,12 @@ use crate::convert::{hash, now, uuid};
 use crate::{db_err, Database};
 use async_trait::async_trait;
 use onera_core::domain::provider_stack::{FileProvider, ProviderStack, StackEntry};
-use onera_core::domain::reconcile::InstallationMapping;
+use onera_core::domain::reconcile::{InstallationMapping, MutationPlan};
 use onera_core::ids::{
     ArchiveId, BackupId, InstallationId, LocalGameId, ModId, OperationId, ReleaseId,
 };
 use onera_core::plan::{ConflictChoice, ScopedRule, TargetLocation};
-use onera_core::ports::DeploymentStore;
+use onera_core::ports::{DeploymentStore, ReconciliationStore};
 use onera_core::{CoreError, RelPath, Result};
 use sqlx::Row as _;
 
@@ -251,6 +251,21 @@ impl DeploymentStore for Database {
         release: ReleaseId,
         archive: ArchiveId,
     ) -> Result<()> {
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        // Installing a new artifact in a lineage is an upgrade/downgrade. Keep
+        // the previous artifact, but release the unique active slot first.
+        sqlx::query(
+            "UPDATE installations
+             SET active = 0, state = 'artifact', deactivated_at = ?4
+             WHERE local_game_id = ?1 AND mod_id = ?2 AND id != ?3 AND active = 1",
+        )
+        .bind(game.to_string())
+        .bind(mod_id.to_string())
+        .bind(installation.to_string())
+        .bind(now())
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
         sqlx::query(
             "INSERT INTO installations
                (id, local_game_id, mod_id, release_id, archive_id, state, installed_at)
@@ -264,9 +279,10 @@ impl DeploymentStore for Database {
         .bind(release.to_string())
         .bind(archive.to_string())
         .bind(now())
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -500,4 +516,105 @@ fn row_to_target(row: sqlx::sqlite::SqliteRow) -> Result<TargetLocation> {
         root_key: row.try_get("root_key").map_err(db_err)?,
         path: RelPath::normalize(&rel)?,
     })
+}
+
+#[async_trait]
+impl ReconciliationStore for Database {
+    async fn complete_reconciliation(
+        &self,
+        operation: OperationId,
+        plan: &MutationPlan,
+    ) -> Result<()> {
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        for (target, stack) in &plan.final_stacks {
+            let existing: Option<(String,)> = sqlx::query_as(
+                "SELECT id FROM deployed_files WHERE local_game_id = ?1 AND root_key = ?2 AND rel_path = ?3",
+            )
+            .bind(plan.desired.local_game_id.to_string())
+            .bind(&target.root_key)
+            .bind(target.path.as_str())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let Some(top) = stack.top() else {
+                if let Some((id,)) = existing {
+                    sqlx::query("DELETE FROM deployed_files WHERE id = ?1")
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db_err)?;
+                }
+                continue;
+            };
+            let file_id = if let Some((id,)) = existing {
+                sqlx::query("UPDATE deployed_files SET current_hash = ?2, size = ?3, updated_at = ?4 WHERE id = ?1")
+                    .bind(&id).bind(top.hash.to_storage_string()).bind(top.size as i64).bind(now())
+                    .execute(&mut *tx).await.map_err(db_err)?;
+                id
+            } else {
+                let id = uuid::Uuid::new_v4().to_string();
+                sqlx::query("INSERT INTO deployed_files (id, local_game_id, root_key, rel_path, current_hash, size, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
+                    .bind(&id).bind(plan.desired.local_game_id.to_string()).bind(&target.root_key)
+                    .bind(target.path.as_str()).bind(top.hash.to_storage_string()).bind(top.size as i64).bind(now())
+                    .execute(&mut *tx).await.map_err(db_err)?;
+                id
+            };
+            sqlx::query("DELETE FROM deployed_file_providers WHERE deployed_file_id = ?1")
+                .bind(&file_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            for (position, entry) in stack.entries().iter().enumerate() {
+                let (kind, installation, backup) = match entry.provider {
+                    FileProvider::Installation { installation_id } => {
+                        ("installation", Some(installation_id.to_string()), None)
+                    }
+                    FileProvider::UnmanagedBackup { backup_id } => {
+                        ("unmanaged", None, Some(backup_id.to_string()))
+                    }
+                };
+                sqlx::query("INSERT INTO deployed_file_providers (id, deployed_file_id, position, provider_kind, installation_id, backup_id, hash, size, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")
+                    .bind(uuid::Uuid::new_v4().to_string()).bind(&file_id).bind(position as i64).bind(kind)
+                    .bind(installation).bind(backup).bind(entry.hash.to_storage_string()).bind(entry.size as i64).bind(now())
+                    .execute(&mut *tx).await.map_err(db_err)?;
+            }
+        }
+        let wanted: std::collections::BTreeSet<_> = plan
+            .desired
+            .installations
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT id FROM installations WHERE local_game_id = ?1")
+                .bind(plan.desired.local_game_id.to_string())
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        // Release every unique active slot before selecting the desired rows.
+        sqlx::query("UPDATE installations SET active = 0, state = 'artifact', deactivated_at = ?2 WHERE local_game_id = ?1")
+            .bind(plan.desired.local_game_id.to_string()).bind(now())
+            .execute(&mut *tx).await.map_err(db_err)?;
+        let existing: std::collections::BTreeSet<_> = rows.into_iter().map(|(id,)| id).collect();
+        for id in &wanted {
+            if !existing.contains(id) {
+                return Err(CoreError::NotFound {
+                    kind: "retained installation",
+                    id: id.clone(),
+                });
+            }
+            sqlx::query("UPDATE installations SET active = 1, state = 'installed', deactivated_at = NULL WHERE id = ?1")
+                .bind(id)
+                .execute(&mut *tx).await.map_err(db_err)?;
+        }
+        let result = sqlx::query("UPDATE operations SET state = 'complete', updated_at = ?2 WHERE id = ?1 AND state = 'committing'")
+            .bind(operation.to_string()).bind(now()).execute(&mut *tx).await.map_err(db_err)?;
+        if result.rows_affected() != 1 {
+            return Err(CoreError::Conflict(format!(
+                "operation {operation} is not committing"
+            )));
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
 }

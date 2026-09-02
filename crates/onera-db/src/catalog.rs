@@ -12,7 +12,8 @@ use onera_core::domain::game::{Game, InstallSource, LocalGameInstall};
 use onera_core::domain::release::{FileCategory, Mod, ProviderFile, Release};
 use onera_core::hash::FileHash;
 use onera_core::ids::{
-    ArchiveId, GameId, LocalGameId, ModId, ProviderFileId, ProviderId, ProviderModId, ReleaseId,
+    ArchiveId, GameId, InstallationId, LocalGameId, ModId, ProviderFileId, ProviderId,
+    ProviderModId, ReleaseId,
 };
 use onera_core::{CoreError, Result};
 use sqlx::Row as _;
@@ -98,6 +99,64 @@ fn parse_category(s: &str) -> FileCategory {
 }
 
 impl Database {
+    /// Active retained artifacts for one local game.
+    pub async fn active_installations(&self, game: LocalGameId) -> Result<Vec<InstallationId>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM installations WHERE local_game_id = ?1 AND active = 1 ORDER BY installed_at, id",
+        )
+        .bind(game.to_string())
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        rows.into_iter()
+            .map(|(id,)| Ok(InstallationId::from(uuid(&id)?)))
+            .collect()
+    }
+
+    /// Mod lineage owned by a retained installation of this local game.
+    pub async fn mod_for_installation(
+        &self,
+        game: LocalGameId,
+        installation: InstallationId,
+    ) -> Result<Option<ModId>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT mod_id FROM installations WHERE id = ?1 AND local_game_id = ?2")
+                .bind(installation.to_string())
+                .bind(game.to_string())
+                .fetch_optional(self.pool())
+                .await
+                .map_err(db_err)?;
+        row.map(|(id,)| Ok(ModId::from(uuid(&id)?))).transpose()
+    }
+
+    /// Content-addressed archive retained by an installation.
+    pub async fn archive_for_installation(
+        &self,
+        game: LocalGameId,
+        installation: InstallationId,
+    ) -> Result<Option<StoredArchive>> {
+        let row = sqlx::query(
+            "SELECT a.id, a.hash, a.stored_path, a.size FROM installations i
+             JOIN archives a ON a.id = i.archive_id WHERE i.id = ?1 AND i.local_game_id = ?2",
+        )
+        .bind(installation.to_string())
+        .bind(game.to_string())
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        row.map(|row| {
+            let id: String = row.try_get("id").map_err(db_err)?;
+            let digest: String = row.try_get("hash").map_err(db_err)?;
+            let size: i64 = row.try_get("size").map_err(db_err)?;
+            Ok(StoredArchive {
+                id: ArchiveId::from(uuid(&id)?),
+                hash: opt_hash(Some(digest))?.expect("archive hash"),
+                path: PathBuf::from(row.try_get::<String, _>("stored_path").map_err(db_err)?),
+                size: size.max(0) as u64,
+            })
+        })
+        .transpose()
+    }
     /// Installed mods for one local game, newest installation first.
     ///
     /// # Errors

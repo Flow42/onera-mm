@@ -24,5 +24,6 @@ onera-db.workspace = true
 chrono.workspace = true
 proptest.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

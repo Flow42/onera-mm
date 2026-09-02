@@ -43,8 +43,14 @@ files and deletes the ones that had nothing before. A test fails the _second_ of
 three renames and asserts that a pre-existing file survives byte-identical.
 
 **Power loss between the rename and the journal write.** The file is in place but
-recorded as `staged`. Rollback deletes it or restores its backup. The journal is
-always allowed to be _ahead_ of the disk, never behind it.
+recorded as `staged`. While an operation is `Committing` or `RollingBack`, the
+rollback path deliberately treats every non-rolled-back entry as potentially
+renamed, then deletes it or restores its backup idempotently.
+
+Desired-state reconciliations use the same recovery list. Their filesystem
+changes are one operation, and deployment stacks plus active/inactive artifact
+flags are not published until all files verify. A rollback therefore restores
+the files while SQLite still describes the previous state.
 
 **A hash mismatch after a rename.** Fatal for the operation; triggers rollback.
 Onera does not accept a deployed file whose content it did not intend.

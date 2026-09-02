@@ -55,21 +55,21 @@ understands. Downgrading is the one migration direction that cannot be made safe
 
 ### Deployment — the part that is not a cache
 
-| Table                     | Holds                                                     | Notes                                                                               |
-| ------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `installations`           | One retained release artifact for one game                | `active` distinguishes an acquired artifact from its current deployment            |
-| `installation_mappings`  | Stable source-to-target mapping for a retained artifact   | Allows reactivation without rediscovering archive layout                            |
-| `deployed_files`          | One row per `(game, root, relative path)`                 | `current_hash` is what should be on disk                                            |
-| `deployed_file_providers` | **The provider stack.** Ordered by `position`, 0 = bottom | A `CHECK` enforces that a row names exactly one of `installation_id` / `backup_id`  |
-| `installation_files`      | Which archive entry produced which deployed file          |                                                                                     |
-| `created_directories`     | Directories Onera itself created                          | Removal only ever deletes from this list, so a game's own empty directories survive |
-| `file_provider_history`   | Append-only audit trail of ownership changes              | Answers "how did this file get like this?"                                          |
+| Table                     | Holds                                                     | Notes                                                                                               |
+| ------------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `installations`           | One retained release artifact for one game                | `active` distinguishes acquisition from deployment; one artifact per game/mod lineage may be active |
+| `installation_mappings`   | Stable source-to-target mapping for a retained artifact   | Allows reactivation without rediscovering archive layout                                            |
+| `deployed_files`          | One row per `(game, root, relative path)`                 | `current_hash` is what should be on disk                                                            |
+| `deployed_file_providers` | **The provider stack.** Ordered by `position`, 0 = bottom | A `CHECK` enforces that a row names exactly one of `installation_id` / `backup_id`                  |
+| `installation_files`      | Which archive entry produced which deployed file          |                                                                                                     |
+| `created_directories`     | Directories Onera itself created                          | Removal only ever deletes from this list, so a game's own empty directories survive                 |
+| `file_provider_history`   | Append-only audit trail of ownership changes              | Answers "how did this file get like this?"                                                          |
 
 ### Operations
 
 | Table             | Holds                                              | Notes                                                                                                  |
 | ----------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `operations`      | One journaled mutation, with the full plan as JSON | `kind` includes focused operations plus `reconcile` and `clean_restore`; `state` is constrained |
+| `operations`      | One journaled mutation, with the full plan as JSON | `kind` includes focused operations plus `reconcile` and `clean_restore`; `state` is constrained        |
 | `operation_files` | Per-file journal rows                              | Stores the resolved **absolute path**, so recovery works without loading a game adapter                |
 | `conflicts`       | Recorded conflicts and their decisions             |                                                                                                        |
 | `scoped_rules`    | Remembered decisions                               | Unique on `(mod_id, root_key, path_prefix)` — deliberately narrow; there is no global "always replace" |
@@ -89,8 +89,9 @@ safely restarts from zero if the server does not support ranges.
 
 `ON DELETE CASCADE` runs from providers down through games, mods, releases and
 files, and from installations to their provider-stack rows. Deleting an
-installation therefore releases every claim it held in one statement — which is
-exactly what `remove_installation` relies on, and what a test asserts.
+installation therefore releases every claim it held in one statement. Normal
+removal does not use that destructive path: it deactivates the installation
+while retaining its archive and mappings for offline reactivation.
 
 `backups.id` is referenced with `ON DELETE SET NULL` rather than cascade: losing
 a backup record must not delete the stack entry that documents an unmanaged

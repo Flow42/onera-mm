@@ -14,6 +14,10 @@
 
 use onera_archive::SafeArchiveBackend;
 use onera_core::domain::game::{Game, LocalGameInstall};
+use onera_core::domain::operation::OperationKind;
+use onera_core::domain::reconcile::{
+    reconcile_with_decisions, DesiredGameState, InstallationMapping, MutationPlan, MutationStep,
+};
 use onera_core::domain::release::{ProviderFile, Release};
 use onera_core::hash::FileHash;
 use onera_core::ids::{
@@ -23,7 +27,7 @@ use onera_core::ids::{
 use onera_core::plan::{InstallPlan, ScopedRule, TargetLocation};
 use onera_core::ports::{
     AccountInfo, ArchiveBackend, ArchiveStore, AuthProvider, Credential, DeploymentStore,
-    GameAdapter, ModProvider, SecretStore,
+    GameAdapter, ModProvider, OperationJournal, SecretStore,
 };
 use onera_core::progress::{CancelToken, ProgressSink};
 use onera_core::redact::Secret;
@@ -37,7 +41,7 @@ use onera_install::planner::{plan_install, PlanRequest, RootMap};
 use onera_install::remove::{ModifiedFilePolicy, RemovalReport, Remover};
 use onera_install::{
     recover_all, verify_installation, GameLocks, InstallReport, Installer, InterruptedOperation,
-    RealFileSystem, VerifyReport,
+    RealFileSystem, ReconciliationEngine, VerifyReport,
 };
 use onera_nexus::{ApiKeyAuth, NexusClient, NexusConfig};
 use std::path::PathBuf;
@@ -60,6 +64,7 @@ pub struct Onera {
     downloader: Arc<Downloader>,
     installer: Arc<Installer>,
     remover: Arc<Remover>,
+    reconciler: Arc<ReconciliationEngine>,
     locks: GameLocks,
     download_lock: tokio::sync::Mutex<()>,
     expired_prepared_plans: u64,
@@ -162,7 +167,17 @@ impl Onera {
                 Arc::new(db.clone()),
                 backups.clone(),
             )),
-            remover: Arc::new(Remover::new(fs, Arc::new(db.clone()), backups)),
+            remover: Arc::new(Remover::new(
+                fs.clone(),
+                Arc::new(db.clone()),
+                backups.clone(),
+            )),
+            reconciler: Arc::new(ReconciliationEngine::new(
+                fs,
+                Arc::new(db.clone()),
+                backups,
+                Arc::new(db.clone()),
+            )),
             locks: GameLocks::new(),
             download_lock: tokio::sync::Mutex::new(()),
             expired_prepared_plans,
@@ -945,6 +960,208 @@ impl Onera {
         self.db.put_rule(rule).await
     }
 
+    /// Build a deterministic desired-state preview without extracting archives
+    /// or touching the game directory.
+    pub async fn plan_state(
+        &self,
+        game: LocalGameId,
+        installations: Vec<InstallationId>,
+    ) -> Result<PreparedState> {
+        self.plan_state_with_decisions(game, installations, &std::collections::BTreeMap::new())
+            .await
+    }
+
+    /// Preview a desired state with explicit winners for cross-mod paths.
+    ///
+    /// Decisions are part of the returned plan and therefore of the operation
+    /// journal record that is ultimately applied.
+    pub async fn plan_state_with_decisions(
+        &self,
+        game: LocalGameId,
+        installations: Vec<InstallationId>,
+        decisions: &std::collections::BTreeMap<TargetLocation, InstallationId>,
+    ) -> Result<PreparedState> {
+        let (roots, _) = self.roots_for(game).await?;
+        let desired = DesiredGameState::new(game, installations);
+        let mut lineages = std::collections::BTreeMap::new();
+        for installation in &desired.installations {
+            let mod_id = self
+                .db
+                .mod_for_installation(game, *installation)
+                .await?
+                .ok_or_else(|| CoreError::NotFound {
+                    kind: "retained installation",
+                    id: installation.to_string(),
+                })?;
+            if let Some(previous) = lineages.insert(mod_id, *installation) {
+                return Err(CoreError::Conflict(format!(
+                    "installations {previous} and {installation} are versions of the same mod"
+                )));
+            }
+        }
+        let mut current = std::collections::BTreeMap::new();
+        for target in self.db.all_targets(game).await? {
+            current.insert(target.clone(), self.db.stack(game, &target).await?);
+        }
+        let mut mappings = Vec::new();
+        for installation in &desired.installations {
+            if self
+                .db
+                .archive_for_installation(game, *installation)
+                .await?
+                .is_none()
+            {
+                return Err(CoreError::NotFound {
+                    kind: "retained installation",
+                    id: installation.to_string(),
+                });
+            }
+            let stored = self.db.mappings_of(*installation).await?;
+            if stored.is_empty() {
+                return Err(CoreError::Conflict(format!(
+                    "installation {installation} has no retained layout mappings and must be reinstalled"
+                )));
+            }
+            mappings.extend(stored);
+        }
+        Ok(PreparedState {
+            plan: reconcile_with_decisions(desired, &current, &mappings, decisions),
+            mappings,
+            roots,
+        })
+    }
+
+    /// Apply an approved state preview. Required retained archives are
+    /// re-extracted and checked against their recorded mappings first.
+    pub async fn apply_state(
+        &self,
+        prepared: &PreparedState,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        let game = prepared.plan.desired.local_game_id;
+        let _guard = self.locks.acquire(game).await;
+        let mut needed = std::collections::BTreeSet::new();
+        for step in &prepared.plan.steps {
+            if let MutationStep::Write { provider, .. } = step {
+                if let Some(installation) = provider.provider.installation_id() {
+                    needed.insert(installation);
+                }
+            }
+        }
+        let mut extracted = std::collections::BTreeMap::new();
+        let result = async {
+            for installation in needed {
+                let archive = self
+                    .db
+                    .archive_for_installation(game, installation)
+                    .await?
+                    .ok_or_else(|| CoreError::NotFound {
+                        kind: "retained installation",
+                        id: installation.to_string(),
+                    })?;
+                let staging = self.paths.staging_for(onera_core::ids::OperationId::new());
+                extracted.insert(installation, staging.clone());
+                let manifest = self
+                    .archives
+                    .extract(&archive.path, &staging, progress, cancel)
+                    .await?;
+                if manifest.archive_hash != archive.hash {
+                    return Err(CoreError::IntegrityMismatch {
+                        path: archive.path.display().to_string(),
+                        expected: archive.hash.to_string(),
+                        actual: manifest.archive_hash.to_string(),
+                    });
+                }
+                for mapping in prepared
+                    .mappings
+                    .iter()
+                    .filter(|mapping| mapping.installation_id == installation)
+                {
+                    let actual = manifest.file(&mapping.source).ok_or_else(|| {
+                        CoreError::IntegrityMismatch {
+                            path: mapping.source.to_string(),
+                            expected: mapping.source_hash.to_string(),
+                            actual: "missing".into(),
+                        }
+                    })?;
+                    if actual.hash != mapping.source_hash {
+                        return Err(CoreError::IntegrityMismatch {
+                            path: mapping.source.to_string(),
+                            expected: mapping.source_hash.to_string(),
+                            actual: actual.hash.to_string(),
+                        });
+                    }
+                }
+            }
+            self.reconciler
+                .apply(
+                    &prepared.plan,
+                    &prepared.mappings,
+                    &extracted,
+                    &prepared.roots,
+                    progress,
+                    cancel,
+                )
+                .await
+        }
+        .await;
+        for staging in extracted.values() {
+            let _ = tokio::fs::remove_dir_all(staging).await;
+        }
+        result
+    }
+
+    /// Enable a retained artifact through the shared reconciler.
+    pub async fn enable(
+        &self,
+        game: LocalGameId,
+        installation: InstallationId,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        let mut desired = self.db.active_installations(game).await?;
+        let lineage = self
+            .db
+            .mod_for_installation(game, installation)
+            .await?
+            .ok_or_else(|| CoreError::NotFound {
+                kind: "retained installation",
+                id: installation.to_string(),
+            })?;
+        let mut retained = Vec::with_capacity(desired.len() + 1);
+        for active in desired.drain(..) {
+            if self.db.mod_for_installation(game, active).await? != Some(lineage) {
+                retained.push(active);
+            }
+        }
+        desired = retained;
+        if !desired.contains(&installation) {
+            desired.push(installation);
+        }
+        let prepared = self.plan_state(game, desired).await?;
+        self.apply_state(&prepared, progress, cancel).await
+    }
+
+    /// Disable an artifact while retaining its archive and mappings.
+    pub async fn disable(
+        &self,
+        game: LocalGameId,
+        installation: InstallationId,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        let desired = self
+            .db
+            .active_installations(game)
+            .await?
+            .into_iter()
+            .filter(|candidate| *candidate != installation)
+            .collect();
+        let prepared = self.plan_state(game, desired).await?;
+        self.apply_state(&prepared, progress, cancel).await
+    }
+
     // -----------------------------------------------------------------------
     // Verify, remove, recover
     // -----------------------------------------------------------------------
@@ -1039,7 +1256,23 @@ impl Onera {
         operation: onera_core::ids::OperationId,
         progress: &dyn ProgressSink,
     ) -> Result<()> {
-        self.installer.rollback(operation, progress).await
+        let kind = self
+            .db
+            .get(operation)
+            .await?
+            .ok_or_else(|| CoreError::NotFound {
+                kind: "operation",
+                id: operation.to_string(),
+            })?
+            .kind;
+        match kind {
+            OperationKind::Reconcile | OperationKind::CleanRestore => {
+                self.reconciler.rollback(operation).await
+            }
+            OperationKind::Install | OperationKind::Remove | OperationKind::Repair => {
+                self.installer.rollback(operation, progress).await
+            }
+        }
     }
 }
 
@@ -1171,6 +1404,18 @@ pub struct PreparedInstall {
     pub ignored: usize,
     /// Entries the archive inspector refused, for the preview.
     pub rejected_entries: Vec<onera_core::domain::archive::RejectedEntry>,
+}
+
+/// A dry-run desired-state plan together with the retained mappings needed to
+/// prepare its writes later.
+#[derive(Debug)]
+pub struct PreparedState {
+    /// Deterministic preview shown before apply.
+    pub plan: MutationPlan,
+    /// Stable artifact mappings used for archive-backed reactivation.
+    pub mappings: Vec<InstallationMapping>,
+    /// Resolved deployment roots.
+    pub roots: RootMap,
 }
 
 /// A mod as Onera knows it after fetching metadata.

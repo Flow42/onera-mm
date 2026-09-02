@@ -377,6 +377,7 @@ mod tests {
         assert_object_safe::<dyn FileSystem>();
         assert_object_safe::<dyn SecretStore>();
         assert_object_safe::<dyn ArchiveStore>();
+        assert_object_safe::<dyn ReconciliationStore>();
         assert_object_safe::<dyn AuthProvider>();
         assert_object_safe::<dyn ProgressSink>();
     }
@@ -565,6 +566,18 @@ pub trait DeploymentStore: Send + Sync {
 
     /// Remember a rule.
     async fn put_rule(&self, rule: &ScopedRule) -> Result<()>;
+}
+
+/// Atomically publishes the database half of a completed reconciliation.
+#[async_trait]
+pub trait ReconciliationStore: Send + Sync {
+    /// Replace all affected stacks, synchronize activation flags, and mark the
+    /// operation complete in one transaction after disk verification succeeds.
+    async fn complete_reconciliation(
+        &self,
+        operation: OperationId,
+        plan: &MutationPlan,
+    ) -> Result<()>;
 }
 
 /// Copies of files Onera was about to overwrite.

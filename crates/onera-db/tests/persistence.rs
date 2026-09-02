@@ -360,6 +360,15 @@ async fn deactivated_artifacts_keep_their_stable_mappings() {
     f.db.put_mapping(&mapping).await.unwrap();
     f.db.deactivate_installation(installation).await.unwrap();
 
+    assert!(f.db.active_installations(f.game).await.unwrap().is_empty());
+    assert_eq!(
+        f.db.archive_for_installation(f.game, installation)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        f.archive
+    );
     assert_eq!(
         f.db.mappings_of(installation).await.unwrap(),
         vec![mapping.clone()]
@@ -367,6 +376,10 @@ async fn deactivated_artifacts_keep_their_stable_mappings() {
     assert!(f.db.installed_mods(f.game).await.unwrap().is_empty());
 
     f.db.activate_installation(installation).await.unwrap();
+    assert_eq!(
+        f.db.active_installations(f.game).await.unwrap(),
+        vec![installation]
+    );
     assert_eq!(f.db.mappings_of(installation).await.unwrap(), vec![mapping]);
     assert_eq!(f.db.installed_mods(f.game).await.unwrap().len(), 1);
 }

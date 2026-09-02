@@ -110,6 +110,54 @@ enum Commands {
         #[arg(long)]
         force_modified: bool,
     },
+    /// Preview a desired active-mod state.
+    PlanState {
+        /// Registered game installation id.
+        #[arg(long)]
+        game: String,
+        /// Retained installation to enable; may be repeated.
+        #[arg(long)]
+        enable: Vec<String>,
+        /// Active installation to disable; may be repeated.
+        #[arg(long)]
+        disable: Vec<String>,
+        /// Resolve a collision as ROOT:PATH=INSTALLATION_ID; may be repeated.
+        #[arg(long, value_name = "ROOT:PATH=INSTALLATION_ID")]
+        winner: Vec<String>,
+    },
+    /// Apply a desired active-mod state as one transaction.
+    ApplyState {
+        /// Registered game installation id.
+        #[arg(long)]
+        game: String,
+        /// Retained installation to enable; may be repeated.
+        #[arg(long)]
+        enable: Vec<String>,
+        /// Active installation to disable; may be repeated.
+        #[arg(long)]
+        disable: Vec<String>,
+        /// Resolve a collision as ROOT:PATH=INSTALLATION_ID; may be repeated.
+        #[arg(long, value_name = "ROOT:PATH=INSTALLATION_ID")]
+        winner: Vec<String>,
+    },
+    /// Enable one retained installation without downloading it again.
+    Enable {
+        /// Registered game installation id.
+        #[arg(long)]
+        game: String,
+        /// Retained installation id.
+        #[arg(long)]
+        installation: String,
+    },
+    /// Disable one installation while retaining its artifact.
+    Disable {
+        /// Registered game installation id.
+        #[arg(long)]
+        game: String,
+        /// Active installation id.
+        #[arg(long)]
+        installation: String,
+    },
     /// Show who provides a deployed path, oldest first.
     Ownership {
         /// Game installation id.
@@ -324,6 +372,54 @@ async fn main() -> Result<()> {
                 cli.json,
             )
             .await
+        }
+        Commands::PlanState {
+            game,
+            enable,
+            disable,
+            winner,
+        } => {
+            state_change(
+                &onera, &game, &enable, &disable, &winner, false, &progress, &cancel, cli.json,
+            )
+            .await
+        }
+        Commands::ApplyState {
+            game,
+            enable,
+            disable,
+            winner,
+        } => {
+            state_change(
+                &onera, &game, &enable, &disable, &winner, true, &progress, &cancel, cli.json,
+            )
+            .await
+        }
+        Commands::Enable { game, installation } => {
+            let game = LocalGameId::from_str(&game).context("invalid game id")?;
+            let installation =
+                InstallationId::from_str(&installation).context("invalid installation id")?;
+            onera.enable(game, installation, &progress, &cancel).await?;
+            emit(
+                cli.json,
+                &serde_json::json!({ "installation": installation, "active": true }),
+                || format!("enabled {installation}"),
+            );
+            Ok(())
+        }
+        Commands::Disable { game, installation } => {
+            let game = LocalGameId::from_str(&game).context("invalid game id")?;
+            let installation =
+                InstallationId::from_str(&installation).context("invalid installation id")?;
+            onera
+                .disable(game, installation, &progress, &cancel)
+                .await?;
+            emit(
+                cli.json,
+                &serde_json::json!({ "installation": installation, "active": false }),
+                || format!("disabled {installation}"),
+            );
+            Ok(())
         }
         Commands::Ownership { game, root, path } => {
             ownership(&onera, &game, &root, &path, cli.json).await
@@ -749,6 +845,78 @@ async fn verify(
     if !report.is_clean() {
         // A non-zero exit lets a script notice without parsing output.
         std::process::exit(2);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn state_change(
+    onera: &Onera,
+    game: &str,
+    enable: &[String],
+    disable: &[String],
+    winners: &[String],
+    apply: bool,
+    progress: &CliProgress,
+    cancel: &CancelToken,
+    json: bool,
+) -> Result<()> {
+    let game = LocalGameId::from_str(game).context("invalid game id")?;
+    let mut desired = onera.database().active_installations(game).await?;
+    for raw in disable {
+        let id = InstallationId::from_str(raw).context("invalid disabled installation id")?;
+        desired.retain(|candidate| *candidate != id);
+    }
+    for raw in enable {
+        let id = InstallationId::from_str(raw).context("invalid enabled installation id")?;
+        if !desired.contains(&id) {
+            desired.push(id);
+        }
+    }
+    let mut decisions = std::collections::BTreeMap::new();
+    for raw in winners {
+        let (target, winner) = raw
+            .split_once('=')
+            .context("winner must be ROOT:PATH=INSTALLATION_ID")?;
+        let (root_key, path) = target
+            .split_once(':')
+            .context("winner target must be ROOT:PATH")?;
+        let winner = InstallationId::from_str(winner).context("invalid winner installation id")?;
+        decisions.insert(
+            onera_core::plan::TargetLocation {
+                root_key: root_key.to_owned(),
+                path: onera_core::RelPath::normalize(path).context("invalid winner path")?,
+            },
+            winner,
+        );
+    }
+    let prepared = onera
+        .plan_state_with_decisions(game, desired, &decisions)
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&prepared.plan)?);
+    } else {
+        println!(
+            "{} filesystem change(s), {} conflict(s)",
+            prepared.plan.steps.len(),
+            prepared.plan.conflicts.len()
+        );
+        for step in &prepared.plan.steps {
+            println!("  {step:?}");
+        }
+        for conflict in &prepared.plan.conflicts {
+            println!("  conflict {}: {:?}", conflict.target, conflict.providers);
+        }
+    }
+    if !apply {
+        return Ok(());
+    }
+    if !prepared.plan.is_ready() {
+        anyhow::bail!("the desired state has unresolved cross-mod conflicts");
+    }
+    onera.apply_state(&prepared, progress, cancel).await?;
+    if !json {
+        println!("desired state applied");
     }
     Ok(())
 }

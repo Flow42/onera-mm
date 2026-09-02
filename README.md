@@ -8,10 +8,10 @@ what was there before, and nothing the user did not put there is ever
 overwritten without being asked. A power cut in the middle of an install leaves
 a recoverable state, not a broken game.
 
-> **Status: early but end-to-end usable.** The first product milestone is
-> complete: archive safety, planning, transactional installation, provider
-> history, recovery, persistent/resumable downloads, browser handoff, and the
-> primary desktop views are implemented and covered by tests.
+> **Status: early but end-to-end usable.** The initial product slice and the
+> desired-state reconciliation foundation are complete: Onera can preview and
+> atomically apply multi-mod enable/disable sets, retain disabled artifacts for
+> offline reactivation, and recover the complete set after a failed write.
 
 ## Why another mod manager
 
@@ -44,6 +44,9 @@ pnpm install && pnpm test
 cargo run -p onera-cli -- --help
 cargo run -p onera-cli -- auth login      # reads the key from stdin
 cargo run -p onera-cli -- discover
+# Preview/apply a retained multi-mod state. Repeat --enable/--disable as needed.
+cargo run -p onera-cli -- plan-state --game <game-id> --enable <installation-id>
+cargo run -p onera-cli -- apply-state --game <game-id> --enable <installation-id>
 ```
 
 The full manual smoke test — discover, authenticate, download, install, verify,

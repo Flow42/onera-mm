@@ -68,12 +68,16 @@ pub enum MutationStep {
         target: TargetLocation,
         /// Provider whose bytes must be staged.
         provider: StackEntry,
+        /// Hash expected on disk when this preview was built.
+        expected_previous: Option<FileHash>,
     },
     /// No provider remains for this target.
     Delete {
         /// Target to delete, subject to the existing external-modification
         /// safeguards in the mutation engine.
         target: TargetLocation,
+        /// Hash expected on disk when this preview was built.
+        expected_previous: FileHash,
     },
 }
 
@@ -92,11 +96,47 @@ pub struct MutationPlan {
     /// State being requested.
     pub desired: DesiredGameState,
     /// Final provider stacks, including paths whose bytes do not change.
+    #[serde(with = "target_map")]
     pub final_stacks: BTreeMap<TargetLocation, ProviderStack>,
     /// Filesystem changes needed before the final stacks can be persisted.
     pub steps: Vec<MutationStep>,
+    /// Expected current top hash for every affected target, including paths
+    /// whose ownership changes without requiring a byte rewrite.
+    #[serde(with = "target_map")]
+    pub expected_files: BTreeMap<TargetLocation, Option<FileHash>>,
     /// Cross-mod collisions that are not safe to choose automatically.
     pub conflicts: Vec<CrossModConflict>,
+    /// Explicit winner selected for each resolved cross-mod collision.
+    #[serde(with = "target_map")]
+    pub conflict_decisions: BTreeMap<TargetLocation, InstallationId>,
+}
+
+// JSON object keys can only be strings. Persist target-keyed maps as ordered
+// pairs so the complete, typed target survives journal serialization.
+mod target_map {
+    use super::TargetLocation;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S, V>(
+        map: &BTreeMap<TargetLocation, V>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        V: Serialize,
+    {
+        map.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D, V>(deserializer: D) -> Result<BTreeMap<TargetLocation, V>, D::Error>
+    where
+        D: Deserializer<'de>,
+        V: Deserialize<'de>,
+    {
+        let entries = Vec::<(TargetLocation, V)>::deserialize(deserializer)?;
+        Ok(entries.into_iter().collect())
+    }
 }
 
 impl MutationPlan {
@@ -118,6 +158,21 @@ pub fn reconcile(
     current: &BTreeMap<TargetLocation, ProviderStack>,
     mappings: &[InstallationMapping],
 ) -> MutationPlan {
+    reconcile_with_decisions(desired, current, mappings, &BTreeMap::new())
+}
+
+/// Reconcile while applying explicit per-path winners for cross-mod collisions.
+///
+/// A decision is accepted only when its installation actually provides that
+/// target. The selected provider is moved to the top of the final stack while
+/// all other providers remain underneath it for later enable/disable changes.
+#[must_use]
+pub fn reconcile_with_decisions(
+    desired: DesiredGameState,
+    current: &BTreeMap<TargetLocation, ProviderStack>,
+    mappings: &[InstallationMapping],
+    decisions: &BTreeMap<TargetLocation, InstallationId>,
+) -> MutationPlan {
     let selected: BTreeSet<_> = desired.installations.iter().copied().collect();
     let mut by_target: BTreeMap<TargetLocation, BTreeMap<InstallationId, &InstallationMapping>> =
         BTreeMap::new();
@@ -133,17 +188,23 @@ pub fn reconcile(
     let targets: BTreeSet<_> = current.keys().chain(by_target.keys()).cloned().collect();
     let mut final_stacks = BTreeMap::new();
     let mut steps = Vec::new();
+    let mut expected_files = BTreeMap::new();
     let mut conflicts = Vec::new();
+    let mut conflict_decisions = BTreeMap::new();
 
     for target in targets {
         let current_stack = current.get(&target).cloned().unwrap_or_default();
+        expected_files.insert(
+            target.clone(),
+            current_stack.top().map(|entry| entry.hash.clone()),
+        );
         let retained_unmanaged = current_stack
             .entries()
             .iter()
             .filter(|entry| entry.provider.is_unmanaged())
             .cloned();
         let target_mappings = by_target.get(&target);
-        let selected_entries: Vec<_> = desired
+        let mut selected_entries: Vec<_> = desired
             .installations
             .iter()
             .filter_map(|installation_id| {
@@ -164,17 +225,39 @@ pub fn reconcile(
             .map(|entry| entry.hash.clone())
             .collect();
         if distinct_hashes.len() > 1 {
-            conflicts.push(CrossModConflict {
-                target: target.clone(),
-                providers: selected_entries
+            if let Some(winner) = decisions.get(&target) {
+                if let Some(position) = selected_entries
                     .iter()
-                    .filter_map(|entry| entry.provider.installation_id())
-                    .collect(),
-            });
-            // Preserve the current stack until the caller supplies a conflict
-            // decision; no unsafe inferred final state leaks into apply.
-            final_stacks.insert(target, current_stack);
-            continue;
+                    .position(|entry| entry.provider.installation_id() == Some(*winner))
+                {
+                    let selected_winner = *winner;
+                    let winner_entry = selected_entries.remove(position);
+                    selected_entries.push(winner_entry);
+                    conflict_decisions.insert(target.clone(), selected_winner);
+                } else {
+                    conflicts.push(CrossModConflict {
+                        target: target.clone(),
+                        providers: selected_entries
+                            .iter()
+                            .filter_map(|entry| entry.provider.installation_id())
+                            .collect(),
+                    });
+                    final_stacks.insert(target, current_stack);
+                    continue;
+                }
+            } else {
+                conflicts.push(CrossModConflict {
+                    target: target.clone(),
+                    providers: selected_entries
+                        .iter()
+                        .filter_map(|entry| entry.provider.installation_id())
+                        .collect(),
+                });
+                // Preserve the current stack until the caller supplies a conflict
+                // decision; no unsafe inferred final state leaks into apply.
+                final_stacks.insert(target, current_stack);
+                continue;
+            }
         }
 
         let final_stack =
@@ -184,9 +267,11 @@ pub fn reconcile(
             Some(top) if current_top != Some(&top.hash) => steps.push(MutationStep::Write {
                 target: target.clone(),
                 provider: top.clone(),
+                expected_previous: current_top.cloned(),
             }),
             None if current_stack.top().is_some() => steps.push(MutationStep::Delete {
                 target: target.clone(),
+                expected_previous: current_stack.top().expect("checked").hash.clone(),
             }),
             _ => {}
         }
@@ -197,7 +282,9 @@ pub fn reconcile(
         desired,
         final_stacks,
         steps,
+        expected_files,
         conflicts,
+        conflict_decisions,
     }
 }
 
@@ -291,6 +378,33 @@ mod tests {
         assert!(!plan.is_ready());
         assert_eq!(plan.conflicts[0].providers, vec![a, b]);
         assert!(plan.steps.is_empty());
+    }
+
+    #[test]
+    fn an_explicit_cross_mod_winner_is_preserved_in_the_plan() {
+        let game = LocalGameId::new();
+        let (a, b) = (InstallationId::new(), InstallationId::new());
+        let location = target("same");
+        let plan = reconcile_with_decisions(
+            DesiredGameState::new(game, vec![a, b]),
+            &BTreeMap::new(),
+            &[mapping(a, "same", b"a"), mapping(b, "same", b"b")],
+            &BTreeMap::from([(location.clone(), a)]),
+        );
+        assert!(plan.is_ready());
+        assert_eq!(plan.conflict_decisions[&location], a);
+        assert_eq!(plan.final_stacks[&location].len(), 2);
+        assert_eq!(
+            plan.final_stacks[&location]
+                .top()
+                .and_then(|entry| entry.provider.installation_id()),
+            Some(a)
+        );
+        assert!(matches!(
+            plan.steps.as_slice(),
+            [MutationStep::Write { provider, .. }]
+                if provider.provider.installation_id() == Some(a)
+        ));
     }
 
     #[test]

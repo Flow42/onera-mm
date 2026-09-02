@@ -23,9 +23,10 @@ database, a network, a filesystem, a browser — is an adapter behind a trait.
 | `onera-desktop`   | Tauri driver (outside the Cargo workspace)                       | `onera-app`      |
 
 `onera-install` deliberately does **not** depend on `onera-db`. It talks to
-`OperationJournal`, `DeploymentStore` and `BackupStore`, which SQLite happens to
-implement. That is what makes "what happens if the database fails halfway
-through a commit" a test rather than a hypothesis.
+`OperationJournal`, `DeploymentStore`, `ReconciliationStore` and `BackupStore`,
+which SQLite happens to implement. Filesystem faults can therefore be injected
+without replacing the persistence layer, and persistence can be replaced
+without changing mutation logic.
 
 The Tauri crate sits outside the Cargo workspace on purpose: it needs
 `webkit2gtk` and `libsoup`, and a CI job that only builds and tests the core
@@ -35,16 +36,17 @@ should not need a desktop stack installed.
 
 Declared in `onera_core::ports`:
 
-| Port                                                   | Implemented by                  | Why it is a port                                         |
-| ------------------------------------------------------ | ------------------------------- | -------------------------------------------------------- |
-| `ModProvider`                                          | `onera-nexus`                   | A second provider is a second implementation, not a fork |
-| `AuthProvider`                                         | `onera-nexus::ApiKeyAuth`       | Nexus SSO replaces this one type and nothing else        |
-| `GameAdapter`                                          | `onera-games`                   | Adding a game must not touch the installer               |
-| `ArchiveBackend`                                       | `onera-archive`                 | Lets the installer be tested without real archives       |
-| `FileSystem`                                           | `onera-install::RealFileSystem` | Lets rename and write failures be injected               |
-| `SecretStore`                                          | `onera-app::KeyringSecretStore` | Lets auth be tested without a D-Bus session              |
-| `ArchiveStore`                                         | `onera-download`                | Content addressing is a policy, not a detail             |
-| `OperationJournal` / `DeploymentStore` / `BackupStore` | `onera-db`                      | Crash recovery is testable without SQLite                |
+| Port                                                   | Implemented by                  | Why it is a port                                                           |
+| ------------------------------------------------------ | ------------------------------- | -------------------------------------------------------------------------- |
+| `ModProvider`                                          | `onera-nexus`                   | A second provider is a second implementation, not a fork                   |
+| `AuthProvider`                                         | `onera-nexus::ApiKeyAuth`       | Nexus SSO replaces this one type and nothing else                          |
+| `GameAdapter`                                          | `onera-games`                   | Adding a game must not touch the installer                                 |
+| `ArchiveBackend`                                       | `onera-archive`                 | Lets the installer be tested without real archives                         |
+| `FileSystem`                                           | `onera-install::RealFileSystem` | Lets rename and write failures be injected                                 |
+| `SecretStore`                                          | `onera-app::KeyringSecretStore` | Lets auth be tested without a D-Bus session                                |
+| `ArchiveStore`                                         | `onera-download`                | Content addressing is a policy, not a detail                               |
+| `OperationJournal` / `DeploymentStore` / `BackupStore` | `onera-db`                      | Crash recovery is testable without SQLite                                  |
+| `ReconciliationStore`                                  | `onera-db`                      | Final stacks, activation flags and operation completion publish atomically |
 
 Every port is object-safe and stored as `Arc<dyn Trait>`; a test in
 `ports.rs` asserts that, because losing object safety would quietly force the
@@ -103,3 +105,10 @@ extension ─(game domain, mod id)─► NM host ─► durable inbox
 
 Everything before "user approves" is read-only with respect to the game
 directory. That is not a convention; the planner has no write capability.
+
+Enable/disable sets use the same boundary at a larger scope: `onera-app` loads
+the current stacks and retained mappings, the pure desired-state reconciler
+returns one `MutationPlan`, and the mutation engine stages bytes from every
+required archive before committing any target. Explicit cross-mod winners are
+serialized into that plan. SQLite publishes final stacks, active artifacts and
+operation completion together only after every target verifies.

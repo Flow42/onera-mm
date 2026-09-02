@@ -149,7 +149,13 @@ the database before the first migration that changes installation semantics.
 - Make operation kinds accept `reconcile` and `clean_restore`.
 - Add a persisted desired-state/reconciliation summary to operations.
 
-### `0004_baselines.sql`
+### `0004_active_lineage.sql`
+
+- Deactivate all but the newest legacy artifact in a duplicated game/mod lineage.
+- Replace the v3 lookup index with a partial unique index enforcing one active
+  artifact per local game and mod.
+
+### `0005_baselines.sql`
 
 - `game_baselines`: game, source, store build identity, adapter/version, status,
   capture time, and scan fingerprint.
@@ -158,7 +164,7 @@ the database before the first migration that changes installation semantics.
 - Keep historical baselines when a game build changes; mark them superseded
   rather than overwriting them.
 
-### `0005_profiles.sql`
+### `0006_profiles.sql`
 
 - `profiles`: local game, name, description, active flag, timestamps.
 - `profile_members`: mod, desired provider file/version, optional installation,
@@ -166,7 +172,7 @@ the database before the first migration that changes installation semantics.
 - `profile_activation_history`: source/target profile, operation, result, time.
 - Scope remembered file-conflict rules to a profile where applicable.
 
-### `0006_dependencies.sql`
+### `0007_dependencies.sql`
 
 - `dependency_snapshots`: source provider version, availability, provider
   revision/fingerprint, raw metadata, and fetch time.
@@ -230,13 +236,16 @@ CLI/host companions needed for AppImage per-user setup.
 **Purpose:** make enabling, disabling, switching profiles, compatible updates,
 and clean restoration use one safe mechanism.
 
-**Status: in progress (2026-09-02).** Schema v3 separates retained artifacts
-from active deployments and persists stable source-to-target mappings. The core
-now has a pure, deterministic desired-state reconciler that computes final
-provider stacks, shares identical content without rewriting it, and blocks new
-cross-mod collisions for an explicit decision. The remaining work is the
-multi-artifact staging/commit executor, rollback of deployment-state changes,
-and headless CLI commands.
+**Status: complete (2026-09-02).** Schemas v3-v4 separate retained artifacts
+from active deployments, backfill stable source-to-target mappings where legacy
+data permits, and enforce one active artifact per game/mod lineage. A pure,
+deterministic reconciler produces previewable final stacks and records explicit
+per-path conflict winners. The application re-extracts retained archives,
+validates every mapped hash, and stages all required bytes before one journaled
+multi-artifact commit. Filesystem failure rolls the complete set back while the
+old deployment and activation state remains atomically published in SQLite.
+Headless `plan-state`, `apply-state`, `enable`, and `disable` commands exercise
+the same path, including offline reactivation.
 
 ### Work
 

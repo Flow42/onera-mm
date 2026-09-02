@@ -17,6 +17,7 @@ pub mod secrets;
 
 pub use flow::{
     DownloadRequest, DownloadedArchive, InstallRequest, InstalledModInfo, Onera, PreparedInstall,
+    PreparedState,
 };
 pub use paths::Paths;
 pub use secrets::{InMemorySecretStore, KeyringSecretStore};

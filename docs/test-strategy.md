@@ -4,7 +4,7 @@
 
 | Suite                        | Command                  | Count |
 | ---------------------------- | ------------------------ | ----- |
-| Rust unit and integration    | `cargo test --workspace` | 319   |
+| Rust unit and integration    | `cargo test --workspace` | 332   |
 | Frontend and extension units | `pnpm test`              | 50    |
 | Frontend end-to-end          | `pnpm test:e2e`          | 11    |
 
@@ -42,6 +42,7 @@ retry curve, redaction, VDF parsing, and the Cyberpunk layout resolver.
 | `onera-archive/tests/malicious_archives.rs` | Zip slip, Windows traversal, absolute paths, symlinks, hard links, device nodes, compression bombs, entry-count and size limits, deep nesting, dirty staging, cancellation, progress                           |
 | `onera-db/tests/persistence.rs`             | Stack round-trips and ordering, cascade deletes, backup sharing, journal transitions, migration from populated v1, durable inbox/download jobs, installed-mod and archive read models                          |
 | `onera-install/tests/install_engine.rs`     | 33 tests: clean install, identical sharing, upgrades, downgrades, every conflict class, every decision, rule scoping, fault-injected rename and staging failures, recovery, verification, removal, round trips |
+| `onera-install/tests/reconciliation.rs`     | Multi-artifact atomic commit, offline deactivate/reactivate, stale previews, and complete rollback after injected staging/rename failures                                                                      |
 | `onera-nexus/tests/api_contract.rs`         | Auth header, pagination, rate limits, retries, cancellation during backoff, malformed bodies, missing required fields, hostile identifiers                                                                     |
 | `onera-download/tests/streaming.rs`         | Streaming, hashing, dedup, hash mismatch, truncated responses, size limits, retries, cancellation, bounded concurrency, byte-range resume, safe non-range restart                                              |
 | `onera-app/tests/end_to_end.rs`             | The full documented flow, plus conflict handling, malicious archives, and secret redaction across the whole stack                                                                                              |
@@ -92,6 +93,7 @@ without a compiled desktop binary.
 | Restoring previous providers       | `install_engine.rs`, `provider_stack.rs`                               |
 | Restoring unmanaged backups        | `install_engine.rs`, `end_to_end.rs`                                   |
 | Interrupted writes and renames     | `install_engine.rs` (fault injection)                                  |
+| Multi-mod atomic reconciliation    | `reconciliation.rs`, `domain/reconcile.rs`                             |
 | Restart recovery                   | `install_engine.rs`                                                    |
 | Removal and reinstall round trips  | `install_engine.rs`                                                    |
 | Nexus pagination and rate limiting | `api_contract.rs`                                                      |
@@ -128,6 +130,10 @@ pnpm --filter onera-desktop exec svelte-check
 pnpm test
 pnpm test:e2e
 ```
+
+The workspace coverage run (`cargo llvm-cov --workspace --all-features
+--summary-only`) reports 76.3% line coverage; the desired-state core is at
+92.0% and its filesystem executor at 75.3%.
 
 `#![forbid(unsafe_code)]` and `#![warn(missing_docs)]` are set on every library
 crate.

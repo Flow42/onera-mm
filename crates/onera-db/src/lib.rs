@@ -37,7 +37,7 @@ use std::time::Duration;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The schema version this build understands.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// A pooled SQLite database.
 #[derive(Debug, Clone)]
@@ -220,6 +220,19 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO games VALUES ('game', 'nexus', 'test', 'Test', NULL, '2026-01-01');
+             INSERT INTO local_game_installs VALUES ('local', 'game', 'test', 'manual', '/game', NULL, '[]', 1, '2026-01-01');
+             INSERT INTO mods VALUES ('mod', 'nexus', '1', 'test', 'Mod', NULL, '2026-01-01');
+             INSERT INTO releases VALUES ('release', 'mod', '1', NULL, '{}');
+             INSERT INTO archives VALUES ('archive', 'blake3:0000000000000000000000000000000000000000000000000000000000000000', 7, 'mod.zip', 'zip', '/archive', '2026-01-01');
+             INSERT INTO installations VALUES ('installation', 'local', 'mod', 'release', 'archive', 'installed', 'flat', '2026-01-01');
+             INSERT INTO deployed_files VALUES ('deployed', 'local', 'game', 'mods/a', 'blake3:1111111111111111111111111111111111111111111111111111111111111111', 5, '2026-01-01');
+             INSERT INTO installation_files VALUES ('installation', 'deployed', 'payload/a', 'blake3:1111111111111111111111111111111111111111111111111111111111111111', 'create');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         pool.close().await;
 
         let db = Database::open(&path).await.unwrap();
@@ -237,11 +250,28 @@ mod tests {
                 .fetch_all(db.pool())
                 .await
                 .unwrap();
+        let mapping: (String, String, String, i64) = sqlx::query_as(
+            "SELECT root_key, rel_path, source_path, source_size
+             FROM installation_mappings WHERE installation_id = 'installation'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let (active,): (i64,) =
+            sqlx::query_as("SELECT active FROM installations WHERE id = 'installation'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
 
         assert_eq!(version, SCHEMA_VERSION.to_string());
         assert_eq!(providers, 1);
         assert!(columns.iter().any(|(name,)| name == "game_slug"));
         assert!(columns.iter().any(|(name,)| name == "provider_mod_id"));
+        assert_eq!(
+            mapping,
+            ("game".into(), "mods/a".into(), "payload/a".into(), 5)
+        );
+        assert_eq!(active, 1);
     }
 
     #[tokio::test]

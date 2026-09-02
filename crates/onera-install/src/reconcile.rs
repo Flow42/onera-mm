@@ -3,13 +3,13 @@
 use crate::planner::RootMap;
 use onera_core::domain::operation::OperationState;
 use onera_core::domain::reconcile::{InstallationMapping, MutationPlan, MutationStep};
-use onera_core::ids::InstallationId;
+use onera_core::ids::{InstallationId, OperationId};
 use onera_core::ports::{
-    BackupStore, DeploymentStore, FileSystem, JournalEntry, JournalStatus, OperationJournal,
+    BackupStore, FileSystem, JournalEntry, JournalStatus, OperationJournal, ReconciliationStore,
 };
-use onera_core::progress::{CancelToken, ProgressSink};
+use onera_core::progress::{CancelToken, ProgressEvent, ProgressSink, Stage};
 use onera_core::{CoreError, FileHash, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,29 +17,29 @@ use std::sync::Arc;
 pub struct ReconciliationEngine {
     fs: Arc<dyn FileSystem>,
     journal: Arc<dyn OperationJournal>,
-    deployments: Arc<dyn DeploymentStore>,
     backups: Arc<dyn BackupStore>,
+    state: Arc<dyn ReconciliationStore>,
 }
 
 impl ReconciliationEngine {
-    /// Assemble the engine from the same ports as the single-install engine.
+    /// Assemble the engine from persistence and filesystem ports.
     #[must_use]
     pub fn new(
         fs: Arc<dyn FileSystem>,
         journal: Arc<dyn OperationJournal>,
-        deployments: Arc<dyn DeploymentStore>,
         backups: Arc<dyn BackupStore>,
+        state: Arc<dyn ReconciliationStore>,
     ) -> Self {
         Self {
             fs,
             journal,
-            deployments,
             backups,
+            state,
         }
     }
 
-    /// Apply a ready plan. `extracted` maps each retained artifact to a fresh,
-    /// validated extraction directory containing its recorded source paths.
+    /// Apply a ready plan. Extracted roots contain validated artifacts.
+    #[allow(clippy::too_many_arguments)]
     pub async fn apply(
         &self,
         plan: &MutationPlan,
@@ -55,26 +55,94 @@ impl ReconciliationEngine {
             ));
         }
         let operation = self.journal.begin_reconciliation(plan).await?;
+        progress.emit(ProgressEvent::Started {
+            operation: Some(operation.id),
+            stage: Stage::Deploying,
+            total: Some(plan.steps.len() as u64),
+        });
+        let result = self
+            .apply_started(
+                operation.id,
+                plan,
+                mappings,
+                extracted,
+                roots,
+                progress,
+                cancel,
+            )
+            .await;
+        let result = match result {
+            Ok(()) => Ok(()),
+            Err(original) => match self.rollback(operation.id).await {
+                Ok(()) => Err(original),
+                Err(rollback) => Err(CoreError::Conflict(format!(
+                    "{original}; reconciliation rollback also failed: {rollback}"
+                ))),
+            },
+        };
+        progress.emit(ProgressEvent::Finished {
+            stage: Stage::Deploying,
+            success: result.is_ok(),
+        });
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_started(
+        &self,
+        operation: OperationId,
+        plan: &MutationPlan,
+        mappings: &[InstallationMapping],
+        extracted: &BTreeMap<InstallationId, PathBuf>,
+        roots: &RootMap,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        // Preconditions cover metadata-only stack changes as well as writes.
+        // Otherwise enabling an identical provider could publish ownership over
+        // a file that was edited after preview without ever inspecting it.
+        for (target, expected) in &plan.expected_files {
+            cancel.check()?;
+            let root = roots.get(&target.root_key).ok_or_else(|| {
+                CoreError::InvalidInput(format!("no deployment root named {:?}", target.root_key))
+            })?;
+            let actual = self.fs.stat_hash(&target.path.resolve_under(root)).await?;
+            if actual.as_ref().map(|(hash, _)| hash) != expected.as_ref() {
+                return Err(CoreError::Conflict(format!(
+                    "{target} changed after the reconciliation preview"
+                )));
+            }
+        }
         let mut entries = Vec::new();
         for (seq, step) in plan.steps.iter().enumerate() {
             cancel.check()?;
-            let target = match step {
-                MutationStep::Write { target, .. } | MutationStep::Delete { target } => target,
+            let (target, expected) = match step {
+                MutationStep::Write {
+                    target,
+                    expected_previous,
+                    ..
+                } => (target, expected_previous.as_ref()),
+                MutationStep::Delete {
+                    target,
+                    expected_previous,
+                } => (target, Some(expected_previous)),
             };
             let root = roots.get(&target.root_key).ok_or_else(|| {
                 CoreError::InvalidInput(format!("no deployment root named {:?}", target.root_key))
             })?;
-            let absolute_path = target.path.resolve_under(root);
-            let prior = self.fs.stat_hash(&absolute_path).await?;
+            let absolute = target.path.resolve_under(root);
+            let prior = self.fs.stat_hash(&absolute).await?;
+            if prior.as_ref().map(|(hash, _)| hash) != expected {
+                return Err(CoreError::Conflict(format!(
+                    "{target} changed after the reconciliation preview"
+                )));
+            }
             let mut entry = JournalEntry {
-                seq: seq as u32,
+                seq: u32::try_from(seq).unwrap_or(u32::MAX),
                 target: target.clone(),
-                absolute_path: absolute_path.clone(),
-                source_hash: prior
-                    .as_ref()
-                    .map(|(h, _)| h.clone())
-                    .unwrap_or_else(|| FileHash::blake3_of(b"")),
-                previous_hash: prior.as_ref().map(|(h, _)| h.clone()),
+                absolute_path: absolute.clone(),
+                source_hash: FileHash::blake3_of(b""),
+                previous_hash: prior.as_ref().map(|(hash, _)| hash.clone()),
                 backup_id: None,
                 temp_path: None,
                 status: JournalStatus::Pending,
@@ -82,72 +150,76 @@ impl ReconciliationEngine {
             if let Some((hash, size)) = prior {
                 entry.backup_id = Some(
                     self.backups
-                        .create(
-                            plan.desired.local_game_id,
-                            target,
-                            &absolute_path,
-                            &hash,
-                            size,
-                        )
+                        .create(plan.desired.local_game_id, target, &absolute, &hash, size)
                         .await?,
                 );
             }
             if let MutationStep::Write { provider, .. } = step {
-                let installation = provider
-                    .provider
-                    .installation_id()
-                    .expect("write providers are installations");
-                let mapping = mappings
-                    .iter()
-                    .find(|m| {
-                        m.installation_id == installation
-                            && m.target == *target
-                            && m.source_hash == provider.hash
-                    })
-                    .ok_or_else(|| {
-                        CoreError::Conflict(format!("no recorded mapping for {target}"))
-                    })?;
-                let dir = extracted
-                    .get(&installation)
-                    .ok_or_else(|| CoreError::NotFound {
-                        kind: "extracted artifact",
-                        id: installation.to_string(),
-                    })?;
-                let source = mapping.source.resolve_under(dir);
-                verify(&*self.fs, &source, &provider.hash).await?;
-                let temp = self.fs.write_temp_adjacent(&absolute_path, &source).await?;
-                verify(&*self.fs, &temp, &provider.hash).await?;
+                let source = match provider.provider {
+                    onera_core::domain::provider_stack::FileProvider::Installation {
+                        installation_id,
+                    } => {
+                        let mapping = mappings
+                            .iter()
+                            .find(|mapping| {
+                                mapping.installation_id == installation_id
+                                    && mapping.target == *target
+                                    && mapping.source_hash == provider.hash
+                            })
+                            .ok_or_else(|| {
+                                CoreError::Conflict(format!("no recorded mapping for {target}"))
+                            })?;
+                        mapping
+                            .source
+                            .resolve_under(extracted.get(&installation_id).ok_or_else(|| {
+                                CoreError::NotFound {
+                                    kind: "extracted artifact",
+                                    id: installation_id.to_string(),
+                                }
+                            })?)
+                    }
+                    onera_core::domain::provider_stack::FileProvider::UnmanagedBackup {
+                        backup_id,
+                    } => self.backups.path_of(backup_id).await?.ok_or_else(|| {
+                        CoreError::NotFound {
+                            kind: "backup",
+                            id: backup_id.to_string(),
+                        }
+                    })?,
+                };
+                verify(self.fs.as_ref(), &source, &provider.hash).await?;
+                let temp = self.fs.write_temp_adjacent(&absolute, &source).await?;
+                verify(self.fs.as_ref(), &temp, &provider.hash).await?;
                 entry.source_hash = provider.hash.clone();
                 entry.temp_path = Some(temp);
-                entry.status = JournalStatus::Staged;
-            } else {
-                entry.status = JournalStatus::Staged;
             }
-            self.journal.put_entry(operation.id, &entry).await?;
+            entry.status = JournalStatus::Staged;
+            self.journal.put_entry(operation, &entry).await?;
             entries.push((step, entry));
         }
         self.journal
-            .set_state(operation.id, OperationState::Prepared, None)
+            .set_state(operation, OperationState::Prepared, None)
             .await?;
+        cancel.check()?;
         self.journal
-            .set_state(operation.id, OperationState::Committing, None)
+            .set_state(operation, OperationState::Committing, None)
             .await?;
         for (step, entry) in &entries {
             match step {
                 MutationStep::Write { provider, .. } => {
                     self.fs
                         .rename(
-                            entry.temp_path.as_ref().expect("staged temp"),
+                            entry.temp_path.as_ref().expect("staged write"),
                             &entry.absolute_path,
                         )
                         .await?;
-                    verify(&*self.fs, &entry.absolute_path, &provider.hash).await?;
+                    verify(self.fs.as_ref(), &entry.absolute_path, &provider.hash).await?;
                 }
                 MutationStep::Delete { .. } => self.fs.remove_file(&entry.absolute_path).await?,
             }
             self.journal
                 .put_entry(
-                    operation.id,
+                    operation,
                     &JournalEntry {
                         temp_path: None,
                         status: JournalStatus::Committed,
@@ -155,21 +227,120 @@ impl ReconciliationEngine {
                     },
                 )
                 .await?;
+            progress.emit(ProgressEvent::Advanced {
+                stage: Stage::Deploying,
+                completed: u64::from(entry.seq) + 1,
+                total: Some(entries.len() as u64),
+                detail: Some(entry.target.to_string()),
+            });
         }
-        for (target, stack) in &plan.final_stacks {
-            self.deployments
-                .put_stack(plan.desired.local_game_id, target, stack)
+        self.state.complete_reconciliation(operation, plan).await
+    }
+
+    /// Restore every staged or committed file. SQLite remains at the old state
+    /// until the atomic completion transaction succeeds.
+    pub async fn rollback(&self, operation: OperationId) -> Result<()> {
+        let result = self.rollback_inner(operation).await;
+        if let Err(error) = &result {
+            if self
+                .journal
+                .get(operation)
+                .await?
+                .is_some_and(|op| op.state == OperationState::RollingBack)
+            {
+                // Preserve the original rollback error. Marking the operation
+                // failed is best-effort because persistence may itself be the
+                // reason rollback could not finish.
+                let _ = self
+                    .journal
+                    .set_state(operation, OperationState::Failed, Some(&error.to_string()))
+                    .await;
+            }
+        }
+        result
+    }
+
+    async fn rollback_inner(&self, operation: OperationId) -> Result<()> {
+        let Some(op) = self.journal.get(operation).await? else {
+            return Err(CoreError::NotFound {
+                kind: "operation",
+                id: operation.to_string(),
+            });
+        };
+        if op.state.is_terminal() {
+            return Ok(());
+        }
+        if op.state == OperationState::Planned {
+            // Staging happens while the operation is Planned. A later staging
+            // failure can therefore leave earlier temporary files journaled,
+            // even though no target has been changed yet.
+            for entry in self.journal.entries(operation).await? {
+                if let Some(temp) = &entry.temp_path {
+                    self.fs.remove_file(temp).await?;
+                }
+                self.journal
+                    .put_entry(
+                        operation,
+                        &JournalEntry {
+                            status: JournalStatus::RolledBack,
+                            ..entry
+                        },
+                    )
+                    .await?;
+            }
+            return self
+                .journal
+                .set_state(operation, OperationState::RolledBack, None)
+                .await;
+        }
+        if op.state != OperationState::RollingBack {
+            self.journal
+                .set_state(operation, OperationState::RollingBack, None)
                 .await?;
         }
-        let wanted: BTreeSet<_> = plan.desired.installations.iter().copied().collect();
-        for installation in wanted {
-            self.deployments.activate_installation(installation).await?;
+        let mut entries = self.journal.entries(operation).await?;
+        entries.reverse();
+        for entry in entries {
+            if entry.status == JournalStatus::RolledBack {
+                continue;
+            }
+            if let Some(temp) = &entry.temp_path {
+                self.fs.remove_file(temp).await?;
+            }
+            // In Committing/RollingBack, a Staged row may already have been
+            // renamed when a process died before recording Committed. Restoring
+            // every non-rolled-back entry is idempotent and closes that window.
+            if matches!(
+                op.state,
+                OperationState::Committing | OperationState::RollingBack
+            ) || entry.status == JournalStatus::Committed
+            {
+                if let Some(backup_id) = entry.backup_id {
+                    let backup = self.backups.path_of(backup_id).await?.ok_or_else(|| {
+                        CoreError::Conflict(format!("missing rollback backup for {}", entry.target))
+                    })?;
+                    let temp = self
+                        .fs
+                        .write_temp_adjacent(&entry.absolute_path, &backup)
+                        .await?;
+                    self.fs.rename(&temp, &entry.absolute_path).await?;
+                } else if entry.previous_hash.is_none() {
+                    self.fs.remove_file(&entry.absolute_path).await?;
+                }
+            }
+            self.journal
+                .put_entry(
+                    operation,
+                    &JournalEntry {
+                        status: JournalStatus::RolledBack,
+                        ..entry
+                    },
+                )
+                .await?;
         }
         self.journal
-            .set_state(operation.id, OperationState::Complete, None)
-            .await?;
-        let _ = progress;
-        Ok(())
+            .set_state(operation, OperationState::RolledBack, None)
+            .await
     }
 }
 
