@@ -57,7 +57,8 @@ understands. Downgrading is the one migration direction that cannot be made safe
 
 | Table                     | Holds                                                     | Notes                                                                               |
 | ------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `installations`           | One release deployed into one game                        |                                                                                     |
+| `installations`           | One retained release artifact for one game                | `active` distinguishes an acquired artifact from its current deployment            |
+| `installation_mappings`  | Stable source-to-target mapping for a retained artifact   | Allows reactivation without rediscovering archive layout                            |
 | `deployed_files`          | One row per `(game, root, relative path)`                 | `current_hash` is what should be on disk                                            |
 | `deployed_file_providers` | **The provider stack.** Ordered by `position`, 0 = bottom | A `CHECK` enforces that a row names exactly one of `installation_id` / `backup_id`  |
 | `installation_files`      | Which archive entry produced which deployed file          |                                                                                     |
@@ -68,7 +69,7 @@ understands. Downgrading is the one migration direction that cannot be made safe
 
 | Table             | Holds                                              | Notes                                                                                                  |
 | ----------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `operations`      | One journaled mutation, with the full plan as JSON | `CHECK` constrains `kind` and `state` to the modelled vocabulary                                       |
+| `operations`      | One journaled mutation, with the full plan as JSON | `kind` includes focused operations plus `reconcile` and `clean_restore`; `state` is constrained |
 | `operation_files` | Per-file journal rows                              | Stores the resolved **absolute path**, so recovery works without loading a game adapter                |
 | `conflicts`       | Recorded conflicts and their decisions             |                                                                                                        |
 | `scoped_rules`    | Remembered decisions                               | Unique on `(mod_id, root_key, path_prefix)` — deliberately narrow; there is no global "always replace" |

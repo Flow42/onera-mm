@@ -388,6 +388,8 @@ mod tests {
 
 use crate::domain::operation::{Operation, OperationKind, OperationState};
 use crate::domain::provider_stack::{ProviderStack, StackEntry};
+use crate::domain::reconcile::InstallationMapping;
+use crate::domain::reconcile::MutationPlan;
 use crate::ids::{ArchiveId, BackupId, InstallationId, LocalGameId, ModId, OperationId, ReleaseId};
 use crate::plan::{InstallPlan, ScopedRule, TargetLocation as PlanTargetLocation};
 
@@ -443,6 +445,9 @@ pub trait OperationJournal: Send + Sync {
     /// Persist a plan and open an operation in
     /// [`OperationState::Planned`].
     async fn begin(&self, plan: &InstallPlan, kind: OperationKind) -> Result<Operation>;
+
+    /// Persist a desired-state reconciliation before it stages any file.
+    async fn begin_reconciliation(&self, plan: &MutationPlan) -> Result<Operation>;
 
     /// Move an operation to a new state.
     ///
@@ -508,6 +513,19 @@ pub trait DeploymentStore: Send + Sync {
 
     /// Forget an installation once every file it owned has been released.
     async fn remove_installation(&self, installation: InstallationId) -> Result<()>;
+
+    /// Retain an acquired artifact while removing all of its active claims.
+    async fn deactivate_installation(&self, installation: InstallationId) -> Result<()>;
+
+    /// Mark a retained artifact active after its recorded mappings have been
+    /// staged, committed, and verified.
+    async fn activate_installation(&self, installation: InstallationId) -> Result<()>;
+
+    /// Persist one resolved source-to-target mapping for future reactivation.
+    async fn put_mapping(&self, mapping: &InstallationMapping) -> Result<()>;
+
+    /// Stable mappings recorded for a retained artifact.
+    async fn mappings_of(&self, installation: InstallationId) -> Result<Vec<InstallationMapping>>;
 
     /// Record directories an installation had to create.
     ///

@@ -22,6 +22,8 @@ fn kind_str(k: OperationKind) -> &'static str {
         OperationKind::Install => "install",
         OperationKind::Remove => "remove",
         OperationKind::Repair => "repair",
+        OperationKind::Reconcile => "reconcile",
+        OperationKind::CleanRestore => "clean_restore",
     }
 }
 
@@ -30,6 +32,8 @@ fn parse_kind(s: &str) -> Result<OperationKind> {
         "install" => OperationKind::Install,
         "remove" => OperationKind::Remove,
         "repair" => OperationKind::Repair,
+        "reconcile" => OperationKind::Reconcile,
+        "clean_restore" => OperationKind::CleanRestore,
         other => {
             return Err(CoreError::Database(format!(
                 "unknown operation kind {other:?}"
@@ -103,6 +107,36 @@ impl OperationJournal for Database {
             id: plan.operation_id,
             local_game_id: plan.local_game_id,
             kind,
+            state: OperationState::Planned,
+            created_at: from_timestamp(&timestamp)?,
+            updated_at: from_timestamp(&timestamp)?,
+            error: None,
+        })
+    }
+
+    async fn begin_reconciliation(
+        &self,
+        plan: &onera_core::domain::reconcile::MutationPlan,
+    ) -> Result<Operation> {
+        let id = OperationId::new();
+        let encoded = serde_json::to_string(plan)
+            .map_err(|e| CoreError::Database(format!("cannot serialize reconciliation: {e}")))?;
+        let timestamp = now();
+        sqlx::query(
+            "INSERT INTO operations (id, local_game_id, kind, state, plan, created_at, updated_at)
+             VALUES (?1, ?2, 'reconcile', 'planned', ?3, ?4, ?4)",
+        )
+        .bind(id.to_string())
+        .bind(plan.desired.local_game_id.to_string())
+        .bind(encoded)
+        .bind(&timestamp)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(Operation {
+            id,
+            local_game_id: plan.desired.local_game_id,
+            kind: OperationKind::Reconcile,
             state: OperationState::Planned,
             created_at: from_timestamp(&timestamp)?,
             updated_at: from_timestamp(&timestamp)?,

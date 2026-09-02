@@ -127,7 +127,13 @@ impl Remover {
                 report.externally_modified.len()
             )));
         }
-        self.deployments.remove_installation(installation).await?;
+        // A user-facing removal is a deactivation: the artifact archive and
+        // its stable mappings remain available for a later desired-state
+        // activation. Permanent deletion is a separate, explicit purge
+        // operation so disabling never turns into data loss.
+        self.deployments
+            .deactivate_installation(installation)
+            .await?;
         Ok(report)
     }
 

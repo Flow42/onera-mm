@@ -230,6 +230,14 @@ CLI/host companions needed for AppImage per-user setup.
 **Purpose:** make enabling, disabling, switching profiles, compatible updates,
 and clean restoration use one safe mechanism.
 
+**Status: in progress (2026-09-02).** Schema v3 separates retained artifacts
+from active deployments and persists stable source-to-target mappings. The core
+now has a pure, deterministic desired-state reconciler that computes final
+provider stacks, shares identical content without rewriting it, and blocks new
+cross-mod collisions for an explicit decision. The remaining work is the
+multi-artifact staging/commit executor, rollback of deployment-state changes,
+and headless CLI commands.
+
 ### Work
 
 - Apply migration `0003_desired_state.sql` and backfill mappings for existing

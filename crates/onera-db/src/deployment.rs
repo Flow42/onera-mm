@@ -9,6 +9,7 @@ use crate::convert::{hash, now, uuid};
 use crate::{db_err, Database};
 use async_trait::async_trait;
 use onera_core::domain::provider_stack::{FileProvider, ProviderStack, StackEntry};
+use onera_core::domain::reconcile::InstallationMapping;
 use onera_core::ids::{
     ArchiveId, BackupId, InstallationId, LocalGameId, ModId, OperationId, ReleaseId,
 };
@@ -254,7 +255,8 @@ impl DeploymentStore for Database {
             "INSERT INTO installations
                (id, local_game_id, mod_id, release_id, archive_id, state, installed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, 'installed', ?6)
-             ON CONFLICT(id) DO UPDATE SET state = 'installed', installed_at = ?6",
+             ON CONFLICT(id) DO UPDATE SET
+               state = 'installed', active = 1, deactivated_at = NULL, installed_at = ?6",
         )
         .bind(installation.to_string())
         .bind(game.to_string())
@@ -275,6 +277,87 @@ impl DeploymentStore for Database {
             .await
             .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn deactivate_installation(&self, installation: InstallationId) -> Result<()> {
+        sqlx::query(
+            "UPDATE installations
+             SET active = 0, state = 'artifact', deactivated_at = ?2
+             WHERE id = ?1",
+        )
+        .bind(installation.to_string())
+        .bind(now())
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn activate_installation(&self, installation: InstallationId) -> Result<()> {
+        sqlx::query(
+            "UPDATE installations
+             SET active = 1, state = 'installed', deactivated_at = NULL
+             WHERE id = ?1",
+        )
+        .bind(installation.to_string())
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn put_mapping(&self, mapping: &InstallationMapping) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO installation_mappings
+               (id, installation_id, root_key, rel_path, source_path, source_hash, source_size, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(installation_id, root_key, rel_path) DO UPDATE SET
+               source_path = excluded.source_path,
+               source_hash = excluded.source_hash,
+               source_size = excluded.source_size",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(mapping.installation_id.to_string())
+        .bind(&mapping.target.root_key)
+        .bind(mapping.target.path.as_str())
+        .bind(mapping.source.as_str())
+        .bind(mapping.source_hash.to_storage_string())
+        .bind(mapping.source_size as i64)
+        .bind(now())
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn mappings_of(&self, installation: InstallationId) -> Result<Vec<InstallationMapping>> {
+        let rows = sqlx::query(
+            "SELECT root_key, rel_path, source_path, source_hash, source_size
+             FROM installation_mappings WHERE installation_id = ?1
+             ORDER BY root_key, rel_path",
+        )
+        .bind(installation.to_string())
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        rows.into_iter()
+            .map(|row| {
+                let source_path: String = row.try_get("source_path").map_err(db_err)?;
+                let rel_path: String = row.try_get("rel_path").map_err(db_err)?;
+                let source_hash: String = row.try_get("source_hash").map_err(db_err)?;
+                let source_size: i64 = row.try_get("source_size").map_err(db_err)?;
+                Ok(InstallationMapping {
+                    installation_id: installation,
+                    source: RelPath::normalize(&source_path)?,
+                    target: TargetLocation {
+                        root_key: row.try_get("root_key").map_err(db_err)?,
+                        path: RelPath::normalize(&rel_path)?,
+                    },
+                    source_hash: hash(&source_hash)?,
+                    source_size: source_size.max(0) as u64,
+                })
+            })
+            .collect()
     }
 
     async fn record_created_dirs(
@@ -323,13 +406,15 @@ impl DeploymentStore for Database {
         game: LocalGameId,
         mod_id: ModId,
     ) -> Result<Vec<InstallationId>> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT id FROM installations WHERE local_game_id = ?1 AND mod_id = ?2")
-                .bind(game.to_string())
-                .bind(mod_id.to_string())
-                .fetch_all(self.pool())
-                .await
-                .map_err(db_err)?;
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM installations
+                 WHERE local_game_id = ?1 AND mod_id = ?2 AND active = 1",
+        )
+        .bind(game.to_string())
+        .bind(mod_id.to_string())
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
         rows.into_iter()
             .map(|(id,)| Ok(InstallationId::from(uuid(&id)?)))
             .collect()

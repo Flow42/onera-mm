@@ -37,7 +37,7 @@ use std::time::Duration;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The schema version this build understands.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// A pooled SQLite database.
 #[derive(Debug, Clone)]

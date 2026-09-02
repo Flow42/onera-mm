@@ -47,6 +47,10 @@ pub enum OperationKind {
     Remove,
     /// Re-deploy files that verification found wrong.
     Repair,
+    /// Reconcile several retained artifacts into one desired deployment state.
+    Reconcile,
+    /// Reconcile to no active mods, then verify the trusted game baseline.
+    CleanRestore,
 }
 
 /// Where an operation is in its lifecycle.

@@ -3,6 +3,7 @@
 use onera_core::domain::download::{DownloadJob, JobState};
 use onera_core::domain::operation::{OperationKind, OperationState};
 use onera_core::domain::provider_stack::{FileProvider, ProviderStack, StackEntry};
+use onera_core::domain::reconcile::InstallationMapping;
 use onera_core::domain::release::{FileCategory, Mod, ProviderFile, Release};
 use onera_core::hash::FileHash;
 use onera_core::ids::*;
@@ -343,6 +344,34 @@ async fn installations_of_a_mod_are_found() {
 }
 
 #[tokio::test]
+async fn deactivated_artifacts_keep_their_stable_mappings() {
+    let f = fixture().await;
+    let installation = InstallationId::new();
+    f.db.record_installation(installation, f.game, f.mod_id, f.release, f.archive)
+        .await
+        .unwrap();
+    let mapping = InstallationMapping {
+        installation_id: installation,
+        source: RelPath::normalize("archive/pc/mod/example.archive").unwrap(),
+        target: target("archive/pc/mod/example.archive"),
+        source_hash: FileHash::blake3_of(b"artifact bytes"),
+        source_size: 14,
+    };
+    f.db.put_mapping(&mapping).await.unwrap();
+    f.db.deactivate_installation(installation).await.unwrap();
+
+    assert_eq!(
+        f.db.mappings_of(installation).await.unwrap(),
+        vec![mapping.clone()]
+    );
+    assert!(f.db.installed_mods(f.game).await.unwrap().is_empty());
+
+    f.db.activate_installation(installation).await.unwrap();
+    assert_eq!(f.db.mappings_of(installation).await.unwrap(), vec![mapping]);
+    assert_eq!(f.db.installed_mods(f.game).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn scoped_rules_round_trip_and_stay_scoped() {
     let f = fixture().await;
     let rule = ScopedRule {
@@ -405,6 +434,17 @@ async fn the_journal_records_a_plan_and_its_entries() {
     let entries = f.db.entries(op.id).await.unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].status, JournalStatus::Committed);
+}
+
+#[tokio::test]
+async fn reconciliation_operation_kinds_round_trip() {
+    let f = fixture().await;
+    for kind in [OperationKind::Reconcile, OperationKind::CleanRestore] {
+        let plan = plan_for(&f, InstallationId::new());
+        let stored = f.db.begin(&plan, kind).await.unwrap();
+        assert_eq!(stored.kind, kind);
+        assert_eq!(f.db.get(stored.id).await.unwrap().unwrap().kind, kind);
+    }
 }
 
 #[tokio::test]

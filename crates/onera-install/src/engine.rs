@@ -19,6 +19,7 @@
 use crate::planner::RootMap;
 use onera_core::domain::operation::{Operation, OperationKind, OperationState};
 use onera_core::domain::provider_stack::{FileProvider, StackEntry};
+use onera_core::domain::reconcile::InstallationMapping;
 use onera_core::ids::{ArchiveId, ReleaseId};
 use onera_core::plan::{InstallPlan, PlannedAction, PlannedFile, TargetLocation};
 use onera_core::ports::{
@@ -320,6 +321,24 @@ impl Installer {
                 archive,
             )
             .await?;
+
+        for file in &plan.files {
+            if matches!(
+                file.effective_action(),
+                PlannedAction::Skip | PlannedAction::Reject
+            ) {
+                continue;
+            }
+            self.deployments
+                .put_mapping(&InstallationMapping {
+                    installation_id: plan.installation_id,
+                    source: file.source.clone(),
+                    target: file.target.clone(),
+                    source_hash: file.source_hash.clone(),
+                    source_size: file.source_size,
+                })
+                .await?;
+        }
 
         let created: Vec<TargetLocation> = created_dirs.into_iter().collect();
         self.deployments
