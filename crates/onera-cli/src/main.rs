@@ -194,6 +194,101 @@ enum Commands {
         #[command(subcommand)]
         action: ProfileAction,
     },
+    /// Inspect and decide on provider-declared dependencies.
+    Deps {
+        #[command(subcommand)]
+        action: DepsAction,
+    },
+}
+
+/// Dependency subcommands.
+///
+/// These print exactly the payloads `docs/frontend-contracts.md` documents, so
+/// the contract stays honest without a compiled desktop binary. Every one of
+/// them parses its input, calls a single application method and serialises the
+/// result; none of them decides anything itself.
+#[derive(Debug, Subcommand)]
+enum DepsAction {
+    /// Solve a profile's dependencies and report the result.
+    ///
+    /// The `--preview-*` options describe desired-state edits that have not
+    /// been made, so a change can be checked before it is saved. Nothing they
+    /// name is written.
+    Check {
+        /// Profile id.
+        #[arg(long)]
+        profile: String,
+        /// Uncommitted addition, as `<mod-id>` or `<mod-id>:<provider-file-id>`.
+        #[arg(long = "preview-add", value_name = "MOD[:FILE]")]
+        preview_add: Vec<String>,
+        /// Uncommitted enable of an existing member.
+        #[arg(long = "preview-enable", value_name = "MEMBER")]
+        preview_enable: Vec<String>,
+        /// Uncommitted disable of an existing member.
+        #[arg(long = "preview-disable", value_name = "MEMBER")]
+        preview_disable: Vec<String>,
+        /// Uncommitted pin of an existing member.
+        #[arg(long = "preview-pin", value_name = "MEMBER")]
+        preview_pin: Vec<String>,
+        /// Uncommitted unpin of an existing member.
+        #[arg(long = "preview-unpin", value_name = "MEMBER")]
+        preview_unpin: Vec<String>,
+    },
+    /// Print the requirement list a provider declared for one file.
+    Show {
+        /// Onera mod-lineage id.
+        #[arg(long = "mod")]
+        mod_id: String,
+        /// Opaque provider file id.
+        #[arg(long = "file")]
+        provider_file: String,
+    },
+    /// Accept, or withdraw, one named dependency risk.
+    ///
+    /// The fingerprint is the one that was displayed with the requirement. An
+    /// override is scoped to that exact definition, so a provider that changes
+    /// the requirement invalidates the decision instead of silently keeping it.
+    Ignore {
+        /// Profile member id.
+        #[arg(long)]
+        member: String,
+        /// Dependency group id.
+        #[arg(long)]
+        group: String,
+        /// Fingerprint of the definition that was displayed.
+        #[arg(long)]
+        fingerprint: String,
+        /// Why the risk is acceptable. Required unless clearing.
+        #[arg(long, required_unless_present = "clear")]
+        reason: Option<String>,
+        /// Withdraw a previously accepted risk instead of recording one.
+        #[arg(long, conflicts_with = "reason")]
+        clear: bool,
+    },
+    /// Accept a solved dependency plan as a desired-state edit.
+    ApplyPlan {
+        /// Profile id.
+        #[arg(long)]
+        profile: String,
+        /// Fingerprint of the proposal you approved.
+        #[arg(long)]
+        expect: Option<String>,
+    },
+    /// Solve the whole enabled profile for one compatible update set.
+    PlanUpdates {
+        /// Profile id.
+        #[arg(long)]
+        profile: String,
+    },
+    /// Apply the whole-profile compatible update set.
+    ApplyUpdates {
+        /// Profile id.
+        #[arg(long)]
+        profile: String,
+        /// Fingerprint of the preview you approved.
+        #[arg(long)]
+        expect: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -605,6 +700,136 @@ async fn main() -> Result<()> {
         Commands::Profiles { action } => {
             profiles(&onera, action, &progress, &cancel, cli.json).await
         }
+        Commands::Deps { action } => deps(&onera, action, cli.json).await,
+    }
+}
+
+/// The application method a command needs before it can do anything.
+///
+/// Milestone 4's solver and its application wiring land separately from this
+/// adapter. Until they do, a command that would have to invent an answer says
+/// so and exits non-zero: an empty or optimistic result would be a lie, and the
+/// driver is not allowed to compute one itself.
+fn awaiting(method: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "this command needs `Onera::{method}`, which Milestone 4 has not wired up yet. \
+         No dependency answer is invented here, so nothing is printed."
+    )
+}
+
+async fn deps(onera: &Onera, action: DepsAction, json: bool) -> Result<()> {
+    match action {
+        DepsAction::Check {
+            profile,
+            preview_add,
+            preview_enable,
+            preview_disable,
+            preview_pin,
+            preview_unpin,
+        } => {
+            let profile = ProfileId::from_str(&profile).context("invalid profile id")?;
+            let previews = preview_add.len()
+                + preview_enable.len()
+                + preview_disable.len()
+                + preview_pin.len()
+                + preview_unpin.len();
+            if previews > 0 {
+                return Err(awaiting("resolve_profile_dependencies_with_preview"));
+            }
+            let result = onera.resolve_profile_dependencies(profile).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                print_resolution(&result);
+            }
+            Ok(())
+        }
+        DepsAction::Show { mod_id, .. } => {
+            // Parsed rather than passed through: an id that is not one is
+            // refused here, not somewhere that would treat it as a path.
+            ModId::from_str(&mod_id).context("invalid mod id")?;
+            Err(awaiting("dependency_snapshot"))
+        }
+        DepsAction::Ignore { member, .. } => {
+            ProfileMemberId::from_str(&member).context("invalid member id")?;
+            Err(awaiting("set_dependency_override"))
+        }
+        DepsAction::ApplyPlan { profile, .. } => {
+            ProfileId::from_str(&profile).context("invalid profile id")?;
+            Err(awaiting("apply_dependency_plan"))
+        }
+        DepsAction::PlanUpdates { profile } => {
+            ProfileId::from_str(&profile).context("invalid profile id")?;
+            Err(awaiting("plan_compatible_updates"))
+        }
+        DepsAction::ApplyUpdates { profile, .. } => {
+            ProfileId::from_str(&profile).context("invalid profile id")?;
+            Err(awaiting("apply_compatible_updates"))
+        }
+    }
+}
+
+/// One line naming what the solver concluded.
+///
+/// Split out from the printer so the rule it exists for can be tested: every
+/// outcome names itself, and nothing that is not `Compatible` reads as if it
+/// were.
+fn resolution_headline(outcome: &onera_core::domain::dependency::ResolutionOutcome) -> String {
+    use onera_core::domain::dependency::ResolutionOutcome as O;
+    match outcome {
+        O::Compatible => "compatible: no dependency action is required".to_owned(),
+        O::InstallMissing { install } => {
+            format!("install-missing: {} candidate(s) to add", install.len())
+        }
+        O::UpdateSet { select, install } => format!(
+            "update-set: {} version change(s), {} addition(s)",
+            select.len(),
+            install.len()
+        ),
+        O::DisableSet { disable } => {
+            format!("disable-set: {} member(s) would be disabled", disable.len())
+        }
+        O::Unsatisfied { requirements } => format!(
+            "unsatisfied: {} requirement(s) cannot be met",
+            requirements.len()
+        ),
+        O::Unknown { reason } => format!("unknown: {reason}"),
+    }
+}
+
+/// Render a resolution the way the JSON payload reads.
+///
+/// `unknown` and `unsatisfied` are printed as themselves. Neither is collapsed
+/// into "compatible", and an outcome this build does not recognise is printed
+/// with its own tag rather than guessed at.
+fn print_resolution(result: &onera_core::domain::dependency::ResolutionResult) {
+    println!("{}", resolution_headline(&result.outcome));
+    for member in &result.health {
+        println!("  {}  {:?}", member.profile_member_id, member.health);
+        for requirement in &member.unsatisfied {
+            println!(
+                "    requires {} ({}): {}",
+                requirement
+                    .label
+                    .as_deref()
+                    .unwrap_or("unnamed requirement"),
+                requirement.group_id,
+                requirement.explanation
+            );
+        }
+    }
+    let evidence = &result.evidence;
+    println!(
+        "evidence: {} fresh, {} cached, {} stale, {} unavailable, {} unsupported, {} unknown DLC",
+        evidence.fresh,
+        evidence.cached,
+        evidence.stale,
+        evidence.unavailable,
+        evidence.unsupported,
+        evidence.unknown_dlc
+    );
+    if !evidence.is_complete_and_current() {
+        println!("this answer rests on incomplete data and is not current");
     }
 }
 
@@ -1799,6 +2024,189 @@ mod tests {
         // profile because two ids swapped places is not a mistake worth
         // allowing.
         assert!(Cli::try_parse_from(["onera", "profiles", "activate", &id]).is_err());
+    }
+
+    #[test]
+    fn dependency_commands_parse() {
+        let id = "00000000-0000-0000-0000-000000000000".to_owned();
+        for args in [
+            vec!["onera", "deps", "check", "--profile", &id],
+            vec![
+                "onera",
+                "deps",
+                "check",
+                "--profile",
+                &id,
+                "--preview-add",
+                "mod-1:9001",
+                "--preview-disable",
+                &id,
+            ],
+            vec!["onera", "deps", "show", "--mod", &id, "--file", "9001"],
+            vec![
+                "onera",
+                "deps",
+                "ignore",
+                "--member",
+                &id,
+                "--group",
+                &id,
+                "--fingerprint",
+                "b3:definition",
+                "--reason",
+                "I install it by hand",
+            ],
+            vec![
+                "onera",
+                "deps",
+                "ignore",
+                "--member",
+                &id,
+                "--group",
+                &id,
+                "--fingerprint",
+                "b3:definition",
+                "--clear",
+            ],
+            vec!["onera", "deps", "apply-plan", "--profile", &id],
+            vec!["onera", "deps", "plan-updates", "--profile", &id],
+            vec![
+                "onera",
+                "deps",
+                "apply-updates",
+                "--profile",
+                &id,
+                "--expect",
+                "b3:update",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args.clone()).is_ok(), "{args:?}");
+        }
+
+        // Ignoring is always an attributable decision, so a reason is required
+        // unless the decision is being withdrawn.
+        assert!(Cli::try_parse_from([
+            "onera",
+            "deps",
+            "ignore",
+            "--member",
+            &id,
+            "--group",
+            &id,
+            "--fingerprint",
+            "b3:definition",
+        ])
+        .is_err());
+        // Identifiers are named, never positional.
+        assert!(Cli::try_parse_from(["onera", "deps", "check", &id]).is_err());
+        assert!(Cli::try_parse_from(["onera", "deps", "show", "--mod", &id]).is_err());
+    }
+
+    #[test]
+    fn dependency_help_lists_the_documented_subcommands() {
+        let rendered = Cli::try_parse_from(["onera", "deps", "--help"])
+            .expect_err("--help exits through the error path")
+            .to_string();
+        for command in [
+            "check",
+            "show",
+            "ignore",
+            "apply-plan",
+            "plan-updates",
+            "apply-updates",
+        ] {
+            assert!(
+                rendered.contains(command),
+                "missing {command} in:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resolution_prints_its_contract_payload() {
+        use onera_core::domain::dependency::{
+            DependencyHealth, MemberHealth, ResolutionEvidence, ResolutionOutcome, ResolutionResult,
+        };
+
+        let result = ResolutionResult {
+            outcome: ResolutionOutcome::Unknown {
+                reason: "the provider could not be reached".to_owned(),
+            },
+            health: vec![MemberHealth {
+                profile_member_id: ProfileMemberId::new(),
+                health: DependencyHealth::Unknown,
+                unsatisfied: vec![],
+            }],
+            evidence: ResolutionEvidence::default(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        for field in ["outcome", "health", "evidence"] {
+            assert!(json.get(field).is_some(), "missing {field}");
+        }
+        assert_eq!(json["outcome"]["kind"], serde_json::json!("unknown"));
+        assert_eq!(json["health"][0]["health"], serde_json::json!("unknown"));
+        for field in [
+            "fresh",
+            "cached",
+            "stale",
+            "unavailable",
+            "unsupported",
+            "unknown_dlc",
+        ] {
+            assert!(json["evidence"].get(field).is_some(), "missing {field}");
+        }
+    }
+
+    #[test]
+    fn every_outcome_names_itself_and_only_one_reads_as_compatible() {
+        use onera_core::domain::dependency::{
+            DependencySource, ResolutionOutcome as O, UnsatisfiedRequirement,
+        };
+        use onera_core::ids::{DependencyGroupId, ProviderId, ProviderModId};
+
+        let requirement = UnsatisfiedRequirement {
+            source: DependencySource {
+                provider: ProviderId::new("nexus"),
+                game_slug: "cyberpunk2077".to_owned(),
+                provider_mod_id: ProviderModId::new("107"),
+                provider_file_id: None,
+                provider_version_id: None,
+            },
+            group_id: DependencyGroupId::new(),
+            label: None,
+            explanation: "no available candidate targets this game".to_owned(),
+        };
+        let cases = [
+            (O::Compatible, "compatible"),
+            (O::InstallMissing { install: vec![] }, "install-missing"),
+            (
+                O::UpdateSet {
+                    select: vec![],
+                    install: vec![],
+                },
+                "update-set",
+            ),
+            (O::DisableSet { disable: vec![] }, "disable-set"),
+            (
+                O::Unsatisfied {
+                    requirements: vec![requirement],
+                },
+                "unsatisfied",
+            ),
+            (
+                O::Unknown {
+                    reason: "offline".to_owned(),
+                },
+                "unknown",
+            ),
+        ];
+        for (outcome, expected) in cases {
+            let line = resolution_headline(&outcome);
+            assert!(line.starts_with(expected), "{expected} vs {line}");
+            if expected != "compatible" {
+                assert!(!line.starts_with("compatible"), "{line}");
+            }
+        }
     }
 
     #[test]

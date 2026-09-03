@@ -101,11 +101,70 @@ describe('commands', () => {
       ['set_member_state', { memberId: 'member-1', desired: 'disabled' }],
       ['set_member_pin', { memberId: 'member-1', pinned: true, reason: 'known good' }],
       ['reorder_profile_member', { memberId: 'member-1', priority: -12 }],
-      ['resolve_dependencies', { profileId: 'profile-1' }],
+      ['resolve_dependencies', { profileId: 'profile-1', previewMembers: null }],
       ['plan_profile_activation', { profileId: 'profile-1' }],
       ['activate_profile', { profileId: 'profile-1', expectedFingerprint: 'b3:approved-preview' }],
     ]);
 
+    setBridge(null);
+  });
+
+  it('uses the documented dependency command names and camelCase arguments', async () => {
+    const invoke = vi.fn().mockResolvedValue({});
+    setBridge({ invoke, listen: vi.fn() });
+
+    await commands.resolveDependencies('profile-1', [
+      { kind: 'add', mod_id: 'mod-1', provider_file_id: '9001' },
+    ]);
+    await commands.dependencySnapshot('mod-1', '9001');
+    await commands.applyDependencyPlan('profile-1', 'b3:proposal');
+    await commands.setDependencyOverride('member-1', 'group-1', 'b3:definition', 'I accept it');
+    await commands.clearDependencyOverride('member-1', 'group-1', 'b3:definition');
+    await commands.planCompatibleUpdates('profile-1');
+    await commands.applyCompatibleUpdates('profile-1', 'b3:update');
+
+    expect(invoke.mock.calls).toEqual([
+      [
+        'resolve_dependencies',
+        {
+          profileId: 'profile-1',
+          previewMembers: [{ kind: 'add', mod_id: 'mod-1', provider_file_id: '9001' }],
+        },
+      ],
+      ['dependency_snapshot', { modId: 'mod-1', providerFileId: '9001' }],
+      ['apply_dependency_plan', { profileId: 'profile-1', expectedFingerprint: 'b3:proposal' }],
+      [
+        'set_dependency_override',
+        {
+          memberId: 'member-1',
+          groupId: 'group-1',
+          fingerprint: 'b3:definition',
+          reason: 'I accept it',
+        },
+      ],
+      [
+        'clear_dependency_override',
+        { memberId: 'member-1', groupId: 'group-1', fingerprint: 'b3:definition' },
+      ],
+      ['plan_compatible_updates', { profileId: 'profile-1' }],
+      ['apply_compatible_updates', { profileId: 'profile-1', expectedFingerprint: 'b3:update' }],
+    ]);
+
+    setBridge(null);
+  });
+
+  it('sends back the fingerprint that was displayed, so a stale plan is refused', async () => {
+    setBridge({
+      invoke: vi.fn().mockRejectedValue({
+        code: 'conflict',
+        message: 'the dependency proposal is out of date',
+      }),
+      listen: vi.fn(),
+    });
+
+    await expect(commands.applyDependencyPlan('profile-1', 'b3:old')).rejects.toMatchObject({
+      code: 'conflict',
+    });
     setBridge(null);
   });
 

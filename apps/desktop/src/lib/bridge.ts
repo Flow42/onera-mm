@@ -16,12 +16,17 @@
 
 import type {
   AccountInfo,
+  AppliedDependencyPlan,
+  CompatibleUpdatePreview,
+  CompatibleUpdateReport,
   BaselineCapturePreview,
   BaselineSource,
   BaselineStatus,
   BaselineVerification,
   CleanRestorePreview,
   CleanRestoreReport,
+  DependencyOverride,
+  DependencySnapshot,
   DownloadJob,
   DownloadOutcome,
   GameBaseline,
@@ -32,6 +37,7 @@ import type {
   InterruptedOperation,
   LocalGame,
   ModDetails,
+  PreviewMemberEdit,
   ProviderStackView,
   Profile,
   ProfileActivation,
@@ -246,8 +252,57 @@ export const commands = {
     call<ProfileMember>('set_member_pin', { memberId, pinned, reason: reason ?? null }),
   reorderProfileMember: (memberId: string, priority: number) =>
     call<ProfileMember>('reorder_profile_member', { memberId, priority }),
-  resolveDependencies: (profileId: string) =>
-    call<ResolutionResult>('resolve_dependencies', { profileId }),
+  /**
+   * Solve a profile's dependencies.
+   *
+   * `previewMembers` describes desired-state edits the user has not committed
+   * yet, so an add, an enable or a pin change can be checked before it is
+   * saved. Omitting it checks the profile as it stands.
+   */
+  resolveDependencies: (profileId: string, previewMembers?: PreviewMemberEdit[]) =>
+    call<ResolutionResult>('resolve_dependencies', {
+      profileId,
+      previewMembers: previewMembers ?? null,
+    }),
+  /** The raw requirement list behind one provider file, for the detail view. */
+  dependencySnapshot: (modId: string, providerFileId: string) =>
+    call<DependencySnapshot>('dependency_snapshot', { modId, providerFileId }),
+  /**
+   * Accept a solved plan as a desired-state edit.
+   *
+   * Nothing on disk changes: the profile is edited, and the switch that follows
+   * is still previewed and applied separately. `expectedFingerprint` is the one
+   * that was displayed, so a plan that has since moved returns `conflict`
+   * instead of applying something the user never saw.
+   */
+  applyDependencyPlan: (profileId: string, expectedFingerprint?: string | null) =>
+    call<AppliedDependencyPlan>('apply_dependency_plan', {
+      profileId,
+      expectedFingerprint: expectedFingerprint ?? null,
+    }),
+  /**
+   * Record that the user accepted one named requirement going unmet.
+   *
+   * The fingerprint is the one shown beside the requirement, never a fresh
+   * one: an override must not survive a change to the definition it covered.
+   */
+  setDependencyOverride: (memberId: string, groupId: string, fingerprint: string, reason: string) =>
+    call<DependencyOverride>('set_dependency_override', {
+      memberId,
+      groupId,
+      fingerprint,
+      reason,
+    }),
+  clearDependencyOverride: (memberId: string, groupId: string, fingerprint: string) =>
+    call<void>('clear_dependency_override', { memberId, groupId, fingerprint }),
+  /** Solve the whole enabled profile for a compatible update, changing nothing. */
+  planCompatibleUpdates: (profileId: string) =>
+    call<CompatibleUpdatePreview>('plan_compatible_updates', { profileId }),
+  applyCompatibleUpdates: (profileId: string, expectedFingerprint?: string | null) =>
+    call<CompatibleUpdateReport>('apply_compatible_updates', {
+      profileId,
+      expectedFingerprint: expectedFingerprint ?? null,
+    }),
   planProfileActivation: (profileId: string) =>
     call<ProfileActivationPreview>('plan_profile_activation', { profileId }),
   activateProfile: (profileId: string, expectedFingerprint: string) =>

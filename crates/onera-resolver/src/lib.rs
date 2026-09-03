@@ -1,8 +1,5 @@
 //! The pure dependency solver.
 //!
-//! **Status: scaffolding.** The types below are the contract Milestone 4 will
-//! implement against; [`solve`] itself is not implemented yet and says so.
-//!
 //! This crate exists as its own crate to make its central constraint structural
 //! rather than a matter of discipline: it depends on `onera-core` and `serde`
 //! and nothing else. There is no `sqlx`, no `reqwest`, no `tokio` and no
@@ -51,7 +48,7 @@
 
 use onera_core::domain::dependency::{
     CandidateStatus, DependencyOverride, DependencySnapshot, DlcOwnership, ResolutionEvidence,
-    ResolutionOutcome, ResolutionResult,
+    ResolutionResult,
 };
 use onera_core::domain::profile::{DesiredModState, MemberPin, MemberSelection};
 use onera_core::ids::{
@@ -59,6 +56,9 @@ use onera_core::ids::{
     ProviderVersionId, StoreDlcId,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+mod solver;
 
 /// One profile member the solver must account for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,43 +146,70 @@ impl ResolutionRequest {
     #[must_use]
     pub fn evidence(&self) -> ResolutionEvidence {
         let mut evidence = ResolutionEvidence::default();
+        let mut snapshots = BTreeMap::new();
         for snapshot in &self.snapshots {
+            let key = (
+                snapshot.source.provider.clone(),
+                snapshot.source.game_slug.clone(),
+                snapshot.source.provider_mod_id.clone(),
+                snapshot.source.provider_file_id.clone(),
+                snapshot.source.provider_version_id.clone(),
+            );
+            let rank = match snapshot.availability {
+                onera_core::domain::dependency::DependencyAvailability::Unavailable { .. } => 4,
+                onera_core::domain::dependency::DependencyAvailability::Cached {
+                    stale: true,
+                    ..
+                } => 3,
+                onera_core::domain::dependency::DependencyAvailability::Cached {
+                    stale: false,
+                    ..
+                } => 2,
+                onera_core::domain::dependency::DependencyAvailability::Fetched => 1,
+                onera_core::domain::dependency::DependencyAvailability::Unsupported => 0,
+            };
+            snapshots
+                .entry(key)
+                .and_modify(|(previous_rank, previous)| {
+                    if rank > *previous_rank {
+                        *previous_rank = rank;
+                        *previous = snapshot;
+                    }
+                })
+                .or_insert((rank, snapshot));
+        }
+        for (_, snapshot) in snapshots.values() {
             evidence.observe(&snapshot.availability);
         }
-        evidence.unknown_dlc = self
+        let unknown_dlc: BTreeSet<_> = self
             .dlc_ownership
             .iter()
             .filter(|fact| fact.ownership == DlcOwnership::Unknown)
-            .count()
-            .try_into()
-            .unwrap_or(u32::MAX);
+            .map(|fact| fact.id.clone())
+            .collect();
+        evidence.unknown_dlc = unknown_dlc.len().try_into().unwrap_or(u32::MAX);
         evidence
     }
 }
 
 /// Solve a profile's dependency constraints.
 ///
-/// Not implemented yet. It returns [`ResolutionOutcome::Unknown`], which is a
-/// modelled outcome rather than a failure: callers already have to treat
-/// `Unknown` as "cannot be shown to be compatible", so a caller wired up against
-/// this scaffold blocks and explains instead of silently applying an unchecked
-/// plan. It deliberately never returns [`ResolutionOutcome::Compatible`].
+/// The bounded depth-first search keeps an explicit visited-assignment set and
+/// normalizes all set-like inputs before examining them. Inputs beyond its
+/// documented bounds return [`ResolutionOutcome::Unknown`] instead of producing
+/// a partial or timing-dependent answer.
 #[must_use]
 pub fn solve(request: &ResolutionRequest) -> ResolutionResult {
-    ResolutionResult {
-        outcome: ResolutionOutcome::Unknown {
-            reason: "dependency solving is not implemented yet".to_owned(),
-        },
-        health: Vec::new(),
-        evidence: request.evidence(),
-    }
+    solver::solve(request)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::DateTime;
-    use onera_core::domain::dependency::{DependencyAvailability, DependencySource};
+    use onera_core::domain::dependency::{
+        DependencyAvailability, DependencySource, ResolutionOutcome,
+    };
 
     fn source(id: &str) -> DependencySource {
         DependencySource {
@@ -213,11 +240,11 @@ mod tests {
     }
 
     #[test]
-    fn the_scaffold_never_claims_a_set_is_compatible() {
+    fn an_empty_request_is_compatible() {
         let result = solve(&request(vec![], vec![]));
-        assert!(!result.outcome.is_apply_ready());
+        assert!(result.outcome.is_apply_ready());
         assert!(!result.outcome.offers_a_plan());
-        assert!(matches!(result.outcome, ResolutionOutcome::Unknown { .. }));
+        assert!(matches!(result.outcome, ResolutionOutcome::Compatible));
     }
 
     #[test]

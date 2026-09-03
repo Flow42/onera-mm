@@ -62,6 +62,53 @@ const dependency = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
+const requirement = (over: Record<string, unknown> = {}) => ({
+  source: {
+    provider: 'nexus',
+    game_slug: 'cyberpunk2077',
+    provider_mod_id: '107',
+    provider_file_id: '9001',
+    provider_version_id: 'v-9001',
+  },
+  group_id: 'group-cet',
+  label: 'Cyber Engine Tweaks',
+  explanation: 'no available candidate targets this game',
+  ...over,
+});
+
+const candidate = (over: Record<string, unknown> = {}) => ({
+  provider: 'nexus',
+  game_slug: 'cyberpunk2077',
+  provider_mod_id: '107',
+  provider_file_id: '9001',
+  provider_version_id: '9001',
+  provider_file_group_id: '4210',
+  position: 2_500_000,
+  status: 'available',
+  display_name: 'CET 1.35.0',
+  ...over,
+});
+
+const snapshot = (over: Record<string, unknown> = {}) => ({
+  id: 'snapshot-1',
+  source: requirement().source,
+  availability: { kind: 'fetched' },
+  groups: [
+    {
+      id: 'group-cet',
+      provider_group_key: 'req-1',
+      label: 'Cyber Engine Tweaks',
+      kind: 'required',
+      candidates: [candidate()],
+    },
+  ],
+  dlc: [],
+  provider_revision: null,
+  fingerprint: 'b3:definition-one',
+  fetched_at: '2026-09-01T08:00:00Z',
+  ...over,
+});
+
 const preview = (over: Record<string, unknown> = {}) => ({
   from_profile_id: 'profile-default',
   to_profile_id: 'profile-quiet',
@@ -81,6 +128,14 @@ interface MockConfig {
   profiles?: unknown[];
   members?: Record<string, unknown[]>;
   dependency?: unknown;
+  /** Returned when `resolve_dependencies` is called with uncommitted edits. */
+  previewDependency?: unknown;
+  /** Returned once a live, non-invalidated override exists. */
+  dependencyAfterIgnore?: unknown;
+  snapshot?: unknown;
+  /** Simulates the provider changing the definition after a risk was accepted. */
+  snapshotFingerprintChangesTo?: string | null;
+  appliedPlan?: unknown;
   preview?: unknown;
   activation?: unknown;
   errors?: Record<string, { code: string; message: string }>;
@@ -98,6 +153,11 @@ async function stubProfiles(page: Page, supplied: MockConfig = {}) {
       'profile-quiet': [],
     },
     dependency: dependency(),
+    previewDependency: null,
+    dependencyAfterIgnore: null,
+    snapshot: snapshot(),
+    snapshotFingerprintChangesTo: null,
+    appliedPlan: null,
     preview: preview(),
     activation: {
       from_profile_id: 'profile-default',
@@ -117,6 +177,13 @@ async function stubProfiles(page: Page, supplied: MockConfig = {}) {
   await page.addInitScript((settings) => {
     const state = structuredClone(settings) as typeof settings;
     const calls: { command: string; args?: Record<string, unknown> }[] = [];
+    const overrides: {
+      profile_member_id: string;
+      group_id: string;
+      fingerprint: string;
+      reason: string;
+      created_at: string;
+    }[] = [];
     const listeners: Array<(payload: unknown) => void> = [];
     let sequence = 10;
 
@@ -149,8 +216,60 @@ async function stubProfiles(page: Page, supplied: MockConfig = {}) {
             return rows().filter((candidate) => candidate.local_game_id === args?.gameId);
           case 'profile_members':
             return allMembers()[String(args?.profileId)] ?? [];
-          case 'resolve_dependencies':
+          case 'resolve_dependencies': {
+            const edits = args?.previewMembers;
+            if (Array.isArray(edits) && edits.length > 0 && state.previewDependency !== null) {
+              return state.previewDependency;
+            }
+            // An override only counts while it still names the definition that
+            // was displayed when the risk was accepted.
+            const live = overrides.find(
+              (row) => row.fingerprint === (state.snapshot as { fingerprint: string }).fingerprint,
+            );
+            if (live !== undefined && state.dependencyAfterIgnore !== null) {
+              return state.dependencyAfterIgnore;
+            }
             return state.dependency;
+          }
+          case 'dependency_snapshot':
+            return state.snapshot;
+          case 'set_dependency_override': {
+            const current = (state.snapshot as { fingerprint: string }).fingerprint;
+            if (args?.fingerprint !== current) {
+              throw { code: 'conflict', message: 'that dependency definition has changed' };
+            }
+            const decision = {
+              profile_member_id: String(args?.memberId),
+              group_id: String(args?.groupId),
+              fingerprint: String(args?.fingerprint),
+              reason: String(args?.reason),
+              created_at: '2026-09-02T10:00:00Z',
+            };
+            overrides.push(decision);
+            if (state.snapshotFingerprintChangesTo !== null) {
+              (state.snapshot as { fingerprint: string }).fingerprint =
+                state.snapshotFingerprintChangesTo;
+            }
+            return decision;
+          }
+          case 'clear_dependency_override': {
+            const index = overrides.findIndex(
+              (row) => row.group_id === args?.groupId && row.profile_member_id === args?.memberId,
+            );
+            if (index >= 0) overrides.splice(index, 1);
+            return undefined;
+          }
+          case 'apply_dependency_plan': {
+            if (state.appliedPlan === null) {
+              throw { code: 'conflict', message: 'the dependency proposal is out of date' };
+            }
+            const applied = state.appliedPlan as Record<string, unknown>;
+            allMembers()[String(applied.profile_id)] = (
+              applied.members as Array<Record<string, unknown>>
+            ).map((row) => structuredClone(row));
+            state.dependency = applied.dependency;
+            return applied;
+          }
           case 'create_profile': {
             const created = {
               id: `profile-${sequence++}`,
@@ -341,19 +460,26 @@ test('members can be added, disabled, pinned, reordered with a signed priority, 
   await page.goto('/profiles');
   await card(page, 'Quiet').getByRole('button', { name: 'Show' }).click();
 
+  const save = () => page.getByRole('button', { name: 'Save this change' }).click();
+
   await page.getByLabel('Mod ID').fill('555');
   await page.getByLabel(/Provider file ID/).fill('file-555');
   await page.getByRole('button', { name: 'Add member' }).click();
+  await save();
   await expect(page.getByText('nexus:555')).toBeVisible();
   await expect(page.getByText('Download required')).toBeVisible();
 
   await page.getByRole('button', { name: 'Disable 555' }).click();
+  await save();
   await expect(page.getByRole('button', { name: 'Enable 555' })).toBeVisible();
   await page.getByRole('button', { name: 'Enable 555' }).click();
+  await save();
   await expect(page.getByRole('button', { name: 'Disable 555' })).toBeVisible();
   await page.getByRole('button', { name: 'Pin 555' }).click();
+  await save();
   await expect(page.getByRole('button', { name: 'Unpin 555' })).toBeVisible();
   await page.getByRole('button', { name: 'Unpin 555' }).click();
+  await save();
   await expect(page.getByRole('button', { name: 'Pin 555' })).toBeVisible();
 
   await page.getByLabel('Priority for 555').fill('-7');
@@ -609,4 +735,372 @@ test('restart recovery offers rollback without claiming the target profile is ac
   await page.getByRole('button', { name: 'Roll back' }).click();
   await expect(page.getByRole('status')).toContainText('previously active profile remains active');
   await expect(page.getByText(/nothing was interrupted/i)).toBeVisible();
+});
+
+const unsatisfiedHealth = [
+  { profile_member_id: 'member-1', health: 'unsatisfied', unsatisfied: [requirement()] },
+];
+
+test('a missing known dependency blocks apply and offers only the solved install set', async ({
+  page,
+}) => {
+  await stubProfiles(page, {
+    dependency: dependency({
+      outcome: {
+        kind: 'install_missing',
+        install: [
+          {
+            provider: 'nexus',
+            provider_mod_id: '107',
+            provider_file_id: '9001',
+            provider_version_id: 'v-9001',
+            provider_file_group_id: 'g-107',
+            profile_member_id: null,
+            display_name: 'Cyber Engine Tweaks 1.35.0',
+          },
+        ],
+      },
+      health: unsatisfiedHealth,
+    }),
+    appliedPlan: {
+      profile_id: 'profile-default',
+      members: [member()],
+      dependency: dependency(),
+    },
+  });
+  await page.goto('/profiles');
+
+  const panel = page.getByTestId('profile-plan');
+  await expect(panel).toContainText('Missing dependencies can be installed');
+  await expect(panel).toContainText('nexus:107 requires Cyber Engine Tweaks');
+  await expect(panel).toContainText('no available candidate targets this game');
+  await expect(panel).toContainText('Cyber Engine Tweaks 1.35.0');
+  // Only the variant the backend solved is offered.
+  await expect(panel.getByRole('button', { name: 'Install missing requirements' })).toBeVisible();
+  await expect(
+    panel.getByRole('button', { name: 'Update and downgrade to the compatible set' }),
+  ).toHaveCount(0);
+  await expect(panel.getByRole('button', { name: 'Disable the proposed members' })).toHaveCount(0);
+
+  await panel.getByRole('button', { name: 'Install missing requirements' }).click();
+  await expect(page.getByTestId('profile-plan')).toContainText('Compatible');
+  await expect(page.getByRole('status')).toContainText('Preview activation to change files');
+});
+
+test('a compatible set that downgrades a mod says so, and says why', async ({ page }) => {
+  await stubProfiles(page, {
+    dependency: dependency({
+      outcome: {
+        kind: 'update_set',
+        select: [
+          {
+            provider: 'nexus',
+            provider_mod_id: '107',
+            provider_file_id: '8000',
+            provider_version_id: 'v-8000',
+            provider_file_group_id: 'g-107',
+            profile_member_id: 'member-1',
+            change: 'downgrade',
+            reason: 'the later file requires a script runtime this profile cannot install.',
+          },
+        ],
+        install: [],
+      },
+      health: unsatisfiedHealth,
+    }),
+  });
+  await page.goto('/profiles');
+
+  const panel = page.getByTestId('profile-plan');
+  await expect(panel.getByTestId('profile-plan-change')).toContainText('Downgrade');
+  await expect(panel).toContainText('earlier file in its group');
+  await expect(panel).toContainText('script runtime this profile cannot install');
+  await expect(panel).toContainText('nexus:107 requires Cyber Engine Tweaks');
+  await expect(
+    panel.getByRole('button', { name: 'Update and downgrade to the compatible set' }),
+  ).toBeVisible();
+  await expect(panel.getByRole('button', { name: 'Install missing requirements' })).toHaveCount(0);
+});
+
+test('a disable suggestion is presented as a minimal, explained last resort', async ({ page }) => {
+  await stubProfiles(page, {
+    dependency: dependency({
+      outcome: { kind: 'disable_set', disable: ['member-1'] },
+      health: unsatisfiedHealth,
+    }),
+  });
+  await page.goto('/profiles');
+
+  const panel = page.getByTestId('profile-plan');
+  await expect(panel.getByTestId('profile-plan-change')).toContainText('Disable');
+  await expect(panel).toContainText('smallest one that makes the rest valid');
+  await expect(panel.getByRole('button', { name: 'Disable the proposed members' })).toBeVisible();
+});
+
+test('a pin that prevents a solution is named, and no plan is offered', async ({ page }) => {
+  await stubProfiles(page, {
+    members: {
+      'profile-default': [
+        member({
+          pin: {
+            kind: 'pinned',
+            pinned_at: '2026-08-20T09:00:00Z',
+            reason: 'known-good with my save',
+          },
+        }),
+      ],
+      'profile-quiet': [],
+    },
+    dependency: dependency({
+      outcome: { kind: 'unsatisfied', requirements: [requirement()] },
+      health: unsatisfiedHealth,
+    }),
+  });
+  await page.goto('/profiles');
+
+  const panel = page.getByTestId('profile-plan');
+  await expect(panel.getByTestId('profile-plan-outcome')).toContainText('Dependencies unsatisfied');
+  await expect(panel.getByTestId('profile-plan-pins')).toContainText('known-good with my save');
+  await expect(panel.getByTestId('profile-plan-pins')).toContainText('cannot change');
+  await expect(panel.getByRole('button', { name: 'Change pins and solve again' })).toBeVisible();
+  await expect(panel.getByRole('button', { name: /^Install missing/ })).toHaveCount(0);
+  await expect(panel.getByRole('button', { name: /^Update and downgrade/ })).toHaveCount(0);
+  await expect(panel.getByRole('button', { name: /^Disable the proposed/ })).toHaveCount(0);
+});
+
+test('cached and stale evidence is labelled and never called current', async ({ page }) => {
+  await stubProfiles(page, {
+    dependency: dependency({
+      outcome: { kind: 'unknown', reason: 'the provider could not be reached' },
+      health: [{ profile_member_id: 'member-1', health: 'unknown', unsatisfied: [] }],
+      evidence: { fresh: 0, cached: 2, stale: 1, unavailable: 1, unsupported: 1, unknown_dlc: 1 },
+    }),
+  });
+  await page.goto('/profiles');
+
+  const panel = page.getByTestId('profile-plan');
+  await expect(panel.getByTestId('profile-plan-outcome')).toContainText(
+    'the provider could not be reached',
+  );
+  const evidence = panel.getByTestId('profile-plan-evidence');
+  await expect(evidence).toContainText('Cached dependency data');
+  await expect(evidence).toContainText('Stale dependency data');
+  await expect(evidence).toContainText('Dependency data unavailable');
+  await expect(evidence).toContainText('Dependencies unsupported');
+  await expect(evidence).toContainText('DLC ownership unknown');
+  await expect(evidence).toContainText('are not current');
+  await expect(panel.getByTestId('profile-plan-health')).toContainText('Unknown');
+  await expect(panel).toContainText('file-path conflict between two mods is a separate decision');
+});
+
+test('a detail view distinguishes unknown DLC ownership from a DLC known to be missing', async ({
+  page,
+}) => {
+  await stubProfiles(page, {
+    snapshot: snapshot({
+      availability: { kind: 'cached', fetched_at: '2026-09-01T08:00:00Z', stale: true },
+      groups: [
+        {
+          id: 'group-cet',
+          provider_group_key: 'req-1',
+          label: 'Cyber Engine Tweaks',
+          kind: 'required',
+          candidates: [
+            candidate({ status: 'hidden' }),
+            candidate({
+              provider_file_id: '9002',
+              provider_version_id: '9002',
+              game_slug: '',
+              provider_mod_id: '',
+              position: null,
+              status: 'unknown',
+              display_name: null,
+            }),
+          ],
+        },
+      ],
+      dlc: [
+        {
+          id: 'dlc-1',
+          label: 'Phantom Liberty',
+          alternatives: ['1091501'],
+          ownership: 'not_owned',
+        },
+        { id: 'dlc-2', label: 'Some Pack', alternatives: [], ownership: 'unknown' },
+      ],
+    }),
+  });
+  await page.goto('/profiles');
+  await page.getByRole('button', { name: 'Details for 107' }).click();
+
+  const detail = page.getByTestId('dependency-detail');
+  await expect(page.getByTestId('dependency-availability')).toContainText('Stale cache');
+  await expect(page.getByTestId('dependency-availability')).toContainText('not current');
+  await expect(detail).toContainText('Every candidate has been withdrawn');
+  await expect(detail).toContainText('Hidden by the author');
+  await expect(detail).toContainText('Target game not stated');
+  await expect(detail).toContainText('Unnamed candidate');
+  // The opaque ordering key is never shown.
+  await expect(detail).not.toContainText('2500000');
+  await expect(detail).toContainText('Phantom Liberty');
+  await expect(detail).toContainText('Not owned');
+  await expect(detail).toContainText('Ownership unknown');
+  await expect(page.getByTestId('dependency-fingerprint')).toHaveText('b3:definition-one');
+});
+
+test('an unsupported provider is never rendered as requiring nothing', async ({ page }) => {
+  await stubProfiles(page, {
+    snapshot: snapshot({ availability: { kind: 'unsupported' }, groups: [], dlc: [] }),
+  });
+  await page.goto('/profiles');
+  await page.getByRole('button', { name: 'Details for 107' }).click();
+
+  await expect(page.getByTestId('dependency-summary')).toContainText('Requirements not known');
+  await expect(page.getByTestId('dependency-availability')).toContainText(
+    'not the same as requiring nothing',
+  );
+  await expect(page.getByTestId('dependency-detail')).not.toContainText('Requires nothing');
+});
+
+test('ignoring a requirement needs a reason and sends the fingerprint that was displayed', async ({
+  page,
+}) => {
+  await stubProfiles(page, {
+    dependency: dependency({
+      outcome: { kind: 'unsatisfied', requirements: [requirement()] },
+      health: unsatisfiedHealth,
+    }),
+    dependencyAfterIgnore: dependency({
+      outcome: { kind: 'compatible' },
+      health: [{ profile_member_id: 'member-1', health: 'ignored', unsatisfied: [] }],
+    }),
+  });
+  await page.goto('/profiles');
+  await page.getByRole('button', { name: 'Details for 107' }).click();
+  await page.getByRole('button', { name: 'Ignore this requirement' }).click();
+
+  const form = page.getByTestId('ignore-form');
+  await expect(form).toContainText('b3:definition-one');
+  await expect(form).toContainText('does not pick a winner for any file conflict');
+  await form.getByRole('button', { name: 'Accept this risk' }).click();
+  await expect(form).toContainText('Give a reason');
+
+  await page.getByLabel('Reason for ignoring this requirement').fill('I install CET by hand');
+  await form.getByRole('button', { name: 'Accept this risk' }).click();
+  await expect(page.getByRole('status')).toContainText('Risk accepted for Cyber Engine Tweaks');
+
+  const calls = await page.evaluate(
+    () =>
+      (
+        window as unknown as {
+          __ONERA_CALLS__: Array<{ command: string; args?: Record<string, unknown> }>;
+        }
+      ).__ONERA_CALLS__,
+  );
+  expect(calls).toContainEqual({
+    command: 'set_dependency_override',
+    args: {
+      memberId: 'member-1',
+      groupId: 'group-cet',
+      fingerprint: 'b3:definition-one',
+      reason: 'I install CET by hand',
+    },
+  });
+  // No conflict decision is made by ignoring a dependency.
+  expect(calls.some((entry) => entry.command === 'decide')).toBe(false);
+  await expect(page.getByRole('row').filter({ hasText: 'nexus:107' })).toContainText(
+    'Risk accepted',
+  );
+});
+
+test('changed dependency metadata invalidates the ignore decision it was scoped to', async ({
+  page,
+}) => {
+  await stubProfiles(page, {
+    dependency: dependency({
+      outcome: { kind: 'unsatisfied', requirements: [requirement()] },
+      health: unsatisfiedHealth,
+    }),
+    dependencyAfterIgnore: dependency({
+      outcome: { kind: 'compatible' },
+      health: [{ profile_member_id: 'member-1', health: 'ignored', unsatisfied: [] }],
+    }),
+    snapshotFingerprintChangesTo: 'b3:definition-two',
+  });
+  await page.goto('/profiles');
+  await page.getByRole('button', { name: 'Details for 107' }).click();
+  await page.getByRole('button', { name: 'Ignore this requirement' }).click();
+  await page.getByLabel('Reason for ignoring this requirement').fill('I install CET by hand');
+  await page.getByTestId('ignore-form').getByRole('button', { name: 'Accept this risk' }).click();
+
+  await expect(page.getByRole('status')).toContainText('Risk accepted');
+  // The definition moved, so the accepted risk no longer covers it.
+  await expect(page.getByRole('row').filter({ hasText: 'nexus:107' })).toContainText('Unsatisfied');
+  await expect(page.getByRole('row').filter({ hasText: 'nexus:107' })).not.toContainText(
+    'Risk accepted',
+  );
+});
+
+test('cancelling a previewed edit sends no mutating command at all', async ({ page }) => {
+  await stubProfiles(page, {
+    previewDependency: dependency({
+      outcome: { kind: 'unsatisfied', requirements: [requirement()] },
+      health: [
+        { profile_member_id: 'member-new', health: 'unsatisfied', unsatisfied: [requirement()] },
+      ],
+    }),
+  });
+  await page.goto('/profiles');
+  await card(page, 'Quiet').getByRole('button', { name: 'Show' }).click();
+
+  await page.getByLabel('Mod ID').fill('555');
+  await page.getByRole('button', { name: 'Add member' }).click();
+
+  const pending = page.getByTestId('pending-edit');
+  await expect(pending).toContainText('has not been saved');
+  await expect(pending.getByTestId('pending-plan-outcome')).toContainText(
+    'Dependencies unsatisfied',
+  );
+  await pending.getByRole('button', { name: 'Cancel' }).click();
+
+  await expect(page.getByRole('status')).toContainText(
+    'Desired state and the game directory are unchanged',
+  );
+  await expect(page.getByText('nexus:555')).toHaveCount(0);
+  const calls = await page.evaluate(
+    () =>
+      (
+        window as unknown as {
+          __ONERA_CALLS__: Array<{ command: string; args?: Record<string, unknown> }>;
+        }
+      ).__ONERA_CALLS__,
+  );
+  expect(calls.some((entry) => entry.command === 'add_profile_member')).toBe(false);
+  expect(calls).toContainEqual({
+    command: 'resolve_dependencies',
+    args: {
+      profileId: 'profile-quiet',
+      previewMembers: [{ kind: 'add', mod_id: '555', provider_file_id: null }],
+    },
+  });
+});
+
+test('a plan that moved on is refused and re-solved rather than applied', async ({ page }) => {
+  await stubProfiles(page, {
+    dependency: dependency({
+      outcome: { kind: 'disable_set', disable: ['member-1'] },
+      health: unsatisfiedHealth,
+    }),
+    // No applied plan configured, so the stub answers `conflict`.
+    appliedPlan: null,
+  });
+  await page.goto('/profiles');
+  await page
+    .getByTestId('profile-plan')
+    .getByRole('button', { name: /^Disable the proposed/ })
+    .click();
+
+  await expect(page.getByTestId('stale-plan')).toContainText('This plan is out of date');
+  await expect(page.getByTestId('stale-plan')).toContainText('refused rather than applied');
+  await expect(page.getByTestId('profile-plan')).toBeVisible();
 });

@@ -740,12 +740,157 @@ pub async fn reorder_profile_member(
 pub async fn resolve_dependencies(
     state: State<'_, AppState>,
     profile_id: String,
+    preview_members: Option<serde_json::Value>,
 ) -> CommandResult<serde_json::Value> {
-    let resolution = state
-        .onera
-        .resolve_profile_dependencies(parse_profile(&profile_id)?)
-        .await?;
+    let profile = parse_profile(&profile_id)?;
+    // Checking an edit that has not been saved needs an application method that
+    // takes it. Answering with the *committed* profile's result instead would
+    // silently show the user a check of something they did not ask about.
+    if preview_members
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|edits| !edits.is_empty())
+    {
+        return Err(awaiting("resolve_profile_dependencies_with_preview"));
+    }
+    let resolution = state.onera.resolve_profile_dependencies(profile).await?;
     Ok(serde_json::to_value(&resolution).unwrap_or(serde_json::Value::Null))
+}
+
+/// The application method a command needs before it can answer.
+///
+/// Milestone 4's solver and its application wiring land separately from this
+/// adapter. Until they do, these commands parse and validate their arguments
+/// and then refuse, with the stable code `unimplemented`. The alternative —
+/// returning an empty or optimistic payload — would be exactly the
+/// "unknown rendered as nothing" failure the dependency contract exists to
+/// prevent, and computing an answer here would put dependency logic in a
+/// driver.
+fn awaiting(method: &str) -> CommandError {
+    CommandError {
+        code: "unimplemented".into(),
+        message: format!(
+            "this command needs Onera::{method}, which Milestone 4 has not wired up yet. \
+             No dependency answer is invented here."
+        ),
+    }
+}
+
+fn parse_group(id: &str) -> CommandResult<onera_core::ids::DependencyGroupId> {
+    onera_core::ids::DependencyGroupId::from_str(id).map_err(|_| CommandError {
+        code: "internal".into(),
+        message: "that is not a valid dependency group id".into(),
+    })
+}
+
+/// The raw requirement list a provider declared for one file.
+///
+/// The snapshot's `raw` field is diagnostic, can reach megabytes, and is never
+/// rendered, so it is stripped at this boundary rather than sent to the webview.
+#[tauri::command]
+pub async fn dependency_snapshot(
+    _state: State<'_, AppState>,
+    mod_id: String,
+    provider_file_id: String,
+) -> CommandResult<serde_json::Value> {
+    onera_core::ids::ModId::from_str(&mod_id).map_err(|_| CommandError {
+        code: "internal".into(),
+        message: "that is not a valid mod id".into(),
+    })?;
+    if provider_file_id.is_empty() {
+        return Err(CommandError {
+            code: "internal".into(),
+            message: "a provider file id is required".into(),
+        });
+    }
+    Err(awaiting("dependency_snapshot"))
+}
+
+/// Accept a solved dependency plan as a desired-state edit.
+///
+/// Nothing on disk changes: the profile is edited, and the reconciliation that
+/// deploys it is still previewed and applied separately. A plan whose
+/// fingerprint no longer matches is refused with `conflict`.
+#[tauri::command]
+pub async fn apply_dependency_plan(
+    _state: State<'_, AppState>,
+    profile_id: String,
+    expected_fingerprint: Option<String>,
+) -> CommandResult<serde_json::Value> {
+    parse_profile(&profile_id)?;
+    let _ = expected_fingerprint;
+    Err(awaiting("apply_dependency_plan"))
+}
+
+/// Record that the user accepted one named dependency risk.
+///
+/// `fingerprint` is the definition that was displayed, not a fresh one: an
+/// override must stop applying when the provider changes the requirement.
+/// `reason` is required, because ignoring a requirement is always an
+/// attributable decision.
+#[tauri::command]
+pub async fn set_dependency_override(
+    _state: State<'_, AppState>,
+    member_id: String,
+    group_id: String,
+    fingerprint: String,
+    reason: String,
+) -> CommandResult<serde_json::Value> {
+    parse_member(&member_id)?;
+    parse_group(&group_id)?;
+    if fingerprint.trim().is_empty() {
+        return Err(CommandError {
+            code: "decision_required".into(),
+            message: "the fingerprint that was displayed is required".into(),
+        });
+    }
+    if reason.trim().is_empty() {
+        return Err(CommandError {
+            code: "decision_required".into(),
+            message: "a reason is required to ignore a requirement".into(),
+        });
+    }
+    Err(awaiting("set_dependency_override"))
+}
+
+/// Withdraw a previously accepted dependency risk.
+#[tauri::command]
+pub async fn clear_dependency_override(
+    _state: State<'_, AppState>,
+    member_id: String,
+    group_id: String,
+    fingerprint: String,
+) -> CommandResult<()> {
+    parse_member(&member_id)?;
+    parse_group(&group_id)?;
+    let _ = fingerprint;
+    Err(awaiting("clear_dependency_override"))
+}
+
+/// Solve the whole enabled profile for one compatible update set.
+///
+/// "Update all compatible" is one solve of the entire profile, not a newest
+/// version chosen per mod, so it produces one preview and one journaled
+/// operation.
+#[tauri::command]
+pub async fn plan_compatible_updates(
+    _state: State<'_, AppState>,
+    profile_id: String,
+) -> CommandResult<serde_json::Value> {
+    parse_profile(&profile_id)?;
+    Err(awaiting("plan_compatible_updates"))
+}
+
+/// Apply the whole-profile compatible update set that was previewed.
+#[tauri::command]
+pub async fn apply_compatible_updates(
+    _state: State<'_, AppState>,
+    profile_id: String,
+    expected_fingerprint: Option<String>,
+) -> CommandResult<serde_json::Value> {
+    parse_profile(&profile_id)?;
+    let _ = expected_fingerprint;
+    Err(awaiting("apply_compatible_updates"))
 }
 
 /// Preview a profile switch without touching the game directory.
@@ -1089,5 +1234,23 @@ mod tests {
         }
         .into();
         assert_eq!(missing.code, "not_found");
+    }
+
+    #[test]
+    fn dependency_group_ids_are_parsed_not_trusted() {
+        assert!(parse_group(&onera_core::ids::DependencyGroupId::new().to_string()).is_ok());
+        assert_eq!(
+            parse_group("../../etc/passwd").unwrap_err().code,
+            "internal"
+        );
+    }
+
+    #[test]
+    fn an_unwired_dependency_command_refuses_instead_of_answering_emptily() {
+        let refusal = awaiting("dependency_snapshot");
+        assert_eq!(refusal.code, "unimplemented");
+        assert!(refusal.message.contains("dependency_snapshot"));
+        // The refusal must never read as "this mod requires nothing".
+        assert!(!refusal.message.contains("no dependencies"));
     }
 }

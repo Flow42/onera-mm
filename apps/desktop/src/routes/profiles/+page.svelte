@@ -2,6 +2,10 @@
   import { page } from '$app/state';
   import { freshnessCopy } from '$lib/baseline-view';
   import { BridgeError, commands, onProgress } from '$lib/bridge';
+  import DependencyDetail from '$lib/components/DependencyDetail.svelte';
+  import SolvedPlan from '$lib/components/SolvedPlan.svelte';
+  import { editActions, isStalePlan, stalePlanCopy, validateIgnore } from '$lib/dependency-view';
+  import type { DependencyActionId } from '$lib/dependency-view';
   import { formatBytes } from '$lib/plan-view';
   import {
     activationCopy,
@@ -15,7 +19,10 @@
   } from '$lib/profile-view';
   import { fraction, initial, reduce } from '$lib/progress.svelte';
   import type {
+    DependencyGroup,
+    DependencySnapshot,
     LocalGame,
+    PreviewMemberEdit,
     Profile,
     ProfileActivation,
     ProfileActivationPreview,
@@ -46,6 +53,32 @@
   let addModId = $state('');
   let addFileId = $state('');
   let priorityDrafts = $state<Record<string, string>>({});
+
+  /**
+   * A desired-state edit the user has asked for but not committed.
+   *
+   * Nothing is sent to the backend until `commit` runs, so dismissing this
+   * leaves both desired state and the game directory exactly as they were.
+   */
+  let pendingEdit = $state<{
+    label: string;
+    edits: PreviewMemberEdit[];
+    commit: () => Promise<void>;
+  } | null>(null);
+  let pendingPreview = $state<ResolutionResult | null>(null);
+  let pendingUnavailable = $state(false);
+
+  let detail = $state<{ member: ProfileMember; snapshot: DependencySnapshot } | null>(null);
+  let detailNotice = $state<string | null>(null);
+  let ignoreDraft = $state<{
+    memberId: string;
+    groupId: string;
+    fingerprint: string;
+    label: string;
+    reason: string;
+  } | null>(null);
+  let ignoreProblems = $state<string[]>([]);
+  let stalePlan = $state(false);
 
   let activationPreview = $state<ProfileActivationPreview | null>(null);
   let activation = $state<ProfileActivation | null>(null);
@@ -105,6 +138,12 @@
     activation = null;
     dependency = null;
     dependencyUnavailable = false;
+    pendingEdit = null;
+    pendingPreview = null;
+    detail = null;
+    detailNotice = null;
+    ignoreDraft = null;
+    stalePlan = false;
     try {
       const [memberResult, dependencyResult] = await Promise.allSettled([
         commands.profileMembers(profileId),
@@ -233,27 +272,78 @@
     }
   }
 
-  async function addMember() {
-    if (selectedProfile === null || addModId.trim() === '') return;
-    busy = 'Adding member';
+  /**
+   * Check a desired-state edit before it is saved.
+   *
+   * The edit is described to the backend as an uncommitted change, the result
+   * is shown, and only an explicit confirmation commits it. Cancelling has
+   * never called a mutating command at all.
+   */
+  async function previewEdit(
+    label: string,
+    edits: PreviewMemberEdit[],
+    commit: () => Promise<void>,
+  ) {
+    if (selectedProfile === null) return;
+    clearMessages();
+    stalePlan = false;
+    pendingEdit = { label, edits, commit };
+    pendingPreview = null;
+    pendingUnavailable = false;
+    busy = 'Checking dependencies for this change';
+    try {
+      pendingPreview = await commands.resolveDependencies(selectedProfile, edits);
+    } catch (value) {
+      pendingUnavailable = true;
+      showError(value);
+    } finally {
+      busy = null;
+    }
+  }
+
+  /** Abandon an uncommitted edit. No command was sent and none is sent now. */
+  function cancelPendingEdit() {
+    pendingEdit = null;
+    pendingPreview = null;
+    pendingUnavailable = false;
+    notice = 'Change cancelled. Desired state and the game directory are unchanged.';
+  }
+
+  async function confirmPendingEdit() {
+    const pending = pendingEdit;
+    if (pending === null || selectedProfile === null) return;
+    busy = pending.label;
     clearMessages();
     try {
-      const member = await commands.addProfileMember(
-        selectedProfile,
-        addModId.trim(),
-        addFileId.trim() || undefined,
-      );
-      members = sortMembers([...members, member]);
-      priorityDrafts[member.id] = String(member.priority);
-      addModId = '';
-      addFileId = '';
-      notice = 'Member added to desired state. The game directory has not changed.';
+      await pending.commit();
+      pendingEdit = null;
+      pendingPreview = null;
+      pendingUnavailable = false;
       await refreshDependency(selectedProfile);
     } catch (value) {
       showError(value);
     } finally {
       busy = null;
     }
+  }
+
+  function addMember() {
+    if (selectedProfile === null || addModId.trim() === '') return;
+    const profileId = selectedProfile;
+    const modId = addModId.trim();
+    const fileId = addFileId.trim();
+    void previewEdit(
+      'Adding member',
+      [{ kind: 'add', mod_id: modId, provider_file_id: fileId === '' ? null : fileId }],
+      async () => {
+        const member = await commands.addProfileMember(profileId, modId, fileId || undefined);
+        members = sortMembers([...members, member]);
+        priorityDrafts[member.id] = String(member.priority);
+        addModId = '';
+        addFileId = '';
+        notice = 'Member added to desired state. The game directory has not changed.';
+      },
+    );
   }
 
   async function removeMember(member: ProfileMember) {
@@ -272,37 +362,30 @@
     }
   }
 
-  async function toggleState(member: ProfileMember) {
-    busy = member.desired === 'enabled' ? 'Disabling member' : 'Enabling member';
-    clearMessages();
-    try {
-      setMember(
-        await commands.setMemberState(
-          member.id,
-          member.desired === 'enabled' ? 'disabled' : 'enabled',
-        ),
-      );
-      notice = 'Desired state updated. Activate the profile to change files.';
-      if (selectedProfile !== null) await refreshDependency(selectedProfile);
-    } catch (value) {
-      showError(value);
-    } finally {
-      busy = null;
-    }
+  function toggleState(member: ProfileMember) {
+    const desired = member.desired === 'enabled' ? 'disabled' : 'enabled';
+    void previewEdit(
+      desired === 'disabled' ? 'Disabling member' : 'Enabling member',
+      [{ kind: 'set_state', profile_member_id: member.id, desired }],
+      async () => {
+        setMember(await commands.setMemberState(member.id, desired));
+        notice = 'Desired state updated. Activate the profile to change files.';
+      },
+    );
   }
 
-  async function togglePin(member: ProfileMember) {
-    busy = member.pin.kind === 'pinned' ? 'Unpinning member' : 'Pinning member';
-    clearMessages();
-    try {
-      setMember(await commands.setMemberPin(member.id, member.pin.kind !== 'pinned'));
-      notice = member.pin.kind === 'pinned' ? 'Member unpinned.' : 'Member version pinned.';
-      if (selectedProfile !== null) await refreshDependency(selectedProfile);
-    } catch (value) {
-      showError(value);
-    } finally {
-      busy = null;
-    }
+  function togglePin(member: ProfileMember) {
+    const pinned = member.pin.kind !== 'pinned';
+    void previewEdit(
+      pinned ? 'Pinning member' : 'Unpinning member',
+      [{ kind: 'set_pin', profile_member_id: member.id, pinned }],
+      async () => {
+        setMember(await commands.setMemberPin(member.id, pinned));
+        notice = pinned
+          ? 'Member version pinned. A pinned member never changes version.'
+          : 'Member unpinned. The solver may now change its version.';
+      },
+    );
   }
 
   async function savePriority(member: ProfileMember) {
@@ -321,6 +404,151 @@
       showError(value);
     } finally {
       busy = null;
+    }
+  }
+
+  /** Look up one member's declared requirements for the detail panel. */
+  async function showDetail(member: ProfileMember) {
+    clearMessages();
+    detailNotice = null;
+    ignoreDraft = null;
+    if (member.selection.provider_file_id === null) {
+      detail = null;
+      detailNotice =
+        'This member names no provider file yet, so there is no dependency definition to look up. That is not the same as requiring nothing.';
+      return;
+    }
+    busy = 'Loading dependency details';
+    try {
+      detail = {
+        member,
+        snapshot: await commands.dependencySnapshot(
+          member.mod_id,
+          member.selection.provider_file_id,
+        ),
+      };
+    } catch (value) {
+      detail = null;
+      detailNotice =
+        'The dependency definition could not be loaded. This does not mean the mod requires nothing.';
+      showError(value);
+    } finally {
+      busy = null;
+    }
+  }
+
+  function beginIgnore(group: DependencyGroup, fingerprint: string) {
+    if (detail === null) return;
+    ignoreProblems = [];
+    ignoreDraft = {
+      memberId: detail.member.id,
+      groupId: group.id,
+      fingerprint,
+      label: group.label ?? `requirement ${group.id}`,
+      reason: '',
+    };
+  }
+
+  async function saveIgnore() {
+    const draft = ignoreDraft;
+    if (draft === null || selectedProfile === null) return;
+    const validated = validateIgnore(draft);
+    if (!validated.ok) {
+      ignoreProblems = validated.problems;
+      return;
+    }
+    busy = 'Recording accepted risk';
+    clearMessages();
+    try {
+      await commands.setDependencyOverride(
+        validated.request.memberId,
+        validated.request.groupId,
+        validated.request.fingerprint,
+        validated.request.reason,
+      );
+      ignoreDraft = null;
+      ignoreProblems = [];
+      notice = `Risk accepted for ${draft.label}. It applies only to the definition whose fingerprint was shown.`;
+      await refreshDependency(selectedProfile);
+    } catch (value) {
+      showError(value);
+    } finally {
+      busy = null;
+    }
+  }
+
+  async function clearIgnore(group: DependencyGroup, fingerprint: string) {
+    if (detail === null || selectedProfile === null) return;
+    busy = 'Clearing accepted risk';
+    clearMessages();
+    try {
+      await commands.clearDependencyOverride(detail.member.id, group.id, fingerprint);
+      notice = 'Accepted risk withdrawn. The requirement applies again.';
+      await refreshDependency(selectedProfile);
+    } catch (value) {
+      showError(value);
+    } finally {
+      busy = null;
+    }
+  }
+
+  /** Accept a solved plan as a desired-state edit; nothing is written to disk. */
+  async function applySolvedPlan() {
+    if (selectedProfile === null || dependency === null) return;
+    busy = 'Applying the solved plan';
+    clearMessages();
+    stalePlan = false;
+    try {
+      const applied = await commands.applyDependencyPlan(
+        selectedProfile,
+        dependency.fingerprint ?? null,
+      );
+      members = sortMembers(applied.members);
+      priorityDrafts = Object.fromEntries(
+        members.map((member) => [member.id, String(member.priority)]),
+      );
+      dependency = applied.dependency;
+      dependencyUnavailable = false;
+      activationPreview = null;
+      notice = 'Desired state updated to the solved set. Preview activation to change files.';
+    } catch (value) {
+      if (value instanceof BridgeError && isStalePlan(value.code)) {
+        stalePlan = true;
+        await refreshDependency(selectedProfile);
+      } else {
+        showError(value);
+      }
+    } finally {
+      busy = null;
+    }
+  }
+
+  /** Route one dependency action. Only solved variants reach an apply. */
+  function handleDependencyAction(action: DependencyActionId) {
+    switch (action) {
+      case 'install_missing':
+      case 'apply_update_set':
+      case 'apply_disable_set':
+        void applySolvedPlan();
+        break;
+      case 'change_pins':
+        notice =
+          'Change a pin in the Pin column above. Each change is re-checked before it is saved.';
+        break;
+      case 'ignore_requirement':
+        notice =
+          'Open Details for the affected member. A requirement can only be ignored where its fingerprint is displayed.';
+        break;
+      case 'replan':
+        stalePlan = false;
+        if (selectedProfile !== null) void refreshDependency(selectedProfile);
+        break;
+      case 'save_edit':
+        void confirmPendingEdit();
+        break;
+      case 'cancel':
+        cancelPendingEdit();
+        break;
     }
   }
 
@@ -635,17 +863,127 @@
                     </div>
                   </td>
                   <td>
-                    <button
-                      class="danger"
-                      onclick={() => removeMember(member)}
-                      disabled={busy !== null}>Remove</button
-                    >
+                    <div class="row-actions">
+                      <button
+                        aria-label={`Details for ${member.selection.provider_mod_id}`}
+                        onclick={() => showDetail(member)}
+                        disabled={busy !== null}>Details</button
+                      >
+                      <button
+                        class="danger"
+                        onclick={() => removeMember(member)}
+                        disabled={busy !== null}>Remove</button
+                      >
+                    </div>
                   </td>
                 </tr>
               {/each}
             </tbody>
           </table>
         </div>
+      {/if}
+    </section>
+  {/if}
+
+  {#if pendingEdit !== null}
+    <section aria-labelledby="pending-heading" data-testid="pending-edit">
+      <h2 id="pending-heading">Before this change is saved</h2>
+      <p class="muted">
+        {pendingEdit.label} has not been saved. Onera checked what it would mean first; nothing in desired
+        state or on disk has changed yet.
+      </p>
+      {#if pendingUnavailable}
+        <p class="severity-warning" role="status">
+          The dependency check for this change could not be run. That is not the same as the change
+          being safe.
+        </p>
+        <div class="actions">
+          <button class="primary" onclick={confirmPendingEdit} disabled={busy !== null}
+            >Save this change anyway</button
+          >
+          <button onclick={cancelPendingEdit}>Cancel</button>
+        </div>
+      {:else if pendingPreview !== null}
+        <SolvedPlan
+          heading="Dependency impact of this change"
+          result={pendingPreview}
+          {members}
+          busy={busy !== null}
+          actions={editActions(pendingPreview)}
+          onAction={handleDependencyAction}
+          testId="pending-plan"
+        />
+      {/if}
+    </section>
+  {/if}
+
+  {#if stalePlan}
+    {@const copy = stalePlanCopy()}
+    <p class={`severity-${copy.severity}`} role="status" data-testid="stale-plan">
+      <strong>{copy.label}</strong> — {copy.detail}
+    </p>
+  {/if}
+
+  {#if currentProfile !== null && dependency !== null && pendingEdit === null}
+    <SolvedPlan
+      heading="Dependency check for this profile"
+      result={dependency}
+      {members}
+      busy={busy !== null}
+      onAction={handleDependencyAction}
+      testId="profile-plan"
+    />
+  {/if}
+
+  {#if detailNotice !== null}
+    <p class="severity-warning" role="status" data-testid="detail-notice">{detailNotice}</p>
+  {/if}
+
+  {#if detail !== null}
+    <section aria-labelledby="detail-heading">
+      <div class="section-heading">
+        <h2 id="detail-heading">
+          {detail.member.selection.provider}:{detail.member.selection.provider_mod_id} requirements
+        </h2>
+        <button onclick={() => (detail = null)}>Close details</button>
+      </div>
+      <DependencyDetail
+        snapshot={detail.snapshot}
+        gameSlug={detail.snapshot.source.game_slug}
+        busy={busy !== null}
+        onIgnore={beginIgnore}
+        onClearIgnore={clearIgnore}
+      />
+      {#if ignoreDraft !== null}
+        <form
+          class="panel ignore-form"
+          data-testid="ignore-form"
+          onsubmit={(event) => {
+            event.preventDefault();
+            void saveIgnore();
+          }}
+        >
+          <h3>Ignore “{ignoreDraft.label}”</h3>
+          <p class="muted">
+            This records that you accepted one named risk against the definition fingerprinted
+            <code>{ignoreDraft.fingerprint}</code>. It does not pick a winner for any file conflict,
+            and it stops applying if the provider changes the requirement.
+          </p>
+          <label>
+            Reason
+            <input
+              aria-label="Reason for ignoring this requirement"
+              bind:value={ignoreDraft.reason}
+            />
+          </label>
+          {#each ignoreProblems as problem (problem)}
+            <p class="severity-danger">{problem}</p>
+          {/each}
+          <div class="actions">
+            <button class="danger" type="submit" disabled={busy !== null}>Accept this risk</button>
+            <button type="button" onclick={() => (ignoreDraft = null)}>Cancel</button>
+          </div>
+        </form>
       {/if}
     </section>
   {/if}
@@ -893,6 +1231,16 @@
   }
   .empty-state {
     text-align: center;
+  }
+  .row-actions,
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+  .ignore-form label {
+    display: grid;
+    gap: 0.25rem;
   }
   .activation-result {
     border-color: currentColor;

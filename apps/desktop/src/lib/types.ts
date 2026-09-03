@@ -352,16 +352,25 @@ export interface ProfileMember {
   added_at: string;
 }
 
-export interface DependencyProblem {
-  source: {
-    provider: string;
-    game_slug: string;
-    provider_mod_id: string;
-    provider_file_id: string | null;
-    provider_version_id: string | null;
-  };
+/**
+ * The provider version whose definition stated a requirement.
+ *
+ * `game_slug` and `provider_mod_id` may be empty strings. That is a real value
+ * meaning "the provider did not say", never a game name and never this game.
+ */
+export interface DependencySource {
+  provider: string;
+  game_slug: string;
+  provider_mod_id: string;
+  provider_file_id: string | null;
+  provider_version_id: string | null;
+}
+
+/** Why one requirement could not be satisfied. `label` may be absent. */
+export interface UnsatisfiedRequirement {
+  source: DependencySource;
   group_id: string;
-  label: string;
+  label: string | null;
   explanation: string;
 }
 
@@ -371,19 +380,46 @@ export type DependencyHealthKind =
 export interface MemberDependencyHealth {
   profile_member_id: string;
   health: DependencyHealthKind;
-  unsatisfied: DependencyProblem[];
+  unsatisfied: UnsatisfiedRequirement[];
 }
 
+/**
+ * One version the solver chose.
+ *
+ * `change` and `reason` are advisory disclosure the solver may attach so the
+ * confirmation view can say *why* a mod is being downgraded or installed. Both
+ * are optional: when the backend does not supply them the view says "version
+ * change" rather than guessing a direction, because `position` is opaque and
+ * version strings are never compared.
+ */
+export interface SelectedVersion {
+  provider: string;
+  provider_mod_id: string;
+  provider_file_id: string;
+  provider_version_id: string | null;
+  provider_file_group_id: string | null;
+  profile_member_id: string | null;
+  change?: string | null;
+  reason?: string | null;
+  display_name?: string | null;
+}
+
+/**
+ * What the solver concluded.
+ *
+ * Only `install_missing`, `update_set` and `disable_set` carry a plan the user
+ * can accept. `unknown` is a first-class answer, not an empty one.
+ */
 export type DependencyOutcome =
   | { kind: 'compatible' }
-  | { kind: 'unsatisfied' }
-  | { kind: 'unknown'; reason?: string }
-  | {
-      kind: 'install_missing' | 'update_set' | 'disable_set';
-      select?: Array<Record<string, string | null>>;
-      install?: Array<Record<string, string | null>>;
-      disable?: string[];
-    };
+  | { kind: 'install_missing'; install: SelectedVersion[] }
+  | { kind: 'update_set'; select: SelectedVersion[]; install: SelectedVersion[] }
+  | { kind: 'disable_set'; disable: string[] }
+  | { kind: 'unsatisfied'; requirements: UnsatisfiedRequirement[] }
+  | { kind: 'unknown'; reason: string }
+  // An outcome this build does not recognise. Rendered as undecidable, never
+  // as compatible, and never as an offered action.
+  | { kind: string };
 
 export interface DependencyEvidence {
   fresh: number;
@@ -394,10 +430,121 @@ export interface DependencyEvidence {
   unknown_dlc: number;
 }
 
+/**
+ * A solver result and the evidence it rests on.
+ *
+ * `fingerprint` is advisory: when the backend digests the proposal it is sent
+ * back as `expectedFingerprint` so a stale plan is refused with `conflict`
+ * instead of applying something the user never saw. Omitting it applies
+ * whatever is current, exactly like `plan_profile_activation`.
+ */
 export interface ResolutionResult {
   outcome: DependencyOutcome;
   health: MemberDependencyHealth[];
   evidence: DependencyEvidence;
+  fingerprint?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Dependency snapshot detail
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether a snapshot's contents can be believed, and how much.
+ *
+ * Only `fetched` and `cached` make an empty `groups` array mean "this mod
+ * requires nothing".
+ */
+export type DependencyAvailability =
+  | { kind: 'fetched' }
+  | { kind: 'cached'; fetched_at: string; stale: boolean }
+  | { kind: 'unsupported' }
+  | { kind: 'unavailable'; reason: string };
+
+/** Whether a candidate can be selected. Only `available` is selectable. */
+export type CandidateStatus = 'available' | 'hidden' | 'removed' | 'unknown';
+
+/** How strongly a requirement is stated. `recommended` never blocks. */
+export type RequirementKind = 'required' | 'recommended' | 'incompatible';
+
+/**
+ * A concrete artifact that could satisfy a requirement.
+ *
+ * `position` is an opaque ordering key scaled by the adapter. It orders
+ * candidates only against others in the same `provider_file_group_id` and is
+ * **never displayed**. `null` means the provider gave no position, so the
+ * candidate cannot be called newest or oldest.
+ */
+export interface DependencyCandidate {
+  provider: string;
+  game_slug: string;
+  provider_mod_id: string;
+  provider_file_id: string | null;
+  provider_version_id: string | null;
+  provider_file_group_id: string | null;
+  position: number | null;
+  status: CandidateStatus | string;
+  display_name: string | null;
+}
+
+/** Groups are ANDed; the candidates inside one are ORed. */
+export interface DependencyGroup {
+  id: string;
+  provider_group_key: string | null;
+  label: string | null;
+  kind: RequirementKind | string;
+  candidates: DependencyCandidate[];
+}
+
+/** Whether the user owns a store extra. `unknown` is never owned. */
+export type DlcOwnership = 'owned' | 'not_owned' | 'unknown';
+
+/**
+ * A store-owned extra a mod requires.
+ *
+ * `ownership` is optional disclosure: when the backend can answer, the detail
+ * view distinguishes a known-missing DLC from unknown ownership. When it is
+ * absent the view says ownership was not reported rather than assuming.
+ */
+export interface DlcRequirement {
+  id: string;
+  label: string | null;
+  alternatives: string[];
+  ownership?: DlcOwnership | string | null;
+}
+
+/** The raw requirement list behind one provider file. `raw` is never sent. */
+export interface DependencySnapshot {
+  id: string;
+  source: DependencySource;
+  availability: DependencyAvailability;
+  groups: DependencyGroup[];
+  dlc: DlcRequirement[];
+  provider_revision: string | null;
+  fingerprint: string;
+  fetched_at: string;
+}
+
+/** A recorded, attributable acceptance of one named risk. */
+export interface DependencyOverride {
+  profile_member_id: string;
+  fingerprint: string;
+  group_id: string;
+  reason: string;
+  created_at: string;
+}
+
+/** An uncommitted desired-state edit, checked before it is saved. */
+export type PreviewMemberEdit =
+  | { kind: 'add'; mod_id: string; provider_file_id: string | null }
+  | { kind: 'set_state'; profile_member_id: string; desired: 'enabled' | 'disabled' }
+  | { kind: 'set_pin'; profile_member_id: string; pinned: boolean };
+
+/** The desired state after a solved plan was accepted, plus a fresh solve. */
+export interface AppliedDependencyPlan {
+  profile_id: string;
+  members: ProfileMember[];
+  dependency: ResolutionResult;
 }
 
 /** Adapter-root-relative path. Blocker targets are already formatted strings. */
@@ -471,6 +618,39 @@ export interface ProfileActivation {
   to_profile_id: string;
   operation_id: string | null;
   state: ProfileActivationState;
+  started_at: string;
+  finished_at: string | null;
+  error: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Compatible updates
+// ---------------------------------------------------------------------------
+
+/**
+ * One whole-profile compatible-update preview.
+ *
+ * "Update all compatible" solves the entire enabled profile at once. It is not
+ * a list of independently newest versions, so there is no per-mod acceptance:
+ * the user approves this one result or none of it.
+ */
+export interface CompatibleUpdatePreview {
+  profile_id: string;
+  dependency: ResolutionResult;
+  plan: MutationPlan;
+  downloads: ActivationDownload[];
+  bytes_to_write: number;
+  ready: boolean;
+  blockers: ActivationBlocker[];
+  fingerprint: string;
+}
+
+/** The journaled result of applying one whole-profile compatible update. */
+export interface CompatibleUpdateReport {
+  profile_id: string;
+  operation_id: string | null;
+  state: ProfileActivationState;
+  selected: SelectedVersion[];
   started_at: string;
   finished_at: string | null;
   error: string | null;
