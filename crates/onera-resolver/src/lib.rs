@@ -18,7 +18,7 @@
 //! 4. candidates must target the same game and be selectable
 //!    ([`DependencyCandidate::is_selectable_for`]);
 //! 5. DLC that is known to be missing is never treated as satisfied, and DLC
-//!    whose ownership is unknown produces [`ResolutionOutcome::Unknown`] rather
+//!    whose ownership is unknown produces [`ResolutionOutcome::Unknown`](onera_core::domain::dependency::ResolutionOutcome::Unknown) rather
 //!    than an assumption.
 //!
 //! Preference order, applied in sequence:
@@ -196,7 +196,7 @@ impl ResolutionRequest {
 ///
 /// The bounded depth-first search keeps an explicit visited-assignment set and
 /// normalizes all set-like inputs before examining them. Inputs beyond its
-/// documented bounds return [`ResolutionOutcome::Unknown`] instead of producing
+/// documented bounds return [`ResolutionOutcome::Unknown`](onera_core::domain::dependency::ResolutionOutcome::Unknown) instead of producing
 /// a partial or timing-dependent answer.
 #[must_use]
 pub fn solve(request: &ResolutionRequest) -> ResolutionResult {

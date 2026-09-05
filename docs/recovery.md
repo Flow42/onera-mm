@@ -61,7 +61,17 @@ disk state disagree and further automatic writes could make it worse.
 
 **Database failure mid-operation.** The filesystem effect that was being recorded
 did not happen (journal precedes effect), so the next launch sees an earlier
-state and can roll back from it.
+state and can roll back from it. `crates/onera-install/tests/database_faults.rs`
+injects a failure at each journal transition and asserts it: nothing from a
+failed operation is left in the game directory, and a rollback that cannot
+record itself is reported rather than assumed, leaving the operation open for
+the next launch to finish.
+
+**Losing the database entirely.** Not a recovery case — nothing is deployed
+twice and nothing is deleted, but Onera no longer knows what it installed, and
+its files become unknown extras. See
+[`database-maintenance.md`](database-maintenance.md) for backup, restore, and
+what to do when there is no backup.
 
 **A user deleting files behind Onera's back.** Removal reports them as
 `already_missing` and carries on. Verification reports them as `Missing`.

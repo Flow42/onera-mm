@@ -74,6 +74,13 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
         working-directory: apps/desktop/src-tauri
 
+      # The compiled smoke suite: every command is registered, and the
+      # application's own start-up path works. Needs the libraries above, which
+      # is why it lives in this job rather than the workspace one.
+      - name: Tests
+        run: cargo test
+        working-directory: apps/desktop/src-tauri
+
   frontend:
     name: Frontend and extension
     runs-on: ubuntu-latest

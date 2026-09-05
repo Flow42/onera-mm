@@ -22,14 +22,14 @@ core: the client only ever asks for a `Credential`.
 
 ## Endpoints Onera uses from v3
 
-| Purpose                     | Endpoint                                                    | Stability per the spec |
-| --------------------------- | ----------------------------------------------------------- | ---------------------- |
-| Mod metadata                | `GET /games/{game_domain}/mods/{game_scoped_id}`            | Experimental           |
-| A mod's file slots          | `GET /mods/{id}/files`                                      | Experimental           |
-| Versions of a file slot     | `GET /mod-files/{id}/versions`                              | Experimental           |
-| Declared dependencies       | `GET /mod-file-versions/{id}/dependencies`                  | Experimental           |
-| Resolved candidates (batch) | `POST /mod-file-versions/dependencies/ranges/materialized/batch` | Experimental      |
-| Candidate identities        | `POST /mod-file-versions/batch`                             | Experimental           |
+| Purpose                     | Endpoint                                                         | Stability per the spec |
+| --------------------------- | ---------------------------------------------------------------- | ---------------------- |
+| Mod metadata                | `GET /games/{game_domain}/mods/{game_scoped_id}`                 | Experimental           |
+| A mod's file slots          | `GET /mods/{id}/files`                                           | Experimental           |
+| Versions of a file slot     | `GET /mod-files/{id}/versions`                                   | Experimental           |
+| Declared dependencies       | `GET /mod-file-versions/{id}/dependencies`                       | Experimental           |
+| Resolved candidates (batch) | `POST /mod-file-versions/dependencies/ranges/materialized/batch` | Experimental           |
+| Candidate identities        | `POST /mod-file-versions/batch`                                  | Experimental           |
 
 Several of these are marked **Experimental** by Nexus, meaning they may change
 significantly or be removed. Onera's wire types are correspondingly defensive:
@@ -83,11 +83,11 @@ guessing.
 Three endpoints, because no one of them can answer the question honestly on its
 own. `crates/onera-nexus/src/dependencies.rs` is the only place that knows this.
 
-| Endpoint | What it is authoritative about |
-| --- | --- |
-| `GET /mod-file-versions/{id}/dependencies` | whether a version declares anything at all |
+| Endpoint                                        | What it is authoritative about                          |
+| ----------------------------------------------- | ------------------------------------------------------- |
+| `GET /mod-file-versions/{id}/dependencies`      | whether a version declares anything at all              |
 | `POST …/dependencies/ranges/materialized/batch` | which concrete versions currently satisfy a declaration |
-| `POST /mod-file-versions/batch` | display identity (name, version) of a candidate |
+| `POST /mod-file-versions/batch`                 | display identity (name, version) of a candidate         |
 
 **The deprecated twin is not used.** `POST
 /mod-file-versions/dependencies/materialized/batch` takes the same request and
@@ -97,19 +97,19 @@ returns the same rows but is marked deprecated; Onera calls
 ### Why the raw endpoint is asked at all
 
 **Assumption:** the specification says a source version with no resolvable
-candidates *contributes no rows* to the batch response. A missing row therefore
+candidates _contributes no rows_ to the batch response. A missing row therefore
 means "declared nothing", "declared something unresolvable", or "the resolver
 had nothing to say" — three states Onera must keep apart, because collapsing
 them turns an unsatisfiable profile into an apparently compatible one.
 
 So the raw declaration is fetched per source first, and it decides:
 
-| Nexus said | Onera reports |
-| --- | --- |
-| both definition arrays empty | `Fetched`, no groups; `declares_no_dependencies()` is true |
+| Nexus said                                 | Onera reports                                              |
+| ------------------------------------------ | ---------------------------------------------------------- |
+| both definition arrays empty               | `Fetched`, no groups; `declares_no_dependencies()` is true |
 | definitions, but no candidate rows for one | a group with **no candidates** — visible and unsatisfiable |
-| the declaration call failed | `Unavailable` with the provider's reason |
-| the batch call failed for the chunk | `Unavailable` for every source in that chunk |
+| the declaration call failed                | `Unavailable` with the provider's reason                   |
+| the batch call failed for the chunk        | `Unavailable` for every source in that chunk               |
 
 An empty `groups` list is never used to mean "we do not know". Only sources that
 declared at least one version-range definition are sent to the batch endpoint; a
@@ -124,14 +124,14 @@ of health it did not receive.
 `DependencyLimits` in `crates/onera-nexus/src/client.rs` holds them; the defaults
 are the documented request caps.
 
-| Bound | Default | Why |
-| --- | --- | --- |
-| Source ids per batch request | 5000 | the specification's `maxItems` |
-| Version ids per detail request | 2000 | the specification's `maxItems` |
-| Candidate rows per page | 1000 | the specification's default `page_size` |
-| Pages per chunk | 64 | a server that always says "one more page" must not loop forever |
-| Rows per chunk | 100 000 | a server must not be able to make Onera allocate without limit |
-| Response body | 16 MiB | enforced while streaming, before any parser sees the bytes |
+| Bound                          | Default | Why                                                             |
+| ------------------------------ | ------- | --------------------------------------------------------------- |
+| Source ids per batch request   | 5000    | the specification's `maxItems`                                  |
+| Version ids per detail request | 2000    | the specification's `maxItems`                                  |
+| Candidate rows per page        | 1000    | the specification's default `page_size`                         |
+| Pages per chunk                | 64      | a server that always says "one more page" must not loop forever |
+| Rows per chunk                 | 100 000 | a server must not be able to make Onera allocate without limit  |
+| Response body                  | 16 MiB  | enforced while streaming, before any parser sees the bytes      |
 
 Exceeding a bound produces `Unavailable` for the affected sources rather than a
 truncated candidate list, because a truncated list silently turns a satisfiable
@@ -147,19 +147,19 @@ rather than continuing hopefully.
 Four Nexus identifiers stay distinct, because collapsing any two of them selects
 the wrong artifact:
 
-| Nexus | Onera |
-| --- | --- |
-| `version_id` (mod file version) | `provider_version_id`, and `provider_file_id` — the same id, kept in separate fields so a provider where they differ needs no core change |
-| `mod_file_id` (update group/chain) | `provider_file_group_id` |
-| `source_version_id` | `DependencySource::provider_version_id` |
-| `position` (decimal string) | `DependencyCandidate::position` |
+| Nexus                              | Onera                                                                                                                                     |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `version_id` (mod file version)    | `provider_version_id`, and `provider_file_id` — the same id, kept in separate fields so a provider where they differ needs no core change |
+| `mod_file_id` (update group/chain) | `provider_file_group_id`                                                                                                                  |
+| `source_version_id`                | `DependencySource::provider_version_id`                                                                                                   |
+| `position` (decimal string)        | `DependencyCandidate::position`                                                                                                           |
 
 **Assumption:** `position` is a decimal string (`"3"`, `"3.5"`) so a version can
-be inserted between two others, and higher means newer *within one chain*. Onera
+be inserted between two others, and higher means newer _within one chain_. Onera
 scales it by a million into the domain's `i64`, which preserves ordering; a
 position that is not a plain decimal — an exponent, a NaN, whitespace, 4 KB of
 digits — becomes `None`, and an unordered candidate is honestly unordered rather
-than guessed at. Nothing anywhere parses the version *string*.
+than guessed at. Nothing anywhere parses the version _string_.
 
 **Assumption:** the batch rows identify a candidate's mod by a composite id and
 say nothing about its game. The raw definitions name both, keyed by the same
@@ -172,14 +172,14 @@ from. A candidate whose game cannot be established keeps an empty slug and
 `mod_status` and the file `category` both have to agree before a candidate is
 selectable:
 
-| Nexus | Onera |
-| --- | --- |
-| `published` + a live category | `Available` |
-| `published` + `removed` category | `Removed` |
-| `published` + `archived` category | `Hidden` |
-| `hidden`, `not_published`, `under_moderation` | `Hidden` |
-| `removed`, `removed_by_staff` | `Removed` |
-| anything this build does not recognise | `Unknown` — never selectable |
+| Nexus                                         | Onera                        |
+| --------------------------------------------- | ---------------------------- |
+| `published` + a live category                 | `Available`                  |
+| `published` + `removed` category              | `Removed`                    |
+| `published` + `archived` category             | `Hidden`                     |
+| `hidden`, `not_published`, `under_moderation` | `Hidden`                     |
+| `removed`, `removed_by_staff`                 | `Removed`                    |
+| anything this build does not recognise        | `Unknown` — never selectable |
 
 **Assumption: Nexus states no requirement strength.** Every declared dependency
 maps to `RequirementKind::Required`. Onera does not invent a `Recommended` or

@@ -379,6 +379,112 @@ async fn a_failed_rename_rolls_back_every_file_and_database_change() {
     assert!(world.db.interrupted().await.unwrap().is_empty());
 }
 
+/// A reconciliation spanning two mods must roll back as one thing.
+///
+/// The multi-file rollback above uses a single installation, so it cannot catch
+/// the failure that matters most here: one mod's files committed and its
+/// installation activated while the other's were undone. A profile switch is
+/// exactly this shape, and a half-applied one leaves a game the user cannot
+/// reason about — some of profile B deployed, the rest of profile A gone.
+#[tokio::test]
+async fn a_failed_rename_rolls_back_every_mod_not_just_the_failing_one() {
+    let world = World::new().await;
+    let (other_mod, other_release) = world.another_mod("2").await;
+    let a = InstallationId::new();
+    let b = InstallationId::new();
+    for (installation, mod_id, release) in [
+        (a, world.mod_id, world.release),
+        (b, other_mod, other_release),
+    ] {
+        world
+            .db
+            .record_installation(
+                installation,
+                world.local_game,
+                mod_id,
+                release,
+                world.archive,
+            )
+            .await
+            .unwrap();
+        world
+            .db
+            .deactivate_installation(installation)
+            .await
+            .unwrap();
+    }
+
+    // Two files from one mod and one from the other, so the injected failure
+    // can land after a file of each has already been committed.
+    let (a_dir, _) = world.stage("multi-a", &[("a1.bin", b"a1"), ("a2.bin", b"a2")]);
+    let (b_dir, _) = world.stage("multi-b", &[("b.bin", b"b")]);
+    let mappings = vec![
+        InstallationMapping {
+            installation_id: a,
+            source: onera_core::RelPath::normalize("a1.bin").unwrap(),
+            target: target("a1.bin"),
+            source_hash: FileHash::blake3_of(b"a1"),
+            source_size: 2,
+        },
+        InstallationMapping {
+            installation_id: a,
+            source: onera_core::RelPath::normalize("a2.bin").unwrap(),
+            target: target("a2.bin"),
+            source_hash: FileHash::blake3_of(b"a2"),
+            source_size: 2,
+        },
+        InstallationMapping {
+            installation_id: b,
+            source: onera_core::RelPath::normalize("b.bin").unwrap(),
+            target: target("b.bin"),
+            source_hash: FileHash::blake3_of(b"b"),
+            source_size: 1,
+        },
+    ];
+    let plan = reconcile(
+        DesiredGameState::new(world.local_game, vec![a, b]),
+        &BTreeMap::new(),
+        &mappings,
+    );
+
+    // Fail partway through the commit loop, so at least one file is already
+    // renamed into place when the operation dies.
+    let error = engine_with(&world, Arc::new(FaultyFileSystem::new(FailAt::Rename(1))))
+        .apply(
+            &plan,
+            &mappings,
+            &BTreeMap::from([(a, a_dir), (b, b_dir)]),
+            &world.roots,
+            &NullProgress,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("injected rename failure"));
+
+    // Neither mod is left partly deployed — including the mod whose file was
+    // committed before the failure.
+    for path in ["a1.bin", "a2.bin", "b.bin"] {
+        assert!(
+            !world.game_file_exists(path),
+            "{path} survived a rolled-back reconciliation"
+        );
+    }
+
+    // And neither is left partly activated: an installation active without its
+    // files is the state every later plan would be computed from.
+    assert!(
+        world
+            .db
+            .active_installations(world.local_game)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a mod was activated by a rolled-back reconciliation"
+    );
+    assert!(world.db.interrupted().await.unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn a_staging_failure_removes_earlier_temporary_files() {
     let world = World::new().await;

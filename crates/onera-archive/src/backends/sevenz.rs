@@ -55,9 +55,10 @@ fn missing_tool() -> CoreError {
 fn parse_listing(
     stdout: &str,
     validator: &mut Validator,
-) -> Result<(Vec<ArchiveEntry>, Vec<RejectedEntry>)> {
+) -> Result<(Vec<ArchiveEntry>, Vec<RejectedEntry>, ExecutableModes)> {
     let mut entries = Vec::new();
     let mut rejected = Vec::new();
+    let mut executable = ExecutableModes::new();
 
     // Records start after the `----------` separator line.
     let body = stdout
@@ -79,7 +80,13 @@ fn parse_listing(
                 "Size" => size = value.trim().parse().unwrap_or(0),
                 "Packed Size" => packed = value.trim().parse().ok(),
                 "Attributes" => attributes = value.trim().to_owned(),
-                "Symbolic Link" => symlink_target = Some(value.to_owned()),
+                // 7-Zip prints this key for *every* entry of a RAR archive and
+                // leaves it blank when there is no link. An empty value is
+                // "not a symlink", not "a symlink to nowhere" — treating it as
+                // the latter rejected every entry of every RAR.
+                "Symbolic Link" if !value.trim().is_empty() => {
+                    symlink_target = Some(value.to_owned());
+                }
                 _ => {}
             }
         }
@@ -89,19 +96,59 @@ fn parse_listing(
         // symlink, which 7-Zip also reports via `Symbolic Link`.
         let kind = if attributes.starts_with('D') {
             EntryKind::Directory
-        } else if symlink_target.is_some() || attributes.contains("l") && attributes.len() > 5 {
+        } else if symlink_target.is_some() || is_unix_symlink_mode(&attributes) {
             EntryKind::Symlink
         } else {
             EntryKind::File
         };
 
         match validator.accept(&path, kind, size, packed, symlink_target)? {
-            Outcome::Accept(e) => entries.push(*e),
+            Outcome::Accept(e) => {
+                if is_unix_executable_mode(&attributes) {
+                    executable.insert(e.path.clone());
+                }
+                entries.push(*e);
+            }
             Outcome::Skip(r) => rejected.push(r),
         }
     }
 
-    Ok((entries, rejected))
+    Ok((entries, rejected, executable))
+}
+
+/// Paths the archive declared executable.
+///
+/// 7-Zip does not restore unix permissions on extraction, so the mode has to be
+/// carried over from the listing. The zip and tar backends likewise take the
+/// bit from what the archive declared rather than from disk.
+type ExecutableModes = std::collections::HashSet<RelPath>;
+
+/// The `ls -l` mode field inside a 7-Zip attribute string, if there is one.
+///
+/// 7-Zip renders unix permissions as a trailing ten-character mode, so an
+/// attribute string looks like `A_ -rwxr-xr-x` or, for RAR, ` -rw-r--r--`.
+fn unix_mode_field(attributes: &str) -> Option<&str> {
+    attributes
+        .split_whitespace()
+        .find(|field| field.len() == 10 && field.is_ascii())
+}
+
+/// Whether a 7-Zip attribute string marks the entry executable by anyone.
+fn is_unix_executable_mode(attributes: &str) -> bool {
+    unix_mode_field(attributes).is_some_and(|mode| {
+        // Owner, group and other execute bits sit at 3, 6 and 9.
+        [3, 6, 9].iter().any(|&i| mode.as_bytes()[i] == b'x')
+    })
+}
+
+/// Whether a 7-Zip attribute string describes a unix symbolic link.
+///
+/// 7-Zip renders unix permissions as a trailing `ls -l` mode string, so a link
+/// shows up as `lrwxrwxrwx`. RAR archives written by `rar` on unix carry the
+/// mode but not always a `Symbolic Link` value, so this is a second signal
+/// rather than a fallback.
+fn is_unix_symlink_mode(attributes: &str) -> bool {
+    unix_mode_field(attributes).is_some_and(|mode| mode.starts_with('l'))
 }
 
 /// List an archive's contents with the external tool.
@@ -111,6 +158,19 @@ pub(crate) async fn inspect(
     format: ArchiveFormat,
     validator: &mut Validator,
 ) -> Result<ArchiveInspection> {
+    inspect_with_modes(binary, path, format, validator)
+        .await
+        .map(|(inspection, _)| inspection)
+}
+
+/// As [`inspect`], but also reporting which entries the archive marked
+/// executable. Extraction needs that; a caller previewing an archive does not.
+async fn inspect_with_modes(
+    binary: &Path,
+    path: &Path,
+    format: ArchiveFormat,
+    validator: &mut Validator,
+) -> Result<(ArchiveInspection, ExecutableModes)> {
     // No shell: the argument vector is passed to execve as-is.
     let output = tokio::process::Command::new(binary)
         .arg("l")
@@ -135,12 +195,16 @@ pub(crate) async fn inspect(
         });
     }
 
-    let (entries, rejected) = parse_listing(&String::from_utf8_lossy(&output.stdout), validator)?;
-    Ok(ArchiveInspection {
-        format,
-        entries,
-        rejected,
-    })
+    let (entries, rejected, executable) =
+        parse_listing(&String::from_utf8_lossy(&output.stdout), validator)?;
+    Ok((
+        ArchiveInspection {
+            format,
+            entries,
+            rejected,
+        },
+        executable,
+    ))
 }
 
 /// Extract with the external tool, then re-validate everything it produced.
@@ -157,7 +221,7 @@ pub(crate) async fn extract(
     progress: &dyn ProgressSink,
     cancel: &CancelToken,
 ) -> Result<ArchiveManifest> {
-    let inspection = inspect(binary, path, format, validator).await?;
+    let (inspection, executable) = inspect_with_modes(binary, path, format, validator).await?;
     cancel.check()?;
     progress.emit(ProgressEvent::Started {
         operation: None,
@@ -169,7 +233,7 @@ pub(crate) async fn extract(
         .arg("x")
         .arg("-y")
         .arg("-bd") // no progress indicator on stdout
-        .arg("-snld-") // do not restore symbolic links
+        .arg("-snl-") // do not restore symbolic links
         .arg("-p")
         .arg(format!("-o{}", staging.display()))
         .arg("--")
@@ -192,7 +256,7 @@ pub(crate) async fn extract(
     }
 
     // The external tool is not trusted. Walk what it actually wrote.
-    let (files, directories) = revalidate_tree(staging, validator)?;
+    let (files, directories) = revalidate_tree(staging, validator, &executable)?;
     progress.emit(ProgressEvent::Finished {
         stage: Stage::Extracting,
         success: true,
@@ -214,6 +278,7 @@ pub(crate) async fn extract(
 pub(crate) fn revalidate_tree(
     staging: &Path,
     validator: &mut Validator,
+    executable_modes: &ExecutableModes,
 ) -> Result<(Vec<ManifestFile>, Vec<RelPath>)> {
     let mut files = Vec::new();
     let mut directories = Vec::new();
@@ -245,8 +310,10 @@ pub(crate) fn revalidate_tree(
         let file_type = meta.file_type();
 
         if file_type.is_symlink() {
-            // 7-Zip was told not to restore links; if one exists anyway, remove
-            // it and fail rather than deploy from a tree we do not understand.
+            // `-snl-` tells 7-Zip not to restore links, and the listing pass
+            // already rejected them. A link here means the tool did something
+            // neither of those accounted for, so remove it and fail rather than
+            // deploy from a tree Onera does not understand.
             let _ = std::fs::remove_file(abs);
             return Err(CoreError::ArchiveRejected {
                 reason: format!("extraction produced the symlink {rel}, which is never allowed"),
@@ -276,7 +343,9 @@ pub(crate) fn revalidate_tree(
             });
         }
 
-        let executable = {
+        // 7-Zip does not restore permissions, so disk would report every file
+        // as non-executable. The archive's own declaration is the only source.
+        let executable = executable_modes.contains(&rel) || {
             use std::os::unix::fs::PermissionsExt as _;
             meta.permissions().mode() & 0o111 != 0
         };
@@ -349,7 +418,7 @@ Symbolic Link = ../../../../etc/passwd
 
     #[test]
     fn parses_a_technical_listing() {
-        let (entries, rejected) = parse_listing(LISTING, &mut validator()).unwrap();
+        let (entries, rejected, _) = parse_listing(LISTING, &mut validator()).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].kind, EntryKind::Directory);
         assert_eq!(entries[1].path.as_str(), "archive/pc/mod/thing.archive");
@@ -358,6 +427,52 @@ Symbolic Link = ../../../../etc/passwd
 
         assert_eq!(rejected.len(), 1, "the symlink must be dropped");
         assert!(rejected[0].reason.contains("etc/passwd"));
+    }
+
+    /// 7-Zip prints every RAR entry with a blank `Symbolic Link` field. Reading
+    /// that as a link classified the whole archive as unextractable links.
+    #[test]
+    fn a_blank_symbolic_link_field_is_not_a_link() {
+        // Exactly the shape `7z l -slt` produces for a RAR written on unix.
+        const RAR_LISTING: &str = "\
+7-Zip 23.01
+
+Listing archive: mod.rar
+
+----------
+Path = archive
+Folder = +
+Size = 0
+Attributes = D drwxr-xr-x
+Host OS = 1
+Symbolic Link = 
+Hard Link = 
+
+Path = archive/pc/mod/thing.archive
+Folder = -
+Size = 25
+Packed Size = 25
+Attributes =  -rw-r--r--
+Host OS = 1
+Symbolic Link = 
+Hard Link = 
+";
+        let (entries, rejected, _) = parse_listing(RAR_LISTING, &mut validator()).unwrap();
+        assert!(rejected.is_empty(), "nothing here is a link: {rejected:?}");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind, EntryKind::Directory);
+        assert_eq!(entries[1].kind, EntryKind::File);
+        assert_eq!(entries[1].path.as_str(), "archive/pc/mod/thing.archive");
+    }
+
+    /// A unix mode string is the only evidence of a link in some RAR listings.
+    #[test]
+    fn a_unix_link_mode_marks_a_symlink_even_without_a_target() {
+        let listing =
+            "x\n----------\nPath = link\nSize = 0\nAttributes =  lrwxrwxrwx\nSymbolic Link = \n";
+        let (entries, rejected, _) = parse_listing(listing, &mut validator()).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(rejected.len(), 1, "the link must be dropped");
     }
 
     #[test]
@@ -373,7 +488,8 @@ Symbolic Link = ../../../../etc/passwd
         std::fs::write(dir.path().join("ok.txt"), b"fine").unwrap();
         std::os::unix::fs::symlink("/etc/passwd", dir.path().join("sneaky")).unwrap();
 
-        let err = revalidate_tree(dir.path(), &mut validator()).unwrap_err();
+        let err =
+            revalidate_tree(dir.path(), &mut validator(), &ExecutableModes::new()).unwrap_err();
         assert!(format!("{err}").contains("symlink"), "{err}");
         assert!(
             !dir.path().join("sneaky").exists(),
@@ -387,7 +503,8 @@ Symbolic Link = ../../../../etc/passwd
         std::fs::create_dir_all(dir.path().join("archive/pc")).unwrap();
         std::fs::write(dir.path().join("archive/pc/a.archive"), b"payload").unwrap();
 
-        let (files, dirs) = revalidate_tree(dir.path(), &mut validator()).unwrap();
+        let (files, dirs) =
+            revalidate_tree(dir.path(), &mut validator(), &ExecutableModes::new()).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path.as_str(), "archive/pc/a.archive");
         assert_eq!(files[0].hash, FileHash::blake3_of(b"payload"));
@@ -402,6 +519,11 @@ Symbolic Link = ../../../../etc/passwd
             max_total_bytes: 100,
             ..ExtractionLimits::strict()
         };
-        assert!(revalidate_tree(dir.path(), &mut Validator::new(limits)).is_err());
+        assert!(revalidate_tree(
+            dir.path(),
+            &mut Validator::new(limits),
+            &ExecutableModes::new()
+        )
+        .is_err());
     }
 }

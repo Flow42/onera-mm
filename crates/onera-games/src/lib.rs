@@ -13,14 +13,16 @@
 #![warn(missing_docs)]
 
 pub mod cyberpunk2077;
+pub mod skyrimse;
 
 pub use cyberpunk2077::Cyberpunk2077;
 use onera_core::ports::GameAdapter;
+pub use skyrimse::SkyrimSpecialEdition;
 
 /// Every adapter this build ships.
 #[must_use]
 pub fn all_adapters() -> Vec<&'static dyn GameAdapter> {
-    vec![&Cyberpunk2077]
+    vec![&Cyberpunk2077, &SkyrimSpecialEdition]
 }
 
 /// Find an adapter by its slug.
@@ -77,7 +79,17 @@ mod tests {
                 .display_name(),
             "Cyberpunk 2077"
         );
+        assert_eq!(
+            adapter_by_id("skyrimspecialedition").unwrap().id(),
+            "skyrimspecialedition"
+        );
+        assert_eq!(
+            adapter_for_provider_slug("skyrimspecialedition")
+                .unwrap()
+                .display_name(),
+            "Skyrim Special Edition"
+        );
         assert!(adapter_by_id("no-such-game").is_none());
-        assert!(adapter_for_provider_slug("skyrimspecialedition").is_none());
+        assert!(adapter_for_provider_slug("morrowind").is_none());
     }
 }

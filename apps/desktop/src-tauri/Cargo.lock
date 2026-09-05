@@ -2852,9 +2852,11 @@ dependencies = [
 name = "onera-desktop"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "onera-app",
  "onera-archive",
  "onera-core",
+ "onera-db",
  "onera-discovery",
  "onera-games",
  "onera-install",
@@ -2864,6 +2866,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",

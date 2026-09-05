@@ -37,14 +37,14 @@ Unchanged from the Milestone 0–1 commands:
 **Unknown is not empty.** A frontend that renders a missing answer as "nothing
 required" or "nothing changed" is a bug, not a simplification:
 
-| Field                               | Never render as         |
-| ----------------------------------- | ----------------------- |
-| `availability.kind = "unavailable"` | "no dependencies"       |
-| `availability.kind = "unsupported"` | "no dependencies"       |
-| `health = "unknown"`                | a satisfied tick        |
-| `freshness.kind = "unknown"`        | "baseline is fresh"     |
-| `dlc_ownership = "unknown"`         | owned                   |
-| `outcome.kind = "unknown"`          | "compatible", or a plan |
+| Field                                | Never render as           |
+| ------------------------------------ | ------------------------- |
+| `availability.kind = "unavailable"`  | "no dependencies"         |
+| `availability.kind = "unsupported"`  | "no dependencies"         |
+| `health = "unknown"`                 | a satisfied tick          |
+| `freshness.kind = "unknown"`         | "baseline is fresh"       |
+| `dlc_ownership = "unknown"`          | owned                     |
+| `outcome.kind = "unknown"`           | "compatible", or a plan   |
 | `game_slug = ""` (`status: unknown`) | a game name, or this game |
 
 Each of those has its own visual state. The plan-view tests already establish

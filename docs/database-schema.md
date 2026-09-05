@@ -27,13 +27,13 @@ understands. Downgrading is the one migration direction that cannot be made safe
 
 ### Provider catalogue — cache-like, always re-fetchable
 
-| Table            | Holds                              | Notes                                                                     |
-| ---------------- | ---------------------------------- | ------------------------------------------------------------------------- |
-| `providers`      | Slug, name, API base               | `nexus` is seeded at startup                                              |
-| `accounts`       | Who a stored credential belongs to | **Never** stores the credential itself                                    |
-| `games`          | Provider game catalogue            | Unique on `(provider_id, provider_slug)`, so re-fetching updates in place |
-| `mods`           | Mod lineages                       | Unique on `(provider_id, game_slug, provider_mod_id)`                     |
-| `releases`       | One published version              | `version` stored **verbatim**, never parsed; ordering uses `published_at` |
+| Table            | Holds                              | Notes                                                                                                 |
+| ---------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `providers`      | Slug, name, API base               | `nexus` is seeded at startup                                                                          |
+| `accounts`       | Who a stored credential belongs to | **Never** stores the credential itself                                                                |
+| `games`          | Provider game catalogue            | Unique on `(provider_id, provider_slug)`, so re-fetching updates in place                             |
+| `mods`           | Mod lineages                       | Unique on `(provider_id, game_slug, provider_mod_id)`                                                 |
+| `releases`       | One published version              | `version` stored **verbatim**, never parsed; ordering uses `published_at`                             |
 | `provider_files` | Downloadable artifacts             | Provider version/file-group IDs and position remain opaque and nullable; `published_hash` is advisory |
 
 Existing provider-file rows with null version, file-group, or position are
@@ -42,10 +42,10 @@ name, identifier, or author-written version string.
 
 ### Dependency metadata and accepted risks
 
-| Table                   | Holds                                      | Notes |
-| ----------------------- | ------------------------------------------ | ----- |
-| `dependency_snapshots`  | Latest provider observation for one source | Unique on the exact provider/game/mod/file/version source identity |
-| `dependency_overrides`  | Profile member's accepted dependency risk  | Unique on `(profile_member_id, group_id)`; writing a changed fingerprint replaces the obsolete acceptance |
+| Table                  | Holds                                      | Notes                                                                                                     |
+| ---------------------- | ------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| `dependency_snapshots` | Latest provider observation for one source | Unique on the exact provider/game/mod/file/version source identity                                        |
+| `dependency_overrides` | Profile member's accepted dependency risk  | Unique on `(profile_member_id, group_id)`; writing a changed fingerprint replaces the obsolete acceptance |
 
 Snapshots store availability, normalized dependency groups, DLC alternatives,
 provider revision, canonical fingerprint, fetch time, and the provider's raw

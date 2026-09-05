@@ -86,6 +86,32 @@ the same dependency graph.
 
 ## Verifying a package
 
+Two layers, because they catch different things.
+
+**The declarations** are checked on every commit, by unit tests in `onera-cli`:
+that the manifest this repository ships points at the path the `.deb` file map
+installs the host binary to, that every browser directory named above is
+registered from that one manifest, that the runtime dependencies are still
+declared, and that per-user setup writes each browser its own directory with an
+absolute host path. A mismatch there produces a package that installs cleanly
+and silently never works — the browser reports only "host not found".
+
+**The artifact** is checked at release time, because it needs a full build:
+
+```sh
+packaging/verify-package.sh onera_0.1.0_amd64.deb Onera_0.1.0_amd64.AppImage
+```
+
+It unpacks the `.deb` into a temporary directory — no root, nothing installed —
+and confirms the bundler actually acted on those declarations: the host binary
+is present and executable at the path the manifest names, every browser
+directory holds a byte-identical copy of the manifest, and the dependencies are
+declared. Given an AppImage it also runs `onera browser setup` against a scratch
+`XDG_CONFIG_HOME` and checks the manifest it writes records an absolute path,
+which is what makes the registration survive the AppImage remounting elsewhere.
+
+For a manual look:
+
 ```sh
 dpkg-deb --contents onera_0.1.0_amd64.deb
 dpkg -I onera_0.1.0_amd64.deb              # check declared dependencies
@@ -95,3 +121,9 @@ dpkg -I onera_0.1.0_amd64.deb              # check declared dependencies
 
 Then run the manual smoke test in [`recovery.md`](recovery.md#manual-smoke-test)
 against the installed binary.
+
+## Upgrading and downgrading
+
+The database is migrated forward on first launch of a new build, and there is no
+automatic rollback. Take a backup before upgrading; see
+[`database-maintenance.md`](database-maintenance.md).

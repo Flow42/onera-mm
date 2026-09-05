@@ -23,7 +23,10 @@ document says what it defends against, what it does not, and why.
 3. **A hostile process on the same machine** that can register itself under the
    Native Messaging host name, or that can read files Onera writes.
 4. **A compromised or misbehaving provider API** returning malformed data,
-   absurd sizes, or download locations pointing somewhere unexpected.
+   absurd sizes, download locations pointing somewhere unexpected, or
+   _dependency metadata_ naming mods the user never asked for.
+5. **A mod author** who controls their own metadata and can name any
+   dependency, including one whose identity resembles a mod the user trusts.
 
 ## Archive handling
 
@@ -31,22 +34,22 @@ The single most dangerous operation Onera performs is extracting an untrusted
 archive. Every rule below is implemented in `onera-archive` and tested in
 `crates/onera-archive/tests/malicious_archives.rs`.
 
-| Attack                                                    | Defence                                                                                                                                            |
-| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Zip slip (`../../etc/cron.d/x`)                           | `RelPath::normalize` rejects any `..` component. **Fatal**: the whole archive is refused, because a traversal entry is never an accident           |
-| Windows-style traversal (`..\..\x`)                       | Backslash is treated as a separator during normalization                                                                                           |
-| Absolute paths (`/etc/passwd`)                            | Rejected before normalization                                                                                                                      |
-| Drive and UNC prefixes (`C:\`, `\\host\share`)            | Rejected explicitly                                                                                                                                |
-| Symlink escape (`link -> /etc`, then write `link/passwd`) | Links are **never extracted**. `StagingWriter` additionally re-checks every ancestor with `symlink_metadata` before creating it                    |
-| Hard links, devices, FIFOs, sockets                       | Never extracted; recorded as rejected entries and shown to the user                                                                                |
-| Decompression bomb                                        | Per-entry ratio heuristic on declared sizes, plus a _running byte budget_ measured against what is actually written — a lying header does not help |
-| Entry-count exhaustion                                    | `max_entries`                                                                                                                                      |
-| Path-length and depth exhaustion                          | `max_path_len`, `max_depth` (hard ceiling of 32)                                                                                                   |
-| Duplicate entries overwriting each other                  | Files are opened `create_new`; a repeated path fails                                                                                               |
-| Trailing-dot/space aliasing (`file.` vs `file`)           | Components that trim to nothing are rejected                                                                                                       |
-| Extraction into the game directory                        | Structurally impossible: `extract` takes a staging root, and `StagingWriter` refuses a non-empty directory                                         |
-| A misnamed archive handed to the wrong parser             | Format is detected from magic bytes, never the extension                                                                                           |
-| An external tool doing something unexpected               | After `7zz` runs, the staging tree is **re-walked and re-validated**: any symlink, special file or oversized file fails the operation              |
+| Attack                                                    | Defence                                                                                                                                                                             |
+| --------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Zip slip (`../../etc/cron.d/x`)                           | `RelPath::normalize` rejects any `..` component. **Fatal**: the whole archive is refused, because a traversal entry is never an accident                                            |
+| Windows-style traversal (`..\..\x`)                       | Backslash is treated as a separator during normalization                                                                                                                            |
+| Absolute paths (`/etc/passwd`)                            | Rejected before normalization                                                                                                                                                       |
+| Drive and UNC prefixes (`C:\`, `\\host\share`)            | Rejected explicitly                                                                                                                                                                 |
+| Symlink escape (`link -> /etc`, then write `link/passwd`) | Links are **never extracted**. `StagingWriter` additionally re-checks every ancestor with `symlink_metadata` before creating it                                                     |
+| Hard links, devices, FIFOs, sockets                       | Never extracted; recorded as rejected entries and shown to the user                                                                                                                 |
+| Decompression bomb                                        | Per-entry ratio heuristic on declared sizes, plus a _running byte budget_ measured against what is actually written — a lying header does not help                                  |
+| Entry-count exhaustion                                    | `max_entries`                                                                                                                                                                       |
+| Path-length and depth exhaustion                          | `max_path_len`, `max_depth` (hard ceiling of 32)                                                                                                                                    |
+| Duplicate entries overwriting each other                  | Files are opened `create_new`; a repeated path fails                                                                                                                                |
+| Trailing-dot/space aliasing (`file.` vs `file`)           | Components that trim to nothing are rejected                                                                                                                                        |
+| Extraction into the game directory                        | Structurally impossible: `extract` takes a staging root, and `StagingWriter` refuses a non-empty directory                                                                          |
+| A misnamed archive handed to the wrong parser             | Format is detected from magic bytes, never the extension                                                                                                                            |
+| An external tool doing something unexpected               | `7zz` is told not to restore links (`-snl-`), and after it runs the staging tree is **re-walked and re-validated**: any symlink, special file or oversized file fails the operation |
 
 ### The backslash trade-off
 
@@ -125,6 +128,108 @@ trustworthy for its other entries either, so the whole thing is refused.
   bodies are parsed defensively and truncated to 500 characters before display.
 - Path segments built from provider or extension input are percent-encoded, so
   a mod id of `../../admin` cannot reach a different endpoint.
+
+## Provider metadata
+
+Dependency definitions are the first provider data Onera _acts_ on rather than
+merely displays, so they get their own boundary.
+
+- **Metadata is advisory input, never executable authority.** A dependency
+  definition can block a plan or raise a warning. It cannot install anything,
+  choose a download location, or write a file. Everything a solved plan does
+  still goes through the same preview, the same conflict rules and the same
+  transaction as a manual install.
+- **Every candidate is re-checked against the game and its selectability.** A
+  candidate for a different game, or one the author has hidden or removed, is
+  rejected rather than selected — a provider cannot use a dependency edge to
+  route a user to content outside the game they are modding.
+- **"No dependencies", "unavailable" and "unsatisfied" are three states.** A
+  provider that fails, times out, or drops the endpoint produces `Unavailable`
+  with a reason. It never collapses to an empty requirement list, because an
+  empty list is a _permission to proceed_ and a failed fetch is not.
+- **Stale cached metadata is labelled stale** and never presented as current.
+  Offline operation is allowed; pretending the cache is fresh is not.
+- **Definitions are fingerprinted.** An "ignore this requirement" decision is
+  scoped to the exact definition the user was shown. Changing the metadata
+  invalidates the decision rather than silently inheriting the accepted risk,
+  so an author cannot get a broader dependency accepted by editing it after the
+  fact.
+- **Bounds are Onera's, not the provider's.** Batch sizes, page counts and row
+  ceilings are capped locally, so a server that keeps answering "one more page"
+  produces an honest `Unavailable` rather than an unbounded amount of work.
+
+### Dependency confusion
+
+The classic supply-chain shape — a hostile package taking the name of one the
+user meant — is constrained here rather than eliminated:
+
+| Attack                                            | Defence                                                                                                    |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| A dependency naming a mod from a different game   | Candidates are rejected unless they target the same game slug                                              |
+| A dependency resolving to a hidden or deleted mod | Non-selectable candidates are never chosen                                                                 |
+| Silent version drift under an accepted decision   | Pins are honoured exactly; a solved set that requires changing a pinned version is reported, not applied   |
+| A solved set applied without the user seeing it   | Every solver outcome is a _proposal_. Installing, updating, downgrading and disabling all require approval |
+| Metadata edited after a risk was accepted         | The ignore decision carries the definition fingerprint and stops applying when it changes                  |
+| A requirement quietly dropped by an API change    | Capability loss is reported as unavailable, and an unsatisfied blocking requirement refuses to apply       |
+
+What this does **not** defend against is a user approving a hostile mod that a
+legitimate mod genuinely depends on. Onera can show what is being installed and
+where it came from; it cannot judge whether an author's stated dependency is a
+good idea. That is the same boundary as "a malicious mod's content", below.
+
+## Baseline identity
+
+A baseline is a claim about what "clean" means for one installation. Trusting a
+stale one would make every later verification meaningless.
+
+- **A baseline is bound to the build it was captured from.** Steam's BuildID and
+  depot manifest identity are recorded with it, and a changed build marks the
+  baseline stale rather than letting it keep answering.
+- **Unknown identity is not fresh identity.** A manual or non-Steam install has
+  no build identity to compare, and reports `Unknown` — a distinct state from
+  "current". The panel is required never to render unknown freshness as
+  freshness.
+- **Comparison, never ordering.** Build identities are compared for equality.
+  Onera does not decide that one build is "newer" and therefore fine.
+- **The declared scope is fingerprinted into the baseline.** Narrowing an
+  adapter's exclusions later invalidates existing baselines instead of quietly
+  making "clean" easier to reach.
+- **A partial scan can never be clean.** An interrupted or metadata-only scan
+  reports what it saw and refuses a clean verdict, because only a complete
+  content-hashed walk proves absence. Files an interrupted walk never reached
+  are _unknown_, not missing.
+- **A capture is refused while Onera knows mods are active**, so a baseline
+  cannot record a modded directory as the clean state. This guard depends on the
+  database: after losing it, Onera no longer knows, which is why
+  [`database-maintenance.md`](database-maintenance.md) says to verify through
+  the store before recapturing.
+- **Restoration never deletes what it does not recognize.** Returning to clean
+  restores baseline files and names the unknown extras it is leaving alone.
+
+## Profile switching
+
+A profile switch is the largest single change Onera makes: it can deploy and
+withdraw dozens of files across several mods at once.
+
+- **One transaction, one journal entry per file.** A switch is an ordinary
+  reconciliation and uses the same engine, the same staging, the same atomic
+  renames and the same rollback as a one-mod install.
+- **The active profile is published with the deployment, not after it.** The
+  profile only becomes active in the same database transaction that publishes
+  the deployment it describes, and only after every file has been renamed into
+  place and re-hashed. A crash between the two is impossible by construction.
+- **A failed switch leaves the previous profile active.** Rollback restores the
+  files while SQLite still describes the previous state, so the pair never
+  disagrees. Tested by injecting both filesystem and database faults; see
+  `crates/onera-install/tests/database_faults.rs`.
+- **A rollback that cannot be recorded is not reported as done.** The operation
+  stays non-terminal and is offered for recovery on the next launch, rather than
+  being retried automatically into a state nothing has verified.
+- **Changed-on-disk files block a switch** rather than being overwritten. A file
+  edited after the preview stops the plan for a decision, the same as any other
+  external modification.
+- **Activation attempts left by a dead process are finalized on startup**, and
+  none of them can make a profile active — only the completion transaction can.
 
 ## Out of scope
 

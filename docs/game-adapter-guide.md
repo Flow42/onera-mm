@@ -131,11 +131,35 @@ reach, so prefer a precise `Prefix` over a broad `DirectoryName`.
 
 ```rust
 pub fn all_adapters() -> Vec<&'static dyn GameAdapter> {
-    vec![&Cyberpunk2077, &YourGame]
+    vec![&Cyberpunk2077, &SkyrimSpecialEdition, &YourGame]
 }
 ```
 
 Table-test `resolve_layout` against real archive shapes: plain, wrapped, deeply
-wrapped, documentation-only, unrecognizable, and ambiguous. The Cyberpunk
-adapter's tests are a usable template — note that they assert the _ambiguous_
-case produces an error rather than an arbitrary choice.
+wrapped, documentation-only, unrecognizable, and ambiguous. Both shipped
+adapters are usable templates — note that they assert the _ambiguous_ case
+produces an error rather than an arbitrary choice.
+
+Which one to copy depends on your game:
+
+- **`cyberpunk2077.rs`** if archives always name their destination directory at
+  the top level. Its resolver only strips wrapper directories, so a mapping is
+  the identity function on the surviving path.
+- **`skyrimse.rs`** if archives are sometimes relative to a subdirectory. Its
+  resolver both strips wrappers _and_ adds a `Data/` component, tries both
+  readings, and refuses when they land in different places.
+
+Two lessons from writing the second one, both of which apply to any adapter that
+adds or rewrites a component:
+
+**Compare results, not readings.** Counting "how many wrapper depths parse" was
+wrong: an archive rooted at `Data/` is always _also_ readable as a wrapper around
+a `Data`-relative one, and both place every file identically. That is one
+reading, not an ambiguity to ask the user about. Deduplicate by the resulting
+target set, then refuse only when the readings genuinely differ.
+
+**Canonicalize the case of directories your game owns.** Archives spell it
+`Data`, `data` and `DATA`; the game directory has exactly one of those. Deploying
+the archive's spelling verbatim builds a second directory beside the real one on
+a case-sensitive filesystem, and the mod appears installed while the engine never
+loads it.

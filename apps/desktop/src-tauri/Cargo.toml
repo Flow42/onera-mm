@@ -10,6 +10,16 @@ license = "MIT OR Apache-2.0"
 # (webkit2gtk, libsoup) that a headless CI job building the core does not, so
 # `cargo test --workspace` stays installable everywhere.
 
+# The application is a library with a thin binary on top, so the compiled smoke
+# suite can build the very same command surface the window registers.
+[lib]
+name = "onera_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "onera-desktop"
+path = "src/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -28,6 +38,13 @@ tauri-plugin-opener = "2"
 tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
 tracing = "0.1"
 uuid = { version = "1" }
+
+[dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+onera-db = { path = "../../../crates/onera-db" }
+tauri = { version = "2", features = ["test"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

@@ -1086,13 +1086,9 @@ async fn browser(action: BrowserAction, json: bool) -> Result<()> {
         BrowserAction::Setup { browser, host_path } => {
             let config =
                 dirs::config_dir().context("cannot resolve the user configuration directory")?;
-            let directory = match browser {
-                Browser::Chromium => config.join("chromium/NativeMessagingHosts"),
-                Browser::Chrome => config.join("google-chrome/NativeMessagingHosts"),
-                Browser::Brave => config.join("BraveSoftware/Brave-Browser/NativeMessagingHosts"),
-            };
+            let directory = native_messaging_dir(browser, &config);
             tokio::fs::create_dir_all(&directory).await?;
-            let destination = directory.join("com.onera.host.json");
+            let destination = directory.join(HOST_MANIFEST_FILE);
             let manifest = native_messaging_manifest(&absolute_path(host_path)?);
             tokio::fs::write(&destination, serde_json::to_vec_pretty(&manifest)?).await?;
             emit(
@@ -1118,6 +1114,22 @@ fn absolute_path(path: std::path::PathBuf) -> Result<std::path::PathBuf> {
         Ok(path)
     } else {
         Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+/// File name every browser looks for a Native Messaging host under.
+const HOST_MANIFEST_FILE: &str = "com.onera.host.json";
+
+/// Where a browser reads its *per-user* Native Messaging manifests.
+///
+/// The `.deb` writes the system-wide copies under `/etc` instead; this is the
+/// path an AppImage user needs, because a bundle cannot install into `/etc` and
+/// its mount point changes on every run.
+fn native_messaging_dir(browser: Browser, config_root: &std::path::Path) -> std::path::PathBuf {
+    match browser {
+        Browser::Chromium => config_root.join("chromium/NativeMessagingHosts"),
+        Browser::Chrome => config_root.join("google-chrome/NativeMessagingHosts"),
+        Browser::Brave => config_root.join("BraveSoftware/Brave-Browser/NativeMessagingHosts"),
     }
 }
 
@@ -1978,6 +1990,164 @@ mod tests {
     #[test]
     fn relative_host_paths_are_made_absolute() {
         assert!(absolute_path("onera-nmhost".into()).unwrap().is_absolute());
+    }
+
+    // -----------------------------------------------------------------------
+    // Package installation
+    // -----------------------------------------------------------------------
+
+    /// The `.deb` bundle definition, as Tauri will act on it.
+    fn deb_bundle() -> serde_json::Value {
+        let conf: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../apps/desktop/src-tauri/tauri.conf.json"
+        ))
+        .expect("tauri.conf.json is valid JSON");
+        conf["bundle"]["linux"]["deb"].clone()
+    }
+
+    /// The single most breakable thing about the `.deb`: the manifest it drops
+    /// into every browser's system directory names an absolute path, and that
+    /// path has to be where the same package puts the host binary. A mismatch
+    /// produces a package that installs cleanly and silently never works,
+    /// because the browser reports only "host not found".
+    #[test]
+    fn the_deb_manifest_points_at_the_path_the_deb_installs_the_host_to() {
+        let files = deb_bundle()["files"].clone();
+        let packaged: serde_json::Value =
+            serde_json::from_str(include_str!("../../../packaging/com.onera.host.json")).unwrap();
+
+        let declared_host_path = packaged["path"]
+            .as_str()
+            .expect("the manifest names a path");
+        assert!(
+            files
+                .as_object()
+                .expect("the deb declares a file map")
+                .contains_key(declared_host_path),
+            "the manifest points at {declared_host_path}, which the .deb does not install"
+        );
+        assert!(
+            std::path::Path::new(declared_host_path).is_absolute(),
+            "a Native Messaging manifest path must be absolute"
+        );
+    }
+
+    /// Every browser Onera claims to support in `docs/packaging.md` gets the
+    /// manifest installed system-wide, from the one checked-in copy.
+    #[test]
+    fn the_deb_registers_the_host_with_every_supported_browser() {
+        let files = deb_bundle()["files"].clone();
+        let files = files.as_object().expect("the deb declares a file map");
+
+        for directory in [
+            "/etc/chromium/native-messaging-hosts",
+            "/etc/opt/chrome/native-messaging-hosts",
+            "/etc/brave/native-messaging-hosts",
+        ] {
+            let destination = format!("{directory}/{HOST_MANIFEST_FILE}");
+            let source = files
+                .get(&destination)
+                .unwrap_or_else(|| panic!("the .deb does not register {destination}"));
+            assert!(
+                source
+                    .as_str()
+                    .is_some_and(|s| s.ends_with("packaging/com.onera.host.json")),
+                "{destination} is installed from {source}, not the checked-in manifest"
+            );
+        }
+
+        // And a reference copy the user can point `browser setup` at.
+        assert!(files.contains_key(&format!(
+            "/usr/share/onera/native-messaging/{HOST_MANIFEST_FILE}"
+        )));
+    }
+
+    /// 7-Zip is a runtime dependency for the `.7z` and `.rar` paths, and
+    /// nothing in the build would notice it going missing from the package.
+    #[test]
+    fn the_deb_declares_its_runtime_dependencies() {
+        let depends = deb_bundle()["depends"].clone();
+        let depends: Vec<&str> = depends
+            .as_array()
+            .expect("the deb declares dependencies")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+
+        for package in ["libwebkit2gtk-4.1-0", "libgtk-3-0", "p7zip-full"] {
+            assert!(
+                depends.contains(&package),
+                "the .deb no longer depends on {package}"
+            );
+        }
+    }
+
+    /// The AppImage path: a bundle cannot write into `/etc`, so the user runs
+    /// `onera browser setup`. Each browser must land in its own per-user
+    /// directory — writing all three to one place would register the host for
+    /// whichever browser happened to be checked last.
+    #[test]
+    fn appimage_setup_targets_each_browsers_own_per_user_directory() {
+        let config = std::path::Path::new("/home/someone/.config");
+        let directories: Vec<std::path::PathBuf> =
+            [Browser::Chromium, Browser::Chrome, Browser::Brave]
+                .into_iter()
+                .map(|browser| native_messaging_dir(browser, config))
+                .collect();
+
+        assert_eq!(
+            directories,
+            vec![
+                config.join("chromium/NativeMessagingHosts"),
+                config.join("google-chrome/NativeMessagingHosts"),
+                config.join("BraveSoftware/Brave-Browser/NativeMessagingHosts"),
+            ]
+        );
+
+        let unique: std::collections::BTreeSet<_> = directories.iter().collect();
+        assert_eq!(unique.len(), 3, "two browsers share a manifest directory");
+        for directory in &directories {
+            assert!(
+                directory.starts_with(config),
+                "{directory:?} escaped $XDG_CONFIG_HOME"
+            );
+        }
+    }
+
+    /// An AppImage mounts at a new path on every run, so a manifest written
+    /// with a relative or mount-relative host path breaks on the next launch.
+    /// `browser setup` must therefore always record an absolute path.
+    #[test]
+    fn appimage_setup_records_an_absolute_host_path() {
+        let manifest = native_messaging_manifest(&absolute_path("onera-nmhost".into()).unwrap());
+        let path = manifest["path"].as_str().unwrap();
+
+        assert!(
+            std::path::Path::new(path).is_absolute(),
+            "{path} is not absolute"
+        );
+        assert!(
+            path.ends_with("onera-nmhost"),
+            "{path} is not the host binary"
+        );
+        // Same shape the .deb installs, so a user switching between the two
+        // does not get a subtly different registration.
+        assert_eq!(manifest["type"], "stdio");
+        assert_eq!(manifest["name"], "com.onera.host");
+    }
+
+    /// The per-user manifest an AppImage writes and the system-wide one the
+    /// `.deb` ships must agree about everything except the host path, or the
+    /// same extension would be trusted by one and not the other.
+    #[test]
+    fn the_appimage_and_deb_manifests_agree_apart_from_the_host_path() {
+        let packaged: serde_json::Value =
+            serde_json::from_str(include_str!("../../../packaging/com.onera.host.json")).unwrap();
+        let generated = native_messaging_manifest(std::path::Path::new("/opt/onera/onera-nmhost"));
+
+        assert_eq!(packaged["name"], generated["name"]);
+        assert_eq!(packaged["type"], generated["type"]);
+        assert_eq!(packaged["allowed_origins"], generated["allowed_origins"]);
     }
 
     #[test]

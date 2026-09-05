@@ -79,6 +79,7 @@ the extension. See [`docs/architecture.md`](docs/architecture.md).
 | [Architecture](docs/architecture.md)                             | Crate layout, ports, and the rules that keep adapters thin                  |
 | [Threat model](docs/threat-model.md)                             | What Onera defends against and how                                          |
 | [Database schema](docs/database-schema.md)                       | Every table and why it exists                                               |
+| [Database maintenance](docs/database-maintenance.md)             | Backup, restore, migrations, and why there is no automatic rollback         |
 | [Operation state machine](docs/operation-state-machine.md)       | The journal and its transitions                                             |
 | [File-provider stack](docs/file-provider-stack.md)               | How restoration actually works                                              |
 | [Game adapter guide](docs/game-adapter-guide.md)                 | Adding a game                                                               |

@@ -1493,6 +1493,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bzip2 0.4.4",
+ "crc32fast",
  "flate2",
  "onera-core",
  "proptest",

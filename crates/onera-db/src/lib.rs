@@ -25,6 +25,7 @@ pub mod catalog;
 pub mod convert;
 pub mod dependency;
 pub mod deployment;
+pub mod fault;
 pub mod jobs;
 pub mod journal;
 pub mod profiles;

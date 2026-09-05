@@ -639,6 +639,200 @@ async fn a_cancelled_capture_records_the_run_and_no_baseline() {
 }
 
 // ---------------------------------------------------------------------------
+// Interrupted scans
+// ---------------------------------------------------------------------------
+
+/// A progress sink that cancels the scan partway through it.
+///
+/// Cancelling before the scan starts, as the test above does, only proves the
+/// guard at the top. The interesting interruption is the one that lands with
+/// some files already hashed and the walk half-finished.
+struct CancelAfter {
+    token: CancelToken,
+    after: usize,
+    seen: std::sync::Mutex<usize>,
+}
+
+impl CancelAfter {
+    fn new(after: usize) -> Self {
+        Self {
+            token: CancelToken::new(),
+            after,
+            seen: std::sync::Mutex::new(0),
+        }
+    }
+}
+
+impl onera_core::progress::ProgressSink for CancelAfter {
+    fn emit(&self, event: onera_core::progress::ProgressEvent) {
+        if matches!(event, onera_core::progress::ProgressEvent::Advanced { .. }) {
+            let mut seen = self.seen.lock().unwrap();
+            *seen += 1;
+            if *seen >= self.after {
+                self.token.cancel();
+            }
+        }
+    }
+}
+
+/// An interruption partway through a capture must leave the game exactly as it
+/// was. A capture only ever reads, and that has to survive being killed.
+#[tokio::test]
+async fn a_capture_interrupted_midway_records_a_partial_run_and_changes_nothing() {
+    let h = Harness::new(InstallSource::SteamNative).await;
+    let game = h.register().await;
+
+    // Enough files that the scan is still running when the token trips.
+    for i in 0..40 {
+        std::fs::write(
+            h.game_dir.join(format!("archive/pc/mod/mod{i}.archive")),
+            format!("payload {i}").as_bytes(),
+        )
+        .unwrap();
+    }
+    let before = snapshot(&h.game_dir);
+
+    let progress = CancelAfter::new(5);
+    let error = h
+        .onera
+        .capture_baseline(game, None, true, &progress, &progress.token)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, CoreError::Cancelled), "{error:?}");
+    assert_eq!(
+        snapshot(&h.game_dir),
+        before,
+        "an interrupted capture modified the game directory"
+    );
+    assert!(
+        BaselineStore::current_baseline(h.onera.database(), game)
+            .await
+            .unwrap()
+            .is_none(),
+        "a partial scan must never become a baseline"
+    );
+
+    // The abandoned run is recorded with what it managed to do, so it cannot be
+    // confused with a capture that was never started.
+    let (state, files, baseline): (String, i64, Option<String>) = sqlx::query_as(
+        "SELECT state, files_scanned, baseline_id FROM baseline_scan_runs ORDER BY started_at DESC",
+    )
+    .fetch_one(h.onera.database().pool())
+    .await
+    .unwrap();
+    assert_eq!(state, "cancelled");
+    assert!(baseline.is_none());
+    assert!(
+        files > 0 && files < 40,
+        "a midway interruption scanned {files} files"
+    );
+}
+
+/// The restart after an interruption is an ordinary capture and must succeed.
+///
+/// An abandoned scan that poisoned the next attempt would leave a user with no
+/// way back to a baseline short of deleting their database.
+#[tokio::test]
+async fn a_capture_can_be_restarted_after_an_interruption() {
+    let h = Harness::new(InstallSource::SteamNative).await;
+    let game = h.register().await;
+    for i in 0..40 {
+        std::fs::write(
+            h.game_dir.join(format!("archive/pc/mod/mod{i}.archive")),
+            format!("payload {i}").as_bytes(),
+        )
+        .unwrap();
+    }
+
+    let progress = CancelAfter::new(5);
+    h.onera
+        .capture_baseline(game, None, true, &progress, &progress.token)
+        .await
+        .unwrap_err();
+
+    // Same game, fresh token: the second attempt runs to completion.
+    let baseline = h
+        .onera
+        .capture_baseline(game, None, true, &NullProgress, &CancelToken::new())
+        .await
+        .unwrap();
+    assert_eq!(baseline.status, BaselineStatus::Current);
+    assert!(baseline.file_count >= 40);
+
+    // Both runs are kept: the abandoned one and the one that produced the
+    // baseline, so the history says what actually happened.
+    let (total, completed): (i64, i64) =
+        sqlx::query_as("SELECT count(*), sum(state = 'completed') FROM baseline_scan_runs")
+            .fetch_one(h.onera.database().pool())
+            .await
+            .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(completed, 1);
+
+    // And the baseline it produced verifies clean, so the interruption left
+    // nothing behind that corrupts the comparison.
+    let verification = h
+        .onera
+        .verify_baseline(game, false, &NullProgress, &CancelToken::new())
+        .await
+        .unwrap();
+    assert!(
+        verification.is_clean(&baseline),
+        "{:?}",
+        verification.counts
+    );
+}
+
+/// An interrupted verification can never report clean.
+///
+/// Only a complete walk proves absence, so a partial scan that said "clean"
+/// would be the single most dangerous thing this panel could claim.
+#[tokio::test]
+async fn an_interrupted_verification_is_never_clean() {
+    let h = Harness::new(InstallSource::SteamNative).await;
+    let game = h.register().await;
+    for i in 0..40 {
+        std::fs::write(
+            h.game_dir.join(format!("archive/pc/mod/mod{i}.archive")),
+            format!("payload {i}").as_bytes(),
+        )
+        .unwrap();
+    }
+    let baseline = h
+        .onera
+        .capture_baseline(game, None, true, &NullProgress, &CancelToken::new())
+        .await
+        .unwrap();
+
+    // The very same directory that just verified clean, interrupted.
+    let progress = CancelAfter::new(5);
+    let verification = h
+        .onera
+        .verify_baseline(game, false, &progress, &progress.token)
+        .await
+        .unwrap();
+
+    assert!(
+        !verification.is_clean(&baseline),
+        "a cancelled scan reported the installation clean"
+    );
+    assert_eq!(verification.state, ScanState::Cancelled);
+
+    // Crucially, the files it never reached are not reported as missing: an
+    // unseen file is unknown, not absent.
+    assert_eq!(
+        verification
+            .findings
+            .iter()
+            .filter(|f| f.classification == FileClassification::Missing)
+            .count(),
+        0,
+        "an interrupted scan inferred missing files it never looked for"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

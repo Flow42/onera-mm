@@ -24,5 +24,8 @@ zip.workspace = true
 zstd = "0.13"
 
 [dev-dependencies]
+# The RAR fixtures are emitted byte by byte; RAR block headers are CRC32-checked.
+crc32fast = "1"
 proptest.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

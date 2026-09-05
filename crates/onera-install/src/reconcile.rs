@@ -330,7 +330,16 @@ impl ReconciliationEngine {
                 entry.temp_path = Some(temp);
             }
             entry.status = JournalStatus::Staged;
-            self.journal.put_entry(operation, &entry).await?;
+            // A temporary file that fails to be journaled is one rollback will
+            // never hear about: it walks the journal, so an unrecorded temp
+            // would sit in the game directory forever. Remove it here, while it
+            // is still the only thing that knows the path.
+            if let Err(error) = self.journal.put_entry(operation, &entry).await {
+                if let Some(temp) = &entry.temp_path {
+                    let _ = self.fs.remove_file(temp).await;
+                }
+                return Err(error);
+            }
             entries.push((step, entry));
         }
         self.journal
