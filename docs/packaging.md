@@ -10,6 +10,7 @@ Onera ships as an AppImage and a `.deb`, both built by Tauri's bundler.
 | `onera-nmhost`             | `/usr/lib/onera/onera-nmhost`                                         |
 | Native Messaging manifests | Chromium, Chrome, and Brave system discovery directories under `/etc` |
 | Reference host manifest    | `/usr/share/onera/native-messaging/com.onera.host.json`               |
+| Browser extension          | `/usr/share/onera/extension/` (unpacked, ready to load)               |
 | Desktop entry and icons    | `/usr/share/applications`, `/usr/share/icons`                         |
 
 The CLI (`onera`) is built separately and is not currently part of the desktop
@@ -64,12 +65,24 @@ in a stable location, then run the per-user setup command:
 
 ```sh
 chmod +x onera onera-nmhost
-./onera browser setup --browser brave --host-path "$PWD/onera-nmhost"
+./onera browser setup --browser brave \
+    --host-path "$PWD/onera-nmhost" \
+    --desktop-path "$PWD/Onera_0.1.0_amd64.AppImage"
 ```
 
 Use `--browser chromium` or `--browser chrome` for those browsers. The command
-creates the correct per-user directory and writes an absolute host path. It can
-also print a manifest without writing it:
+creates the correct per-user directory and writes an absolute host path.
+
+`--desktop-path` is what lets the extension **start** Onera rather than only
+notice that it is not running. The launcher's automatic sources — a binary
+beside the host, then `/usr/bin/onera-desktop` — cover the `.deb` and nothing
+else: an AppImage is one file whose name carries a version, and a development
+tree builds the host and the window into different directories. The path is
+recorded in `$XDG_CONFIG_HOME/onera/desktop-path`, mode `0600`, and is ignored
+on read if it is a symlink, if another user could write it, or if it no longer
+names an executable.
+
+It can also print a manifest without writing it:
 
 ```sh
 ./onera browser manifest --host-path "$PWD/onera-nmhost"
@@ -77,6 +90,38 @@ also print a manifest without writing it:
 
 AppImages also mount at a different path on every run, so an absolute `path` in
 the manifest must point at an extracted location rather than inside the mount.
+
+## The browser extension
+
+The extension has no build step: it is plain MV3 with ES modules, so what ships
+is the source directory.
+
+| Channel                | What the user does                                             |
+| ---------------------- | -------------------------------------------------------------- |
+| `.deb`                 | Load `/usr/share/onera/extension` unpacked                     |
+| AppImage / from source | Load the `extension/` directory unpacked                       |
+| Release page           | Download `onera-extension-<version>.zip`, unzip, load unpacked |
+
+**Loading it:** `chrome://extensions` → enable Developer mode → _Load unpacked_
+→ choose the directory. The `key` field in `manifest.json` fixes the id at
+`pohiidkpoflhifciokepgpaandghjgmj`, which is the id `packaging/com.onera.host.json`
+allows — so an unpacked load talks to the packaged host without either side
+being edited.
+
+`extension/manifest.json` and `tauri.conf.json` must carry the same version;
+`tests/js/packaging.test.ts` enforces that, along with the rule that every file
+under `extension/` appears in the bundler's `files` map. That map lists files
+individually because the bundler takes one entry per file, which is exactly the
+kind of list that rots silently — hence the test.
+
+### Not yet done
+
+There is no store presence. Publishing to the Chrome Web Store would change the
+extension id to one the store assigns, and that id appears in
+`packaging/com.onera.host.json` and in every installed copy of it, so
+`allowed_origins` would need to list both the store id and the unpacked one
+before a store release could ship. Firefox is not supported at all: the
+extension uses `chrome.*` and the Chromium host-manifest layout.
 
 ## Reproducibility
 

@@ -360,6 +360,11 @@ enum BrowserAction {
         /// Absolute path to the onera-nmhost executable.
         #[arg(long, default_value = "/usr/lib/onera/onera-nmhost")]
         host_path: std::path::PathBuf,
+        /// Absolute path to the desktop application, so the extension can start
+        /// it. Needed for AppImage and development builds, where the window is
+        /// not beside the host and not in a system location.
+        #[arg(long)]
+        desktop_path: Option<std::path::PathBuf>,
     },
     /// Print a Native Messaging manifest without writing it.
     Manifest {
@@ -696,7 +701,9 @@ async fn main() -> Result<()> {
             baseline(&onera, action, &progress, &cancel, cli.json).await
         }
         Commands::Recover { rollback } => recover(&onera, rollback, &progress, cli.json).await,
-        Commands::Browser { action } => browser(action, cli.json).await,
+        // Passed the resolved paths rather than rediscovering them, so
+        // `--root` still decides where the desktop path is recorded.
+        Commands::Browser { action } => browser(action, onera.paths.clone(), cli.json).await,
         Commands::Profiles { action } => {
             profiles(&onera, action, &progress, &cancel, cli.json).await
         }
@@ -1081,9 +1088,13 @@ fn print_profile_member(
     }
 }
 
-async fn browser(action: BrowserAction, json: bool) -> Result<()> {
+async fn browser(action: BrowserAction, paths: Paths, json: bool) -> Result<()> {
     match action {
-        BrowserAction::Setup { browser, host_path } => {
+        BrowserAction::Setup {
+            browser,
+            host_path,
+            desktop_path,
+        } => {
             let config =
                 dirs::config_dir().context("cannot resolve the user configuration directory")?;
             let directory = native_messaging_dir(browser, &config);
@@ -1091,10 +1102,30 @@ async fn browser(action: BrowserAction, json: bool) -> Result<()> {
             let destination = directory.join(HOST_MANIFEST_FILE);
             let manifest = native_messaging_manifest(&absolute_path(host_path)?);
             tokio::fs::write(&destination, serde_json::to_vec_pretty(&manifest)?).await?;
+
+            // Recorded in Onera's own configuration directory, not the
+            // browser's: it is Onera that acts on it.
+            let recorded = match desktop_path {
+                Some(path) => Some(
+                    onera_app::presence::record_desktop_binary(
+                        &paths.config,
+                        &absolute_path(path)?,
+                    )
+                    .await?,
+                ),
+                None => None,
+            };
             emit(
                 json,
-                &serde_json::json!({ "manifest": destination }),
-                || format!("installed {}", destination.display()),
+                &serde_json::json!({ "manifest": destination, "desktop_path": recorded }),
+                || match &recorded {
+                    Some(record) => format!(
+                        "installed {}\nrecorded the desktop path in {}",
+                        destination.display(),
+                        record.display()
+                    ),
+                    None => format!("installed {}", destination.display()),
+                },
             );
         }
         BrowserAction::Manifest { host_path } => {

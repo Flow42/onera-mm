@@ -138,7 +138,8 @@ async fn handle(onera: &Onera, request: Request) -> Response {
                     "running": running,
                     "version": record.map(|record| record.version),
                     // Whether offering to start it is worth the user's time.
-                    "launchable": onera_app::presence::desktop_binary().is_some(),
+                    "launchable":
+                        onera_app::presence::desktop_binary(&onera.paths.config).is_some(),
                 }),
             )
         }
@@ -151,7 +152,7 @@ async fn handle(onera: &Onera, request: Request) -> Response {
                     serde_json::json!({ "running": true, "launched": false }),
                 );
             }
-            match onera_app::presence::launch_desktop() {
+            match onera_app::presence::launch_desktop(&onera.paths.config) {
                 // The window takes a moment to appear and longer to write its
                 // first heartbeat, so this reports what was started, not what is
                 // running. The extension polls `app_state` for the latter.

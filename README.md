@@ -54,6 +54,20 @@ cargo run -p onera-cli -- plan-state --game <game-id> --enable <installation-id>
 cargo run -p onera-cli -- apply-state --game <game-id> --enable <installation-id>
 ```
 
+The browser extension needs no build step. Register the native host, pointing it
+at the window so the extension can start it, then load `extension/` unpacked
+from `chrome://extensions` (Developer mode → Load unpacked):
+
+```sh
+cargo build --release -p onera-nmhost
+cargo run -p onera-cli -- browser setup --browser chromium \
+    --host-path "$PWD/target/release/onera-nmhost" \
+    --desktop-path "$PWD/apps/desktop/src-tauri/target/release/onera-desktop"
+```
+
+Restart the browser afterwards; Chromium caches host registration at startup.
+See [`docs/native-messaging.md`](docs/native-messaging.md).
+
 The full manual smoke test — discover, authenticate, download, install, verify,
 remove, restore — is in [`docs/recovery.md`](docs/recovery.md#manual-smoke-test).
 

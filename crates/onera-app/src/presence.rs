@@ -33,12 +33,19 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// that is already open.
 pub const STALE_AFTER: Duration = Duration::from_secs(20);
 
-/// Environment variable naming the desktop binary, for development builds and
-/// AppImage installs whose path is not stable.
+/// Environment variable naming the desktop binary.
+///
+/// Wins over every other source, so a developer can point at a build without
+/// changing anything on disk. Note that a Native Messaging host inherits the
+/// *browser's* environment, so this has to be set where the browser starts —
+/// which is why `onera browser setup --desktop-path` exists.
 pub const DESKTOP_BINARY_ENV: &str = "ONERA_DESKTOP_BIN";
 
 /// File name of the heartbeat inside the runtime directory.
 const PRESENCE_FILE: &str = "desktop.json";
+
+/// File name of the recorded desktop path inside the configuration directory.
+const DESKTOP_PATH_FILE: &str = "desktop-path";
 
 /// Installed locations of the desktop binary, in preference order.
 const DESKTOP_BINARY_PATHS: &[&str] = &[
@@ -163,16 +170,11 @@ pub fn is_live(record: &DesktopPresence, now: SystemTime) -> bool {
 
 /// Start the desktop application, detached from this process.
 ///
-/// The launcher deliberately knows only fixed locations and one environment
-/// variable. Reading a path out of configuration would turn a writable settings
-/// file into a way of getting a program of someone else's choosing started by
-/// whatever asked Onera to open.
-///
 /// # Errors
 /// Returns [`CoreError::NotFound`] when no desktop binary can be located, and
 /// propagates spawn failures.
-pub fn launch_desktop() -> Result<PathBuf> {
-    let binary = desktop_binary().ok_or_else(|| CoreError::NotFound {
+pub fn launch_desktop(config_dir: &Path) -> Result<PathBuf> {
+    let binary = desktop_binary(config_dir).ok_or_else(|| CoreError::NotFound {
         kind: "desktop application",
         id: "onera-desktop".to_owned(),
     })?;
@@ -189,16 +191,36 @@ pub fn launch_desktop() -> Result<PathBuf> {
 }
 
 /// Locate an installed desktop binary.
+///
+/// Four sources, in order: the environment variable, the path recorded by
+/// `onera browser setup`, a binary beside the running one, and the fixed
+/// install locations.
+///
+/// The recorded path exists because neither of the other two automatic sources
+/// covers a development tree or an AppImage: the host and the window are built
+/// into different directories, and an AppImage is one file with a name of its
+/// own. Without it those users get "Onera is installed as a browser connector
+/// only", which is true and useless.
+///
+/// Reading an executable's path out of a file is a real risk, so
+/// [`recorded_binary`] takes it only from a file that no other user can rewrite.
+/// The bar is set by what already exists: a Native Messaging manifest is a file
+/// naming an executable that the *browser* runs on a page's say-so, so a file
+/// naming an executable that Onera runs on the user's own say-so is not a new
+/// kind of authority — provided nobody else can write it.
 #[must_use]
-pub fn desktop_binary() -> Option<PathBuf> {
+pub fn desktop_binary(config_dir: &Path) -> Option<PathBuf> {
     if let Some(configured) = std::env::var_os(DESKTOP_BINARY_ENV) {
         let path = PathBuf::from(configured);
         if path.is_file() {
             return Some(path);
         }
     }
-    // A binary next to the running one covers both a development build and an
-    // extracted AppImage, where nothing is installed system-wide.
+    if let Some(recorded) = recorded_binary(config_dir) {
+        return Some(recorded);
+    }
+    // A binary next to the running one covers a packaged layout where the host
+    // and the window sit together.
     if let Ok(current) = std::env::current_exe() {
         if let Some(sibling) = current.parent().map(|dir| dir.join("onera-desktop")) {
             if sibling.is_file() {
@@ -210,6 +232,94 @@ pub fn desktop_binary() -> Option<PathBuf> {
         .iter()
         .map(PathBuf::from)
         .find(|path| path.is_file())
+}
+
+/// Where `onera browser setup --desktop-path` records the window's location.
+#[must_use]
+pub fn desktop_path_file(config_dir: &Path) -> PathBuf {
+    config_dir.join(DESKTOP_PATH_FILE)
+}
+
+/// Record where the desktop application lives.
+///
+/// Refuses a path that is not an absolute, existing, executable file, so the
+/// failure is reported when the user runs setup rather than months later when
+/// they press a button in a browser.
+///
+/// # Errors
+/// Returns [`CoreError::InvalidInput`] for a path that is not a runnable
+/// executable, and propagates I/O errors.
+pub async fn record_desktop_binary(config_dir: &Path, binary: &Path) -> Result<PathBuf> {
+    if !binary.is_absolute() {
+        return Err(CoreError::InvalidInput(format!(
+            "{} is not an absolute path",
+            binary.display()
+        )));
+    }
+    let metadata = tokio::fs::metadata(binary)
+        .await
+        .map_err(|e| CoreError::fs(binary, e))?;
+    if !metadata.is_file() || !is_executable(&metadata) {
+        return Err(CoreError::InvalidInput(format!(
+            "{} is not an executable file",
+            binary.display()
+        )));
+    }
+
+    tokio::fs::create_dir_all(config_dir)
+        .await
+        .map_err(|e| CoreError::fs(config_dir, e))?;
+    let destination = desktop_path_file(config_dir);
+    tokio::fs::write(&destination, binary.as_os_str().as_encoded_bytes())
+        .await
+        .map_err(|e| CoreError::fs(&destination, e))?;
+    // 0600: the record names something Onera will execute, and the guard on
+    // reading it back refuses anything another user could have rewritten.
+    set_owner_only(&destination).await?;
+    Ok(destination)
+}
+
+/// Read the recorded desktop path, if it is trustworthy.
+///
+/// Returns `None` rather than an error for every failure — absent, unreadable,
+/// writable by others, no longer a file. The caller's question is "where is the
+/// window", and a record it will not act on is the same as no record.
+#[must_use]
+fn recorded_binary(config_dir: &Path) -> Option<PathBuf> {
+    let path = desktop_path_file(config_dir);
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    // A symlink here would move the decision to wherever it points, whose
+    // permissions this check has not seen.
+    if !metadata.is_file() || is_writable_by_others(&metadata) {
+        tracing::warn!(
+            path = %path.display(),
+            "ignoring a desktop-path record that other users could rewrite"
+        );
+        return None;
+    }
+    let recorded = PathBuf::from(String::from_utf8(std::fs::read(&path).ok()?).ok()?);
+    let target = std::fs::metadata(&recorded).ok()?;
+    (recorded.is_absolute() && target.is_file() && is_executable(&target)).then_some(recorded)
+}
+
+/// Whether a file carries any execute bit.
+fn is_executable(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+/// Whether a file's group or world can write it.
+fn is_writable_by_others(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    metadata.permissions().mode() & 0o022 != 0
+}
+
+/// Restrict a file to its owner.
+async fn set_owner_only(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|e| CoreError::fs(path, e))
 }
 
 /// Whether a process id currently resolves to a live process.
@@ -282,6 +392,116 @@ mod tests {
             .unwrap();
         assert!(presence.read().await.is_none());
         assert!(!presence.is_running().await);
+    }
+
+    /// Build a file that passes for an executable.
+    async fn fake_binary(dir: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join(name);
+        tokio::fs::write(&path, b"#!/bin/sh\n").await.unwrap();
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn a_recorded_path_is_found_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let binary = fake_binary(dir.path(), "onera-desktop").await;
+
+        assert!(
+            recorded_binary(&config).is_none(),
+            "nothing is recorded yet"
+        );
+        record_desktop_binary(&config, &binary).await.unwrap();
+        assert_eq!(recorded_binary(&config), Some(binary.clone()));
+        assert_eq!(desktop_binary(&config), Some(binary));
+    }
+
+    #[tokio::test]
+    async fn a_path_that_is_not_a_runnable_executable_is_refused_at_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+
+        // Relative: the browser's working directory is not the user's.
+        assert!(record_desktop_binary(&config, Path::new("onera-desktop"))
+            .await
+            .is_err());
+        // Absent.
+        assert!(record_desktop_binary(&config, &dir.path().join("nope"))
+            .await
+            .is_err());
+        // Present but not executable, which is the commonest mistake: pointing
+        // at an AppImage that was never chmod'd.
+        let data = dir.path().join("Onera.AppImage");
+        tokio::fs::write(&data, b"not executable").await.unwrap();
+        assert!(record_desktop_binary(&config, &data).await.is_err());
+        // A directory with the right name.
+        tokio::fs::create_dir(dir.path().join("bin")).await.unwrap();
+        assert!(record_desktop_binary(&config, &dir.path().join("bin"))
+            .await
+            .is_err());
+
+        assert!(recorded_binary(&config).is_none(), "nothing was recorded");
+    }
+
+    #[tokio::test]
+    async fn a_record_other_users_could_rewrite_is_ignored() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let binary = fake_binary(dir.path(), "onera-desktop").await;
+        record_desktop_binary(&config, &binary).await.unwrap();
+
+        // The record names something Onera will execute. Anyone who can rewrite
+        // it chooses that program, so a loosened mode disqualifies it.
+        let record = desktop_path_file(&config);
+        for mode in [0o666, 0o622, 0o620] {
+            tokio::fs::set_permissions(&record, std::fs::Permissions::from_mode(mode))
+                .await
+                .unwrap();
+            assert!(
+                recorded_binary(&config).is_none(),
+                "mode {mode:o} should disqualify the record"
+            );
+        }
+        tokio::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+        assert_eq!(recorded_binary(&config), Some(binary));
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_record_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let binary = fake_binary(dir.path(), "onera-desktop").await;
+        tokio::fs::create_dir_all(&config).await.unwrap();
+
+        // Following a symlink would move the decision to a file whose
+        // permissions this check never saw.
+        let elsewhere = dir.path().join("elsewhere");
+        tokio::fs::write(&elsewhere, binary.as_os_str().as_encoded_bytes())
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&elsewhere, desktop_path_file(&config)).unwrap();
+        assert!(recorded_binary(&config).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_record_pointing_at_something_since_deleted_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let binary = fake_binary(dir.path(), "onera-desktop").await;
+        record_desktop_binary(&config, &binary).await.unwrap();
+
+        tokio::fs::remove_file(&binary).await.unwrap();
+        assert!(
+            recorded_binary(&config).is_none(),
+            "an upgrade that moved the binary must not leave a broken launch"
+        );
     }
 
     #[test]

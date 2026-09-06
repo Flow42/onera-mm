@@ -14,6 +14,23 @@ Native Messaging host (onera-nmhost)
 Onera core
 ```
 
+## Installing the extension
+
+The extension has no build step. Load it unpacked from whichever copy you have:
+
+| Source       | Directory                                    |
+| ------------ | -------------------------------------------- |
+| `.deb`       | `/usr/share/onera/extension`                 |
+| Release page | the unzipped `onera-extension-<version>.zip` |
+| A checkout   | `extension/`                                 |
+
+`chrome://extensions` → enable **Developer mode** → **Load unpacked** → choose
+the directory. Reload after editing a file; there is nothing to rebuild.
+
+The id is always `pohiidkpoflhifciokepgpaandghjgmj` because `manifest.json`
+pins a `key`. Without that, an unpacked load would get a random id and the host
+would refuse every message, since `allowed_origins` names exactly one.
+
 ## Installing the host manifest
 
 Chromium finds a host by reading a manifest from a well-known directory. The
@@ -135,12 +152,31 @@ timestamp alone by a process suspended mid-write; together they are wrong only
 inside a window narrower than one poll, and being wrong costs a redundant launch
 rather than a lost request.
 
-`launch_app` starts the binary named by `ONERA_DESKTOP_BIN`, then one beside the
-running host, then the installed locations. Nothing is read from configuration:
-a path taken from a writable settings file would be a way of getting a program
-of someone else's choosing started by whatever asked Onera to open. A launch
-returns as soon as the process is spawned — a window takes seconds to appear —
-so the extension polls `app_state` for the result rather than being told.
+`launch_app` resolves the window's location from four sources, in order:
+
+1. `ONERA_DESKTOP_BIN`. A host inherits the _browser's_ environment, so this
+   only works if the browser itself was started with it set.
+2. `$XDG_CONFIG_HOME/onera/desktop-path`, written by
+   `onera browser setup --desktop-path`.
+3. A binary named `onera-desktop` beside the running host.
+4. `/usr/bin/onera-desktop` and the other fixed install locations.
+
+Only the `.deb` is covered by 3 and 4. An AppImage is a single file whose name
+carries a version, and a development tree builds the host into `target/release`
+while the window goes to `apps/desktop/src-tauri/target/release` — so both need
+the recorded path, which is why `--desktop-path` exists.
+
+Reading an executable's path out of a file is a real risk, and the record is
+guarded accordingly: it is written `0600` and refused on read if it is a
+symlink, if its mode lets another user write it, or if what it names is not an
+executable file. The bar is set by what already exists — a Native Messaging
+manifest is a file naming an executable that the _browser_ runs on a page's
+say-so — so a file naming an executable Onera runs on the user's own say-so is
+not new authority, provided nobody else can write it.
+
+A launch returns as soon as the process is spawned — a window takes seconds to
+appear — so the extension polls `app_state` for the result rather than being
+told.
 
 ### What the extension knows about a mod
 
@@ -241,7 +277,7 @@ the user could be registered under the host name.
 | "Onera did not respond"                                              | `onera-nmhost` exited at startup — check `stderr`, which Chromium captures in its own log |
 | `unsupported_version`                                                | Extension and host are from different builds; update both                                 |
 | Nothing happens on click                                             | Extension id is not in `allowed_origins`                                                  |
-| The popup says Onera is not running, and Open Onera does nothing     | No desktop binary was found; set `ONERA_DESKTOP_BIN` for a development build              |
+| The popup says Onera is not running, and Open Onera does nothing     | No desktop binary was found; re-run `browser setup --desktop-path <path to the window>`   |
 | A queued request never runs                                          | The window is closed, or the request needs a file or a game the user has not chosen yet   |
 
 `onera-nmhost` writes diagnostics to **stderr**, never stdout — stdout belongs to

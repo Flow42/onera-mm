@@ -37,6 +37,16 @@
         "files": {
           "/usr/lib/onera/onera-nmhost": "../../../target/release/onera-nmhost",
           "/usr/share/onera/native-messaging/com.onera.host.json": "../../../packaging/com.onera.host.json",
+          "/usr/share/onera/extension/manifest.json": "../../../extension/manifest.json",
+          "/usr/share/onera/extension/src/service-worker.js": "../../../extension/src/service-worker.js",
+          "/usr/share/onera/extension/src/content.js": "../../../extension/src/content.js",
+          "/usr/share/onera/extension/src/native.js": "../../../extension/src/native.js",
+          "/usr/share/onera/extension/src/page-identity.js": "../../../extension/src/page-identity.js",
+          "/usr/share/onera/extension/src/mod-actions.js": "../../../extension/src/mod-actions.js",
+          "/usr/share/onera/extension/src/popup.html": "../../../extension/src/popup.html",
+          "/usr/share/onera/extension/src/popup.js": "../../../extension/src/popup.js",
+          "/usr/share/onera/extension/icons/onera-48.png": "../../../extension/icons/onera-48.png",
+          "/usr/share/onera/extension/icons/onera-128.png": "../../../extension/icons/onera-128.png",
           "/etc/chromium/native-messaging-hosts/com.onera.host.json": "../../../packaging/com.onera.host.json",
           "/etc/opt/chrome/native-messaging-hosts/com.onera.host.json": "../../../packaging/com.onera.host.json",
           "/etc/brave/native-messaging-hosts/com.onera.host.json": "../../../packaging/com.onera.host.json"

@@ -88,6 +88,34 @@ done
 pass "every browser directory registers the packaged host"
 
 # ---------------------------------------------------------------------------
+# The browser extension
+# ---------------------------------------------------------------------------
+
+# The extension has no build step, so the package ships the source directory
+# and the user loads it unpacked. Every file listed in the bundler's `files`
+# map has to arrive, in the layout `manifest.json` expects: it refers to
+# `src/content.js`, so a flattened install would not load.
+EXTENSION_ROOT=$WORK/root/usr/share/onera/extension
+[[ -f $EXTENSION_ROOT/manifest.json ]] || fail "the package installs no extension manifest"
+
+while read -r relative; do
+    [[ -f "$EXTENSION_ROOT/$relative" ]] \
+        || fail "the packaged extension is missing $relative"
+done < <(cd extension && find . -type f -printf '%P\n')
+pass "the browser extension is installed complete at /usr/share/onera/extension"
+
+# A packaged extension whose id is not the one the host manifest allows would
+# install cleanly and then refuse every message.
+packaged_key=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('key',''))" \
+    "$EXTENSION_ROOT/manifest.json")
+repository_key=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('key',''))" \
+    extension/manifest.json)
+[[ -n $packaged_key ]] || fail "the packaged extension manifest has no key, so its id is random"
+[[ $packaged_key == "$repository_key" ]] \
+    || fail "the packaged extension key differs from the repository's, so its id will differ"
+pass "the packaged extension keeps the id the host manifest allows"
+
+# ---------------------------------------------------------------------------
 # Declared dependencies
 # ---------------------------------------------------------------------------
 
@@ -113,8 +141,12 @@ if [[ -n $APPIMAGE ]]; then
         touch "$HOST"
         chmod +x "$HOST"
 
+        DESKTOP=$WORK/onera-desktop
+        touch "$DESKTOP"
+        chmod +x "$DESKTOP"
+
         XDG_CONFIG_HOME="$WORK/config" ./target/release/onera browser setup \
-            --browser brave --host-path "$HOST" >/dev/null
+            --browser brave --host-path "$HOST" --desktop-path "$DESKTOP" >/dev/null
 
         written="$WORK/config/BraveSoftware/Brave-Browser/NativeMessagingHosts/com.onera.host.json"
         [[ -f $written ]] || fail "browser setup wrote no manifest for Brave"
@@ -125,6 +157,18 @@ if [[ -n $APPIMAGE ]]; then
         [[ $written_path == /* ]] || fail "browser setup recorded the relative path $written_path"
         [[ $written_path == "$HOST" ]] || fail "browser setup recorded $written_path, not $HOST"
         pass "per-user setup registers an absolute host path"
+
+        # Without this record an AppImage user's extension can see that Onera
+        # is not running and still be unable to start it: the window is inside
+        # a bundle whose name and mount point the launcher cannot guess.
+        recorded=$WORK/config/onera/desktop-path
+        [[ -f $recorded ]] || fail "browser setup recorded no desktop path"
+        [[ "$(cat "$recorded")" == "$DESKTOP" ]] \
+            || fail "browser setup recorded $(cat "$recorded"), not $DESKTOP"
+        # The record names something Onera will execute.
+        [[ "$(stat -c '%a' "$recorded")" == "600" ]] \
+            || fail "the desktop-path record is not owner-only"
+        pass "per-user setup records where the desktop application lives"
     else
         echo "  skipped: build ./target/release/onera to verify per-user setup"
     fi
