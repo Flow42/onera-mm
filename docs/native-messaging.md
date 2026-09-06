@@ -162,8 +162,17 @@ one value that travels _inwards_ over this transport besides identifiers:
 ```
 
 The extension catches that link in the page's own world (`nxm-intercept.js`),
-parses it as untrusted input (`nxm.js`) and sends the fields above; it never
-forwards the raw address. The grant is not a credential: it authorises one file
+carries it across the world boundary (`nxm-relay.js`), parses it as untrusted
+input (`nxm.js`) and sends the fields above; it never forwards the raw address.
+
+Both scripts run on every Nexus page and in every frame, not only on mod pages:
+pressing the button leads to a further page — sometimes a framed one — offering
+a slow and a premium download, and it is the button _there_ that mints the link.
+The address is caught from a click that carries it, from an anchor followed by
+script, or from the response that delivered it. One route cannot be intercepted
+at all — a page assigning `location.href` — so where the link is already in the
+page the relay offers a button that hands it over instead. Nothing is handed
+over without a click. The grant is not a credential: it authorises one file
 for a few minutes and nothing else. It is stored with the queued request —
 because the host process that received it exits long before the desktop spends
 it — and it is redacted in every log and never serialized to the window.

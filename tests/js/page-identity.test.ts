@@ -25,6 +25,18 @@ describe('identifyModPage', () => {
     }
   });
 
+  it("reads the site's newer /games/ spelling of the same page", () => {
+    // Both layouts are live, and the extension must not go blind on whichever
+    // one the user lands on.
+    expect(identifyModPage('https://www.nexusmods.com/games/cyberpunk2077/mods/107')).toEqual({
+      gameDomain: 'cyberpunk2077',
+      modId: '107',
+    });
+    expect(isModPage('https://www.nexusmods.com/games/cyberpunk2077/mods/107?tab=files')).toBe(
+      true,
+    );
+  });
+
   it('normalises the game domain to lower case', () => {
     expect(
       identifyModPage('https://www.nexusmods.com/SkyrimSpecialEdition/mods/1')?.gameDomain,

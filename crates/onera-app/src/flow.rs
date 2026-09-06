@@ -24,8 +24,8 @@ use onera_core::domain::reconcile::{
 use onera_core::domain::release::{ProviderFile, Release};
 use onera_core::hash::FileHash;
 use onera_core::ids::{
-    ArchiveId, InboxRequestId, InstallationId, LocalGameId, ModId, ProfileId, ProfileMemberId,
-    ProviderFileId, ProviderId, ProviderModId, ReleaseId,
+    ArchiveId, DownloadJobId, InboxRequestId, InstallationId, LocalGameId, ModId, ProfileId,
+    ProfileMemberId, ProviderFileId, ProviderId, ProviderModId, ReleaseId,
 };
 use onera_core::plan::{InstallPlan, ScopedRule, TargetLocation};
 use onera_core::ports::{
@@ -47,6 +47,7 @@ use onera_install::{
     Publication, RealFileSystem, ReconciliationAttempt, ReconciliationEngine, VerifyReport,
 };
 use onera_nexus::{ApiKeyAuth, NexusClient, NexusConfig};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -71,6 +72,14 @@ pub struct Onera {
     backups: Arc<dyn onera_core::ports::BackupStore>,
     pub(crate) locks: GameLocks,
     download_lock: tokio::sync::Mutex<()>,
+    /// Cancellation tokens for the transfers running right now.
+    ///
+    /// A queued job is cancelled by writing its state; one that is already
+    /// moving bytes has to be told to stop, and the token that can do that
+    /// belongs to whoever started it — the window, the watcher or the CLI.
+    /// Holding it here is what lets a cancel reach a transfer none of them
+    /// would otherwise be able to name.
+    active_downloads: tokio::sync::Mutex<HashMap<DownloadJobId, CancelToken>>,
     expired_prepared_plans: u64,
 }
 
@@ -193,6 +202,7 @@ impl Onera {
             backups,
             locks: GameLocks::new(),
             download_lock: tokio::sync::Mutex::new(()),
+            active_downloads: tokio::sync::Mutex::new(HashMap::new()),
             expired_prepared_plans,
             paths,
         })
@@ -1087,6 +1097,52 @@ impl Onera {
         Ok(jobs)
     }
 
+    /// Stop a download the user no longer wants.
+    ///
+    /// Two halves, and both are needed. A transfer that is moving bytes is told
+    /// to stop through the token whoever started it registered, and stops at
+    /// its next safe point; the row is written here as well, because a job that
+    /// was only ever queued has nobody to tell. Either way the job ends in
+    /// [`JobState::Cancelled`], which is not resumable, so nothing picks it up
+    /// again on the next launch.
+    ///
+    /// Cancelling a job that has already finished does nothing: the archive is
+    /// in the store and removing it is a different request.
+    ///
+    /// # Errors
+    /// [`CoreError::NotFound`] when no such job exists. Propagates database
+    /// errors.
+    pub async fn cancel_download(&self, id: DownloadJobId) -> Result<()> {
+        let mut job = self
+            .db
+            .download_jobs()
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.id == id)
+            .ok_or_else(|| CoreError::NotFound {
+                kind: "download job",
+                id: id.to_string(),
+            })?;
+        if !job.state.is_active() {
+            return Ok(());
+        }
+
+        let running = self.active_downloads.lock().await.get(&id).cloned();
+        if let Some(token) = running {
+            // The transfer owns its partial file and writes its own final row
+            // when it unwinds; asking twice would race it. The state is still
+            // written here so the window reflects the cancel immediately.
+            token.cancel();
+        } else {
+            let _ = tokio::fs::remove_file(&job.temp_path).await;
+            job.bytes_downloaded = 0;
+        }
+        job.state = JobState::Cancelled;
+        job.error = None;
+        self.db.put_download_job(&job).await?;
+        Ok(())
+    }
+
     /// Download and safety-inspect a provider file into archive storage.
     ///
     /// A previously associated archive is reused without a network call.
@@ -1191,6 +1247,15 @@ impl Onera {
         cancel: &CancelToken,
         keep_resumable_on_error: bool,
     ) -> Result<DownloadedArchive> {
+        // A user who cancelled this job while it sat in the queue has already
+        // said what they want; picking it up now would ignore them.
+        if !job.state.is_active() {
+            return Err(CoreError::Cancelled);
+        }
+        self.active_downloads
+            .lock()
+            .await
+            .insert(job.id, cancel.clone());
         job.state = JobState::Running;
         job.attempts = job.attempts.saturating_add(1);
         job.error = None;
@@ -1254,6 +1319,8 @@ impl Onera {
         }
         .await;
 
+        self.active_downloads.lock().await.remove(&job.id);
+
         match result {
             Ok((outcome, archive_id, archive_size)) => {
                 job.state = JobState::Complete;
@@ -1273,7 +1340,14 @@ impl Onera {
                 job.bytes_downloaded = tokio::fs::metadata(&job.temp_path)
                     .await
                     .map_or(0, |metadata| metadata.len());
-                job.state = if matches!(error, CoreError::Cancelled) {
+                // A cancelled transfer is decided by the token, not only by the
+                // error: a stop can surface as a torn connection, and a job left
+                // resumable would be picked back up on the next launch — which
+                // is exactly what the user asked not to happen.
+                job.state = if cancel.is_cancelled() || matches!(error, CoreError::Cancelled) {
+                    // Nothing will resume the partial, so it is not left behind.
+                    let _ = tokio::fs::remove_file(&job.temp_path).await;
+                    job.bytes_downloaded = 0;
                     JobState::Cancelled
                 } else if keep_resumable_on_error || error.is_retryable() {
                     JobState::Paused

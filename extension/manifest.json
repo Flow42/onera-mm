@@ -20,9 +20,16 @@
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://www.nexusmods.com/*/mods/*"],
+      "matches": ["https://www.nexusmods.com/*"],
+      "js": ["src/nxm-relay.js"],
+      "all_frames": true,
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://www.nexusmods.com/*"],
       "js": ["src/nxm-intercept.js"],
       "world": "MAIN",
+      "all_frames": true,
       "run_at": "document_start"
     }
   ],

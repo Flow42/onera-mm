@@ -53,6 +53,28 @@
   }
 
   /**
+   * Stop one transfer.
+   *
+   * The queue is refreshed rather than the row edited: what a cancel leaves
+   * behind — how many bytes it kept, whether it had already finished — is the
+   * backend's answer, not something this view should guess at.
+   */
+  async function cancel(job: DownloadJob) {
+    error = null;
+    try {
+      await commands.cancelDownload(job.id);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+    await refresh();
+  }
+
+  /** Whether a job still has work that can be stopped. */
+  function cancellable(job: DownloadJob): boolean {
+    return job.state === 'queued' || job.state === 'running' || job.state === 'paused';
+  }
+
+  /**
    * How far one job has got, as a fraction.
    *
    * Null when the provider never reported a size: a job of unknown length is
@@ -136,6 +158,9 @@
           <p class="path">{job.game_slug} / {job.provider_mod_id}</p>
           {#if job.error !== null}<p class="severity-danger">{job.error}</p>{/if}
         </div>
+        {#if cancellable(job)}
+          <button class="cancel" onclick={() => cancel(job)}>Cancel</button>
+        {/if}
       </li>
     {/each}
   </CardList>
@@ -160,5 +185,11 @@
   }
   .card progress {
     margin-top: 0.45rem;
+  }
+  /* Beside the job rather than under it: it acts on the whole row, and a
+     button in the flow of the text would read as part of the description. */
+  .cancel {
+    align-self: center;
+    margin-left: auto;
   }
 </style>

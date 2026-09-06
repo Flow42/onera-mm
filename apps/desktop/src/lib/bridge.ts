@@ -242,6 +242,13 @@ export const commands = {
   checkUpdates: (gameId: string) => call<InstalledMod[]>('check_updates', { gameId }),
   inboxRequests: () => call<InboxRequest[]>('inbox_requests'),
   dismissInboxRequest: (requestId: string) => call<void>('dismiss_inbox_request', { requestId }),
+  /**
+   * Stop a browser request, including whatever it had already begun.
+   *
+   * Distinct from dismissing one: a request the desktop is running right now is
+   * told to stop rather than left to finish work the user cancelled.
+   */
+  cancelInboxRequest: (requestId: string) => call<void>('cancel_inbox_request', { requestId }),
   completeInboxRequest: (requestId: string) => call<void>('complete_inbox_request', { requestId }),
 
   /* downloads */
@@ -249,6 +256,13 @@ export const commands = {
   downloadFile: (gameDomain: string, modId: string, fileId: string) =>
     call<DownloadOutcome>('download_file', { gameDomain, modId, fileId }),
   resumeDownloads: () => call<void>('resume_downloads'),
+  /**
+   * Stop a transfer.
+   *
+   * Cooperative: a running download stops at its next safe point. The job ends
+   * in a state nothing resumes, and its partial file is discarded.
+   */
+  cancelDownload: (jobId: string) => call<void>('cancel_download', { jobId }),
 
   /* installation */
   prepareInstall: (args: { gameId: string; gameDomain: string; modId: string; fileId: string }) =>

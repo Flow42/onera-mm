@@ -6,7 +6,7 @@
 //! can write to disk.
 
 use onera_app::{Onera, Paths, PreparedInstall};
-use onera_core::ids::OperationId;
+use onera_core::ids::{InboxRequestId, OperationId};
 use onera_core::progress::{CancelToken, ProgressEvent, ProgressSink};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +44,12 @@ pub struct AppState {
     pub prepared: Mutex<HashMap<OperationId, PreparedInstall>>,
     /// Cancellation tokens for in-flight operations.
     pub cancels: Mutex<HashMap<OperationId, CancelToken>>,
+    /// Cancellation tokens for the browser requests the watcher is running.
+    ///
+    /// A queued request is cancelled by dismissing it, which the watcher then
+    /// declines to start. One already running has to be told to stop, and only
+    /// the watcher holds the token that can say so.
+    pub inbox_cancels: Mutex<HashMap<InboxRequestId, CancelToken>>,
     /// Handle used to build progress sinks.
     pub handle: AppHandle,
 }
@@ -69,6 +75,7 @@ impl AppState {
             onera,
             prepared: Mutex::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
+            inbox_cancels: Mutex::new(HashMap::new()),
             handle,
         };
 

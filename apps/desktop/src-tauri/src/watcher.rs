@@ -96,8 +96,19 @@ async fn run_pending(
         let progress = state.progress();
         let cancel = CancelToken::new();
         let onera = Arc::clone(&state.onera);
+        // Published while it runs so a cancel from the window can reach it. A
+        // request that is only queued needs no token: dismissing it is enough,
+        // because `is_runnable` will not start a request in that state.
+        state
+            .inbox_cancels
+            .lock()
+            .await
+            .insert(leased.id, cancel.clone());
 
-        match run_request(&onera, &leased, &progress, &cancel).await {
+        let outcome = run_request(&onera, &leased, &progress, &cancel).await;
+        state.inbox_cancels.lock().await.remove(&leased.id);
+
+        match outcome {
             Ok(outcome) => {
                 let note = describe(&outcome);
                 // A plan that needs a decision is not finished: it is kept for
@@ -123,6 +134,13 @@ async fn run_pending(
                         emit(handle, &leased.id.to_string(), "done", &note);
                     }
                 }
+            }
+            // A request the user cancelled did not fail: it is gone because
+            // they said so, and showing it back as an error would invite them
+            // to retry the thing they just stopped.
+            Err(onera_core::CoreError::Cancelled) => {
+                state.onera.dismiss_inbox_request(leased.id).await?;
+                emit(handle, &leased.id.to_string(), "cancelled", "cancelled");
             }
             Err(error) => {
                 // The reason is kept on the request rather than only logged:

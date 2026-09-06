@@ -236,6 +236,53 @@ test('persisted download jobs are visible after navigation', async ({ page }) =>
   await expect(page.getByText(/500 B \/ 1000 B/)).toBeVisible();
 });
 
+test('a transfer in the queue can be stopped', async ({ page }) => {
+  // The stub answers `downloads` from a list it mutates, so the view shows what
+  // the backend would actually report after the cancel rather than an
+  // optimistic row the frontend invented.
+  await page.addInitScript(() => {
+    const job = {
+      id: 'job-1',
+      provider: 'nexus',
+      game_slug: 'cyberpunk2077',
+      provider_mod_id: '107',
+      provider_file_id: '9001',
+      filename: 'cet.zip',
+      expected_size: 1000,
+      expected_hash: null,
+      temp_path: '/tmp/job.part',
+      bytes_downloaded: 500,
+      state: 'paused',
+      attempts: 1,
+      error: null,
+      archive_id: null,
+    };
+    // @ts-expect-error - injected for the app to pick up.
+    window.__ONERA_TEST_BRIDGE__ = {
+      invoke: async (command: string, args?: Record<string, unknown>) => {
+        if (command === 'downloads') return [job];
+        if (command === 'cancel_download') {
+          // @ts-expect-error - the test asserts on what the command was given.
+          window.__ONERA_CANCELLED__ = args?.jobId;
+          job.state = 'cancelled';
+          job.bytes_downloaded = 0;
+          return null;
+        }
+        throw { code: 'internal', message: `no stub for ${command}` };
+      },
+      listen: async () => () => {},
+    };
+  });
+
+  await page.goto('/downloads');
+  await page.getByRole('button', { name: 'Cancel' }).click();
+
+  await expect(page.getByText('cancelled')).toBeVisible();
+  // A stopped job has nothing left to stop.
+  await expect(page.getByRole('button', { name: 'Cancel' })).toHaveCount(0);
+  expect(await page.evaluate(() => window.__ONERA_CANCELLED__)).toBe('job-1');
+});
+
 test('recovery reports when nothing was interrupted', async ({ page }) => {
   await stubBridge(page, { interrupted_operations: [] });
   await page.goto('/recovery');

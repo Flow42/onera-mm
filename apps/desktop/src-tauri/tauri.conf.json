@@ -45,6 +45,7 @@
           "/usr/share/onera/extension/src/mod-actions.js": "../../../extension/src/mod-actions.js",
           "/usr/share/onera/extension/src/nxm.js": "../../../extension/src/nxm.js",
           "/usr/share/onera/extension/src/nxm-intercept.js": "../../../extension/src/nxm-intercept.js",
+          "/usr/share/onera/extension/src/nxm-relay.js": "../../../extension/src/nxm-relay.js",
           "/usr/share/onera/extension/src/popup.html": "../../../extension/src/popup.html",
           "/usr/share/onera/extension/src/popup.js": "../../../extension/src/popup.js",
           "/usr/share/onera/extension/icons/onera-48.png": "../../../extension/icons/onera-48.png",

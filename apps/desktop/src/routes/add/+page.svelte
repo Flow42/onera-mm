@@ -56,8 +56,21 @@
     await fetchDetails();
   }
 
-  async function dismiss(request: InboxRequest) {
-    await commands.dismissInboxRequest(request.id);
+  /**
+   * Take a request out of the inbox, stopping it if it has already started.
+   *
+   * One action for both cases deliberately: from here a request that is queued,
+   * one the desktop is downloading right now and one that failed all look the
+   * same, and the user's intent — stop doing this — does not change with the
+   * state it happens to be in. Only the label does.
+   */
+  async function cancel(request: InboxRequest) {
+    error = null;
+    try {
+      await commands.cancelInboxRequest(request.id);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
     if (activeRequest?.id === request.id) activeRequest = null;
     await refreshInbox();
   }
@@ -112,7 +125,9 @@
         >{request.kind.replaceAll('_', ' ')}: {request.game_slug}/mods/{request.provider_mod_id}</span
       >
       <button onclick={() => openRequest(request)}>Open</button>
-      <button onclick={() => dismiss(request)}>Dismiss</button>
+      <button onclick={() => cancel(request)}>
+        {request.state === 'failed' ? 'Dismiss' : 'Cancel'}
+      </button>
       {#if request.error !== null}<span class="severity-danger">{request.error}</span>{/if}
     </div>
   {/each}

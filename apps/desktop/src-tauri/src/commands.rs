@@ -590,6 +590,33 @@ pub async fn complete_inbox_request(
     Ok(())
 }
 
+/// Stop a queued browser request, and whatever it had already started.
+///
+/// The request leaves the inbox either way. Anything it downloaded before the
+/// cancel stays in Onera's store — a partial transfer is discarded, but bytes
+/// that already became an archive are not thrown away for a cancel.
+#[tauri::command]
+pub async fn cancel_inbox_request(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> CommandResult<()> {
+    let id = request_id
+        .parse::<uuid::Uuid>()
+        .map(onera_core::ids::InboxRequestId::from)
+        .map_err(|_| CommandError {
+            code: "invalid_input".into(),
+            message: "that is not a valid inbox request id".into(),
+        })?;
+    // Told to stop first, then dismissed: the watcher records the outcome of
+    // the request it was running, and a dismissal written after that is the one
+    // the user sees.
+    if let Some(token) = state.inbox_cancels.lock().await.get(&id) {
+        token.cancel();
+    }
+    state.onera.dismiss_inbox_request(id).await?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn downloads(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     Ok(serde_json::to_value(state.onera.downloads().await?).unwrap_or(serde_json::Value::Null))
@@ -639,6 +666,23 @@ pub async fn download_file(
         "bytes": outcome.bytes,
         "deduplicated": outcome.deduplicated,
     }))
+}
+
+/// Stop a download the user no longer wants.
+///
+/// Cancellation is cooperative: a transfer stops at its next safe point, and
+/// the job is left in a state nothing resumes.
+#[tauri::command]
+pub async fn cancel_download(state: State<'_, AppState>, job_id: String) -> CommandResult<()> {
+    let id = job_id
+        .parse::<uuid::Uuid>()
+        .map(onera_core::ids::DownloadJobId::from)
+        .map_err(|_| CommandError {
+            code: "invalid_input".into(),
+            message: "that is not a valid download job id".into(),
+        })?;
+    state.onera.cancel_download(id).await?;
+    Ok(())
 }
 
 #[tauri::command]

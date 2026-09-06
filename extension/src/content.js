@@ -36,6 +36,9 @@
   container.append(status, row);
   document.body.append(container);
 
+  /** A button the relay asked for, kept so a redraw does not lose it. */
+  let offered = null;
+
   /**
    * Ask the service worker to act, and reflect the outcome on the button.
    *
@@ -75,6 +78,11 @@
   function render(view) {
     status.textContent = view.status;
     row.replaceChildren();
+    // The relay's offer is not one of the mod's actions and does not expire
+    // with them, so it survives a redraw.
+    if (offered !== null) {
+      row.append(offered);
+    }
     for (const { label, action, primary } of view.buttons) {
       const button = document.createElement('button');
       button.textContent = label;
@@ -110,40 +118,42 @@
     }
   }
 
-  // The page's own "Mod manager download" ends in a `nxm://` address, which the
-  // page-world script catches and posts here. This side re-checks the sender —
-  // any script on the page can post a message — and lets the service worker do
-  // the parsing, which is where every other piece of untrusted input is checked.
-  window.addEventListener('message', (event) => {
-    if (event.source !== window || event.origin !== window.location.origin) {
-      return;
-    }
-    const data = event.data;
-    if (data === null || typeof data !== 'object' || data.channel !== 'onera:nxm') {
-      return;
-    }
-    void handOver(data.url);
-  });
-
-  /**
-   * Send a captured download link to Onera and say what happened.
-   *
-   * @param {unknown} url - The candidate address, still unvalidated.
-   */
-  async function handOver(url) {
-    status.textContent = 'Handing the download to Onera…';
-    try {
-      const response = await chrome.runtime.sendMessage({ action: 'nxm_download', url });
-      if (response?.ok === true) {
-        status.textContent = 'Sent to Onera — running it now.';
-        setTimeout(() => void refresh(), 4000);
-      } else {
-        status.textContent = String(response?.message ?? 'Onera could not take that download.');
+  // The panel the relay drives. A download captured on this page — or on the
+  // download page the site sends the user to — is handed over by
+  // `nxm-relay.js`, which runs everywhere this script does not; what it needs
+  // from here is somewhere to say so, rather than a second panel of its own.
+  window[Symbol.for('onera.panel')] = {
+    /**
+     * Replace the status line.
+     *
+     * @param {string} text - One line for the user.
+     */
+    status(text) {
+      status.textContent = text;
+    },
+    /**
+     * Add a button that is not one of the mod's own actions.
+     *
+     * @param {string} label - What the button says.
+     * @param {() => void} onClick - What pressing it does.
+     */
+    offer(label, onClick) {
+      const button = offered ?? document.createElement('button');
+      button.textContent = label;
+      button.style.cssText =
+        'padding:8px 12px;border-radius:6px;cursor:pointer;border:1px solid transparent;' +
+        'background:#7aa2f7;color:#10101a;font-weight:600;';
+      button.onclick = onClick;
+      if (offered === null) {
+        offered = button;
+        row.prepend(button);
       }
-    } catch {
-      status.textContent = 'The Onera extension could not be reached.';
-    }
-  }
+    },
+    /** Ask Onera again what it has for this mod. */
+    refresh() {
+      void refresh();
+    },
+  };
 
   await refresh();
 })();

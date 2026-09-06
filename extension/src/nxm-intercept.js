@@ -21,6 +21,11 @@
  * * it decides nothing. It forwards a candidate string to the extension, which
  *   parses and validates it as untrusted input, exactly as it treats a page URL.
  *
+ * It runs on every Nexus page and in every frame, not only on mod pages: the
+ * click that mints the link happens on whatever page or modal frame the site
+ * chose to put its "slow download" button on, and that page is not the mod
+ * page the user started from.
+ *
  * @module nxm-intercept
  */
 
@@ -77,26 +82,69 @@
     }
   }
 
-  // 1. A link the page renders with the scheme on it. Cancelled, because
+  /**
+   * The download link an element carries, wherever it carries it.
+   *
+   * An anchor spells it in `href`; a button that navigates from script usually
+   * keeps it in a data attribute instead. Reading every attribute rather than
+   * naming the one the site currently uses is what keeps this independent of
+   * the markup — the scheme is the only thing being matched.
+   *
+   * @param {Element} element - The element to read.
+   * @returns {string | null}
+   */
+  function linkOn(element) {
+    for (const attribute of element.attributes) {
+      const value = attribute.value;
+      if (typeof value === 'string' && value.slice(0, 8).toLowerCase().startsWith('nxm:')) {
+        return value;
+      }
+    }
+    return null;
+  }
+
+  // 1. A click on something carrying the scheme. The path is walked rather than
+  //    the target inspected, because the element the site listens on is often
+  //    an ancestor of the one clicked — and inside a shadow root, `target` is
+  //    the host rather than the button. An anchor is also cancelled, because
   //    following it would ask the operating system to open some other mod
   //    manager for a download Onera has already taken.
   document.addEventListener(
     'click',
     (event) => {
-      const target = event.target;
-      if (!(target instanceof Element)) {
+      const path = typeof event.composedPath === 'function' ? event.composedPath() : [event.target];
+      for (const node of path) {
+        if (!(node instanceof Element)) {
+          continue;
+        }
+        const link = linkOn(node);
+        if (link === null) {
+          continue;
+        }
+        offer(link);
+        if (node instanceof HTMLAnchorElement) {
+          event.preventDefault();
+        }
         return;
-      }
-      const anchor = target.closest('a[href^="nxm:" i]');
-      if (anchor instanceof HTMLAnchorElement) {
-        offer(anchor.href);
-        event.preventDefault();
       }
     },
     true,
   );
 
-  // 2. The address arriving over the network. This is the case that actually
+  // 2. The same link followed from script. `a.click()` on an anchor the page
+  //    never put in the document dispatches an event no document listener sees,
+  //    and it is a common way to start a download.
+  const nativeAnchorClick = HTMLAnchorElement.prototype.click;
+  HTMLAnchorElement.prototype.click = function clickWithNxmWatch(...args) {
+    try {
+      offer(this.getAttribute('href'));
+    } catch {
+      /* An anchor that cannot be read is simply not offered. */
+    }
+    return nativeAnchorClick.apply(this, args);
+  };
+
+  // 3. The address arriving over the network. This is the case that actually
   //    fires on the current site: the page asks for a download link and then
   //    assigns it to `location`, which nothing can observe.
   const nativeFetch = window.fetch;
@@ -136,9 +184,10 @@
     return nativeSend.apply(this, args);
   };
 
-  // 3. The remaining ways a page can send the browser somewhere by name.
-  //    `location.href = …` is not among them — it cannot be intercepted — which
-  //    is precisely why case 2 exists.
+  // 4. The remaining ways a page can send the browser somewhere by name.
+  //    `location.href = …` is not among them — the property is unforgeable and
+  //    cannot be intercepted — which is why cases 1 to 3 exist, and why the
+  //    content script also offers the link it can find in the page itself.
   const nativeOpen = window.open;
   if (typeof nativeOpen === 'function') {
     window.open = function openWithNxmWatch(url, ...rest) {

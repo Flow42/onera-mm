@@ -16,8 +16,13 @@ export const ALLOWED_HOSTS = new Set(['www.nexusmods.com', 'nexusmods.com']);
 /**
  * The shape of a mod page URL: `/<game-domain>/mods/<id>`, with anything
  * after it (tabs, query strings, fragments) ignored.
+ *
+ * The optional `games/` prefix is the site's newer spelling of the same page.
+ * Both name the same mod, and the domain is the segment before `mods` either
+ * way, so both are read rather than the extension going blind on whichever
+ * layout the user happens to land on.
  */
-const MOD_PATH = /^\/([a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?)\/mods\/(\d+)(?:\/.*)?$/i;
+const MOD_PATH = /^(?:\/games)?\/([a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?)\/mods\/(\d+)(?:\/.*)?$/i;
 
 /** Longest identifier accepted, matching the native host's own limit. */
 const MAX_ID_LENGTH = 64;
