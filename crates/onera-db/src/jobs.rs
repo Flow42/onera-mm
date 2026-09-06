@@ -8,6 +8,8 @@ use onera_core::ids::{
     ArchiveId, DownloadJobId, InboxRequestId, LocalGameId, ProviderFileId, ProviderId,
     ProviderModId,
 };
+use onera_core::ports::DownloadGrant;
+use onera_core::redact::Secret;
 use onera_core::{CoreError, Result};
 use serde::{Deserialize, Serialize};
 use sqlx::Row as _;
@@ -144,6 +146,16 @@ pub struct InboxRequest {
     /// The local game the request targets, when exactly one adapter claimed the
     /// slug and that game is registered.
     pub local_game_id: Option<LocalGameId>,
+    /// A download the provider's website authorised for this exact file.
+    ///
+    /// Present only for a request that came from a "Mod manager download"
+    /// click, and short-lived by construction — see
+    /// [`onera_core::ports::DownloadGrant`]. It is skipped by serde in both
+    /// directions: a nonce has no business in the JSON the window renders, and
+    /// a [`Secret`](onera_core::redact::Secret) that serialized as `[redacted]`
+    /// must never be read back as if it were the real value.
+    #[serde(skip)]
+    pub download_grant: Option<DownloadGrant>,
     /// Whether the desktop may act on this request without asking first.
     ///
     /// Only ever true for a request the user made by clicking a button, and
@@ -182,6 +194,7 @@ impl InboxRequest {
             error: None,
             page_url: None,
             local_game_id: None,
+            download_grant: None,
             auto_run: false,
             started_at: None,
             created_at: at,
@@ -312,11 +325,14 @@ impl Database {
             "INSERT INTO inbox_requests
                (id, request_kind, provider_id, game_slug, provider_mod_id,
                 provider_file_id, state, error, created_at, updated_at,
-                page_url, local_game_id, auto_run, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                page_url, local_game_id, auto_run, started_at,
+                download_key, download_expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                     ?15, ?16)
              ON CONFLICT(id) DO UPDATE SET provider_file_id = ?6, state = ?7,
                error = ?8, updated_at = ?10, page_url = ?11, local_game_id = ?12,
-               auto_run = ?13, started_at = ?14",
+               auto_run = ?13, started_at = ?14, download_key = ?15,
+               download_expires_at = ?16",
         )
         .bind(request.id.to_string())
         .bind(request.kind.as_str())
@@ -337,6 +353,21 @@ impl Database {
         .bind(request.local_game_id.map(|id| id.to_string()))
         .bind(i64::from(request.auto_run))
         .bind(request.started_at.map(|at| at.to_rfc3339()))
+        // The one place a grant's plaintext is written down, and the reason the
+        // column exists: the host process that received it exits long before
+        // the desktop spends it.
+        .bind(
+            request
+                .download_grant
+                .as_ref()
+                .map(|grant| grant.key.expose().to_owned()),
+        )
+        .bind(
+            request
+                .download_grant
+                .as_ref()
+                .map(|grant| grant.expires_at.to_rfc3339()),
+        )
         .execute(self.pool())
         .await
         .map_err(db_err)?;
@@ -351,7 +382,8 @@ impl Database {
         let rows = sqlx::query(
             "SELECT id, request_kind, provider_id, game_slug, provider_mod_id,
                     provider_file_id, state, error, created_at, updated_at,
-                    page_url, local_game_id, auto_run, started_at
+                    page_url, local_game_id, auto_run, started_at,
+                    download_key, download_expires_at
              FROM inbox_requests
              WHERE state IN ('queued', 'waiting_for_user', 'failed')
              ORDER BY created_at",
@@ -455,6 +487,20 @@ fn row_to_inbox(row: sqlx::sqlite::SqliteRow) -> Result<InboxRequest> {
             .map(|value| uuid(&value).map(LocalGameId::from))
             .transpose()?,
         auto_run: row.try_get::<i64, _>("auto_run").map_err(db_err)? != 0,
+        // Both halves or neither: a key with no expiry cannot be checked for
+        // freshness, and an expiry with no key cannot be spent.
+        download_grant: match (
+            row.try_get::<Option<String>, _>("download_key")
+                .map_err(db_err)?,
+            row.try_get::<Option<String>, _>("download_expires_at")
+                .map_err(db_err)?,
+        ) {
+            (Some(key), Some(expires)) => Some(DownloadGrant {
+                key: Secret::new(key),
+                expires_at: from_timestamp(&expires)?,
+            }),
+            _ => None,
+        },
         started_at: row
             .try_get::<Option<String>, _>("started_at")
             .map_err(db_err)?

@@ -15,6 +15,7 @@ use onera_install::remove::ModifiedFilePolicy;
 use serde_json::json;
 use std::str::FromStr;
 use tauri::State;
+use tauri_plugin_dialog::DialogExt as _;
 use tauri_plugin_opener::OpenerExt as _;
 
 fn parse_game(id: &str) -> CommandResult<LocalGameId> {
@@ -143,6 +144,192 @@ pub async fn local_games(state: State<'_, AppState>) -> CommandResult<serde_json
             "confirmed": g.confirmed,
         }))
         .collect::<Vec<_>>()))
+}
+
+/// Where one game is installed and where its archives are extracted.
+///
+/// Both are directories the user may want to look at, and the second is one
+/// they may want to change: a game on another disk is better staged on that
+/// disk than copied across a filesystem boundary twice per install.
+#[tauri::command]
+pub async fn game_paths(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> CommandResult<serde_json::Value> {
+    let game = parse_game(&game_id)?;
+    let install = state
+        .onera
+        .local_games()
+        .await?
+        .into_iter()
+        .find(|candidate| candidate.id == game)
+        .ok_or_else(|| CommandError {
+            code: "not_found".into(),
+            message: "that game is not registered".into(),
+        })?;
+    let staging = state.onera.staging_info(game).await?;
+    Ok(json!({
+        "install_root": install.install_root,
+        "staging_root": staging.root,
+        "staging_is_default": staging.is_default,
+        "staging_entries": staging.entries,
+    }))
+}
+
+/// Point one game's extractions at another directory.
+///
+/// The directory has to be empty, and Onera says why rather than silently
+/// choosing something else: everything under a staging root is deleted when
+/// Onera starts, so it will only take one that has nothing to lose. Whatever is
+/// in the old root — an unfinished extraction — moves across with the setting.
+#[tauri::command]
+pub async fn set_game_staging_root(
+    state: State<'_, AppState>,
+    game_id: String,
+    path: String,
+) -> CommandResult<serde_json::Value> {
+    let change = state
+        .onera
+        .set_staging_root(parse_game(&game_id)?, std::path::Path::new(&path))
+        .await?;
+    Ok(serde_json::to_value(change).unwrap_or(serde_json::Value::Null))
+}
+
+/// Ask the user for a staging directory, and use it if they choose one.
+///
+/// The picker runs here rather than in the window because the whole change is
+/// one decision: choose a directory, have it checked, have the unfinished work
+/// in the old one moved across. Splitting it would leave a window able to point
+/// staging at a path the user never saw.
+///
+/// `None` means the user cancelled, which is not an error.
+#[tauri::command]
+pub async fn pick_game_staging_root(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    game_id: String,
+) -> CommandResult<Option<serde_json::Value>> {
+    let game = parse_game(&game_id)?;
+    let current = state.onera.staging_info(game).await?;
+
+    let (send, receive) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Choose an empty directory for staging")
+        .set_directory(&current.root)
+        .pick_folder(move |chosen| {
+            // The receiver is only dropped if the window went away first, in
+            // which case there is nothing to tell.
+            let _ = send.send(chosen);
+        });
+    let Ok(Some(chosen)) = receive.await else {
+        return Ok(None);
+    };
+    let path = chosen.into_path().map_err(|e| CommandError {
+        code: "internal".into(),
+        message: format!("that directory could not be read: {e}"),
+    })?;
+
+    let change = state.onera.set_staging_root(game, &path).await?;
+    Ok(Some(
+        serde_json::to_value(change).unwrap_or(serde_json::Value::Null),
+    ))
+}
+
+/// Return one game to Onera's own staging directory.
+#[tauri::command]
+pub async fn reset_game_staging_root(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> CommandResult<serde_json::Value> {
+    let change = state.onera.reset_staging_root(parse_game(&game_id)?).await?;
+    Ok(serde_json::to_value(change).unwrap_or(serde_json::Value::Null))
+}
+
+/// Where downloads are kept, for one game or for everything.
+///
+/// `gameId` is optional on purpose: the settings screen asks about the shared
+/// directory, and a game's page asks about that game — which answers with the
+/// shared directory too when the game has not overridden it, and says so.
+#[tauri::command]
+pub async fn download_paths(
+    state: State<'_, AppState>,
+    game_id: Option<String>,
+) -> CommandResult<serde_json::Value> {
+    let game = game_id.as_deref().map(parse_game).transpose()?;
+    let info = state.onera.download_dir_info(game).await?;
+    Ok(serde_json::to_value(info).unwrap_or(serde_json::Value::Null))
+}
+
+/// Ask the user where downloads should go, and move what is there already.
+///
+/// With a `gameId` this sets that game's own directory, overriding the shared
+/// one; without, it sets the shared one. `None` means the user cancelled.
+#[tauri::command]
+pub async fn pick_download_root(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    game_id: Option<String>,
+) -> CommandResult<Option<serde_json::Value>> {
+    let game = game_id.as_deref().map(parse_game).transpose()?;
+    let current = state.onera.download_dir_info(game).await?;
+
+    let (send, receive) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Choose where downloaded mods are kept")
+        .set_directory(&current.root)
+        .pick_folder(move |chosen| {
+            let _ = send.send(chosen);
+        });
+    let Ok(Some(chosen)) = receive.await else {
+        return Ok(None);
+    };
+    let path = chosen.into_path().map_err(|e| CommandError {
+        code: "internal".into(),
+        message: format!("that directory could not be read: {e}"),
+    })?;
+
+    let change = match game {
+        Some(game) => state.onera.set_game_download_root(game, &path).await?,
+        None => state.onera.set_download_root(&path).await?,
+    };
+    Ok(Some(
+        serde_json::to_value(change).unwrap_or(serde_json::Value::Null),
+    ))
+}
+
+/// Drop an override: a game returns to the shared directory, and the shared
+/// directory returns to Onera's own.
+#[tauri::command]
+pub async fn reset_download_root(
+    state: State<'_, AppState>,
+    game_id: Option<String>,
+) -> CommandResult<serde_json::Value> {
+    let change = match game_id.as_deref().map(parse_game).transpose()? {
+        Some(game) => state.onera.reset_game_download_root(game).await?,
+        None => state.onera.reset_download_root().await?,
+    };
+    Ok(serde_json::to_value(change).unwrap_or(serde_json::Value::Null))
+}
+
+/// A game's own icon, found in its installation directory, as a data URI.
+///
+/// `None` is an ordinary answer: plenty of games ship no image, and the card
+/// falls back to the initials it already draws.
+#[tauri::command]
+pub async fn game_icon(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> CommandResult<Option<String>> {
+    let Some(icon) = state.onera.game_icon(parse_game(&game_id)?).await? else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "data:{};base64,{}",
+        icon.content_type,
+        base64(&icon.bytes)
+    )))
 }
 
 /// Open the provider's mod listing for a game in the user's browser.
@@ -291,6 +478,53 @@ pub async fn mod_artwork(
     )))
 }
 
+/// The files one installed mod owns, and the directory that holds them all.
+///
+/// `limit` bounds the list, never the count: the view shows the first few and
+/// says how many there are.
+#[tauri::command]
+pub async fn mod_contents(
+    state: State<'_, AppState>,
+    game_id: String,
+    installation_id: String,
+    limit: usize,
+) -> CommandResult<serde_json::Value> {
+    let contents = state
+        .onera
+        .mod_contents(
+            parse_game(&game_id)?,
+            parse_installation(&installation_id)?,
+            limit.min(500),
+        )
+        .await?;
+    Ok(serde_json::to_value(contents).unwrap_or(serde_json::Value::Null))
+}
+
+/// Show one mod's files in the system file manager.
+///
+/// The directory is recomputed here from what Onera deployed rather than
+/// accepted from the window: a command that opened a path it was handed would
+/// be a command that opens anything at all.
+#[tauri::command]
+pub async fn browse_mod_files(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    game_id: String,
+    installation_id: String,
+) -> CommandResult<String> {
+    let path = state
+        .onera
+        .mod_browse_path(parse_game(&game_id)?, parse_installation(&installation_id)?)
+        .await?;
+    app.opener()
+        .open_path(path.display().to_string(), None::<&str>)
+        .map_err(|e| CommandError {
+            code: "internal".into(),
+            message: format!("the file manager could not be opened: {e}"),
+        })?;
+    Ok(path.display().to_string())
+}
+
 /// Encode bytes as standard base64.
 ///
 /// Written out rather than pulled in: one call site, no padding subtleties, and
@@ -391,6 +625,9 @@ pub async fn download_file(
                 filename: file.name.clone(),
                 expected_size: file.size_bytes,
                 expected_hash: file.published_hash.clone(),
+                // A download started from the window has no browser click
+                // behind it, so nothing authorised it but the API key.
+                grant: None,
             },
             &state.progress(),
             &cancel,
@@ -483,6 +720,7 @@ pub async fn prepare_install(
                 filename: file.name.clone(),
                 expected_size: file.size_bytes,
                 expected_hash: file.published_hash.clone(),
+                grant: None,
             },
             &progress,
             &cancel,

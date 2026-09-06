@@ -17,7 +17,20 @@ use onera_core::ids::{
 };
 use onera_core::{CoreError, Result};
 use sqlx::Row as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Read one archive row into the shape callers use.
+fn row_to_stored_archive(row: sqlx::sqlite::SqliteRow) -> Result<StoredArchive> {
+    let id: String = row.try_get("id").map_err(db_err)?;
+    let stored_hash: String = row.try_get("hash").map_err(db_err)?;
+    let size: i64 = row.try_get("size").map_err(db_err)?;
+    Ok(StoredArchive {
+        id: ArchiveId::from(uuid(&id)?),
+        hash: crate::convert::hash(&stored_hash)?,
+        path: PathBuf::from(row.try_get::<String, _>("stored_path").map_err(db_err)?),
+        size: size.max(0) as u64,
+    })
+}
 
 /// Installed-mod data required by application list and update flows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,6 +411,209 @@ impl Database {
         Ok(install.id)
     }
 
+    /// Where one game's archives are extracted, when the user chose somewhere.
+    ///
+    /// `None` means the default staging root under `$XDG_STATE_HOME` — which is
+    /// also what a game that has never been given one returns, so a caller
+    /// never has to tell "unset" from "set to the default".
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn staging_root(&self, game: LocalGameId) -> Result<Option<PathBuf>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT path FROM game_staging_roots WHERE local_game_id = ?1")
+                .bind(game.to_string())
+                .fetch_optional(self.pool())
+                .await
+                .map_err(db_err)?;
+        Ok(row.map(|(path,)| PathBuf::from(path)))
+    }
+
+    /// Record where one game's archives should be extracted.
+    ///
+    /// Passing `None` returns the game to the default root by deleting the row,
+    /// rather than by writing the default path into it: the default is allowed
+    /// to move between releases, and a stored copy of it would not.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn set_staging_root(&self, game: LocalGameId, path: Option<&Path>) -> Result<()> {
+        match path {
+            Some(path) => sqlx::query(
+                "INSERT INTO game_staging_roots (local_game_id, path, created_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(local_game_id) DO UPDATE SET path = ?2, created_at = ?3",
+            )
+            .bind(game.to_string())
+            .bind(path.display().to_string())
+            .bind(now())
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?,
+            None => sqlx::query("DELETE FROM game_staging_roots WHERE local_game_id = ?1")
+                .bind(game.to_string())
+                .execute(self.pool())
+                .await
+                .map_err(db_err)?,
+        };
+        Ok(())
+    }
+
+    /// Every staging root a game has been given, for the startup sweep.
+    ///
+    /// The sweep has to know about roots it did not choose: an extraction left
+    /// behind by a crash is just as stale wherever the user put it.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn staging_roots(&self) -> Result<Vec<PathBuf>> {
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT path FROM game_staging_roots")
+            .fetch_all(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().map(|(path,)| PathBuf::from(path)).collect())
+    }
+
+    /// The application-wide download directory, when the user chose one.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn download_root(&self) -> Result<Option<PathBuf>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT path FROM app_directories WHERE kind = 'downloads'")
+                .fetch_optional(self.pool())
+                .await
+                .map_err(db_err)?;
+        Ok(row.map(|(path,)| PathBuf::from(path)))
+    }
+
+    /// Set or clear the application-wide download directory.
+    ///
+    /// `None` deletes the row rather than writing the default path into it: the
+    /// default is allowed to move between releases, and a stored copy of it
+    /// would quietly pin the old one.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn set_download_root(&self, path: Option<&Path>) -> Result<()> {
+        match path {
+            Some(path) => sqlx::query(
+                "INSERT INTO app_directories (kind, path, updated_at)
+                 VALUES ('downloads', ?1, ?2)
+                 ON CONFLICT(kind) DO UPDATE SET path = ?1, updated_at = ?2",
+            )
+            .bind(path.display().to_string())
+            .bind(now())
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?,
+            None => sqlx::query("DELETE FROM app_directories WHERE kind = 'downloads'")
+                .execute(self.pool())
+                .await
+                .map_err(db_err)?,
+        };
+        Ok(())
+    }
+
+    /// One game's download directory, when it overrides the shared one.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn game_download_root(&self, game: LocalGameId) -> Result<Option<PathBuf>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT path FROM game_download_roots WHERE local_game_id = ?1")
+                .bind(game.to_string())
+                .fetch_optional(self.pool())
+                .await
+                .map_err(db_err)?;
+        Ok(row.map(|(path,)| PathBuf::from(path)))
+    }
+
+    /// Set or clear one game's download directory.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn set_game_download_root(
+        &self,
+        game: LocalGameId,
+        path: Option<&Path>,
+    ) -> Result<()> {
+        match path {
+            Some(path) => sqlx::query(
+                "INSERT INTO game_download_roots (local_game_id, path, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(local_game_id) DO UPDATE SET path = ?2, updated_at = ?3",
+            )
+            .bind(game.to_string())
+            .bind(path.display().to_string())
+            .bind(now())
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?,
+            None => sqlx::query("DELETE FROM game_download_roots WHERE local_game_id = ?1")
+                .bind(game.to_string())
+                .execute(self.pool())
+                .await
+                .map_err(db_err)?,
+        };
+        Ok(())
+    }
+
+    /// Every stored archive.
+    ///
+    /// Used when a download directory moves: the database points at archives by
+    /// absolute path, so moving the files without rewriting the rows would lose
+    /// every one of them.
+    ///
+    /// # Errors
+    /// Propagates database and stored-value conversion errors.
+    pub async fn archives(&self) -> Result<Vec<StoredArchive>> {
+        let rows = sqlx::query("SELECT id, hash, stored_path, size FROM archives")
+            .fetch_all(self.pool())
+            .await
+            .map_err(db_err)?;
+        rows.into_iter().map(row_to_stored_archive).collect()
+    }
+
+    /// Stored archives belonging to the mods of one provider game slug.
+    ///
+    /// "Belonging" is the relation the rest of the catalogue uses: an archive is
+    /// linked to the provider file it was downloaded for, which belongs to a
+    /// release of a mod, which is for one game.
+    ///
+    /// # Errors
+    /// Propagates database and stored-value conversion errors.
+    pub async fn archives_for_game_slug(&self, game_slug: &str) -> Result<Vec<StoredArchive>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT a.id, a.hash, a.stored_path, a.size
+             FROM archives a
+             JOIN archive_provider_files apf ON apf.archive_id = a.id
+             JOIN provider_files pf ON pf.id = apf.provider_file_id
+             JOIN releases r ON r.id = pf.release_id
+             JOIN mods m ON m.id = r.mod_id
+             WHERE m.game_slug = ?1",
+        )
+        .bind(game_slug)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        rows.into_iter().map(row_to_stored_archive).collect()
+    }
+
+    /// Record that one archive now lives somewhere else.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn set_archive_path(&self, archive: ArchiveId, path: &Path) -> Result<()> {
+        sqlx::query("UPDATE archives SET stored_path = ?2 WHERE id = ?1")
+            .bind(archive.to_string())
+            .bind(path.display().to_string())
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Every known local installation.
     ///
     /// # Errors
@@ -603,7 +819,7 @@ impl Database {
         let row = sqlx::query(
             "SELECT release_id, provider_version_id, provider_file_group_id,
                     provider_position, name, size_bytes, category, published_hash,
-                    uploaded_at, is_primary
+                    uploaded_at, is_primary, provider_download_id
              FROM provider_files WHERE provider_id = ?1 AND provider_file_id = ?2",
         )
         .bind(provider.as_str())
@@ -621,6 +837,10 @@ impl Database {
             Ok(ProviderFile {
                 provider: provider.clone(),
                 provider_file_id: provider_file_id.clone(),
+                provider_download_id: row
+                    .try_get::<Option<String>, _>("provider_download_id")
+                    .map_err(db_err)?
+                    .map(ProviderFileId::new),
                 provider_version_id: row
                     .try_get::<Option<String>, _>("provider_version_id")
                     .map_err(db_err)?
@@ -686,13 +906,15 @@ impl Database {
             "INSERT INTO provider_files
                (id, release_id, provider_id, provider_file_id, provider_version_id,
                 provider_file_group_id, provider_position, name, size_bytes,
-                category, published_hash, uploaded_at, is_primary)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                category, published_hash, uploaded_at, is_primary,
+                provider_download_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(provider_id, provider_file_id) DO UPDATE SET
                release_id = ?2, provider_version_id = ?5,
                provider_file_group_id = ?6, provider_position = ?7,
                name = ?8, size_bytes = ?9, category = ?10,
-               published_hash = ?11, uploaded_at = ?12, is_primary = ?13",
+               published_hash = ?11, uploaded_at = ?12, is_primary = ?13,
+               provider_download_id = ?14",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(f.release_id.to_string())
@@ -715,6 +937,7 @@ impl Database {
         .bind(f.published_hash.as_ref().map(FileHash::to_storage_string))
         .bind(f.uploaded_at.map(to_timestamp))
         .bind(i64::from(f.is_primary))
+        .bind(f.provider_download_id.as_ref().map(ProviderFileId::as_str))
         .execute(self.pool())
         .await
         .map_err(db_err)?;
@@ -729,7 +952,8 @@ impl Database {
         let rows = sqlx::query(
             "SELECT provider_id, provider_file_id, provider_version_id,
                     provider_file_group_id, provider_position, name, size_bytes,
-                    category, published_hash, uploaded_at, is_primary
+                    category, published_hash, uploaded_at, is_primary,
+                    provider_download_id
              FROM provider_files WHERE release_id = ?1 ORDER BY name",
         )
         .bind(release.to_string())
@@ -752,6 +976,10 @@ impl Database {
                         .try_get::<Option<String>, _>("provider_version_id")
                         .map_err(db_err)?
                         .map(ProviderVersionId::new),
+                    provider_download_id: row
+                        .try_get::<Option<String>, _>("provider_download_id")
+                        .map_err(db_err)?
+                        .map(ProviderFileId::new),
                     provider_file_group_id: row
                         .try_get::<Option<String>, _>("provider_file_group_id")
                         .map_err(db_err)?

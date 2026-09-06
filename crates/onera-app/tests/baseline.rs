@@ -66,6 +66,7 @@ impl ModProvider for NoProvider {
         _: &str,
         _: &ProviderModId,
         _: &ProviderFileId,
+        _: Option<&onera_core::ports::DownloadGrant>,
         _: &CancelToken,
     ) -> onera_core::Result<DownloadTarget> {
         Err(CoreError::Unsupported("no provider in this test".into()))
@@ -887,6 +888,7 @@ async fn activate_a_fake_mod(onera: &Onera, game: LocalGameId) {
         provider: ProviderId::nexus(),
         provider_file_id: ProviderFileId::new("9001"),
         provider_version_id: None,
+        provider_download_id: None,
         provider_file_group_id: None,
         position: None,
         release_id: release,

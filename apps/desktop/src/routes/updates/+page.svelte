@@ -10,6 +10,7 @@
   up to date".
 -->
 <script lang="ts">
+  import { page } from '$app/state';
   import { BridgeError, commands } from '$lib/bridge';
   import SolvedPlan from '$lib/components/SolvedPlan.svelte';
   import {
@@ -152,7 +153,11 @@
     try {
       games = await commands.localGames();
       loadingGames = false;
-      const first = games[0];
+      // The section is reached from one game's submenu, so the address says
+      // which installation it is about; opened directly it falls back to the
+      // first registered game rather than showing nothing.
+      const requested = page.url.searchParams.get('game');
+      const first = games.find((candidate) => candidate.id === requested) ?? games[0];
       if (first !== undefined) await selectGame(first.id);
     } catch (value) {
       showError(value);

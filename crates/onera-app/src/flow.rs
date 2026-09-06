@@ -30,7 +30,7 @@ use onera_core::ids::{
 use onera_core::plan::{InstallPlan, ScopedRule, TargetLocation};
 use onera_core::ports::{
     AccountInfo, ArchiveBackend, ArchiveStore, AuthProvider, Credential, DeploymentStore,
-    GameAdapter, ModProvider, OperationJournal, ProfileStore, SecretStore,
+    DownloadGrant, GameAdapter, ModProvider, OperationJournal, ProfileStore, SecretStore,
 };
 use onera_core::progress::{CancelToken, ProgressSink};
 use onera_core::redact::Secret;
@@ -133,8 +133,16 @@ impl Onera {
         allow_plain_http: bool,
     ) -> Result<Self> {
         paths.ensure().await?;
-        let expired_prepared_plans = cleanup_expired_staging(&paths).await?;
         let db = Database::open(&paths.database()).await?;
+        // Swept after the database opens, because a game may stage somewhere
+        // other than the default root and a leftover there is just as stale.
+        let mut roots = vec![paths.staging()];
+        roots.extend(db.staging_roots().await?);
+        roots.dedup();
+        let mut expired_prepared_plans = 0;
+        for root in &roots {
+            expired_prepared_plans += cleanup_expired_staging(root).await?;
+        }
         db.upsert_provider(
             &ProviderId::nexus(),
             "Nexus Mods",
@@ -933,6 +941,7 @@ impl Onera {
             provider_mod_id,
             provider_file_id: None,
             page_url: None,
+            download_grant: None,
             auto_run: false,
         })
         .await
@@ -959,6 +968,7 @@ impl Onera {
             provider_mod_id,
             provider_file_id: Some(provider_file_id),
             page_url: None,
+            download_grant: None,
             auto_run: false,
         })
         .await
@@ -982,6 +992,7 @@ impl Onera {
         let mut request = InboxRequest {
             page_url: action.page_url,
             local_game_id,
+            download_grant: action.download_grant,
             // An install with nowhere to install to waits for the user; a plain
             // download needs no game at all.
             auto_run: action.auto_run
@@ -1021,6 +1032,7 @@ impl Onera {
             provider_mod_id,
             provider_file_id: None,
             page_url: None,
+            download_grant: None,
             auto_run: false,
         })
         .await
@@ -1114,7 +1126,9 @@ impl Onera {
                     && job.provider_file_id == request.provider_file_id
             })
         {
-            return self.run_download_job(job, progress, cancel, false).await;
+            return self
+                .run_download_job(job, request.grant.as_ref(), progress, cancel, false)
+                .await;
         }
 
         let mut job = DownloadJob::queued(
@@ -1126,10 +1140,21 @@ impl Onera {
             request.expected_size,
             PathBuf::new(),
         );
-        job.temp_path = self.paths.downloads().join(format!("{}.part", job.id));
+        // The partial lands beside its destination rather than in the cache:
+        // finishing a download is then a rename within one filesystem, which is
+        // the whole reason to put a game's downloads on the disk it lives on.
+        let incoming = self
+            .download_root_for_slug(&request.game_slug)
+            .await?
+            .join(".incoming");
+        tokio::fs::create_dir_all(&incoming)
+            .await
+            .map_err(|error| CoreError::fs(&incoming, error))?;
+        job.temp_path = incoming.join(format!("{}.part", job.id));
         job.expected_hash = trusted_provider_hash(request.expected_hash.as_ref()).cloned();
         self.db.put_download_job(&job).await?;
-        self.run_download_job(job, progress, cancel, false).await
+        self.run_download_job(job, request.grant.as_ref(), progress, cancel, false)
+            .await
     }
 
     /// Resume all downloads left active by an earlier process.
@@ -1149,7 +1174,9 @@ impl Onera {
             if cancel.is_cancelled() {
                 break;
             }
-            if let Err(error) = self.run_download_job(job, progress, cancel, true).await {
+            // A resumed job carries no grant: whatever authorised it expired
+            // with the click that made it.
+            if let Err(error) = self.run_download_job(job, None, progress, cancel, true).await {
                 tracing::warn!(error = %error, "could not resume download");
             }
         }
@@ -1159,6 +1186,7 @@ impl Onera {
     async fn run_download_job(
         &self,
         mut job: DownloadJob,
+        grant: Option<&DownloadGrant>,
         progress: &dyn ProgressSink,
         cancel: &CancelToken,
         keep_resumable_on_error: bool,
@@ -1178,12 +1206,21 @@ impl Onera {
                     &job.game_slug,
                     &job.provider_mod_id,
                     &job.provider_file_id,
+                    grant,
                     cancel,
                 )
                 .await?;
+            // Where this download is filed: the directory chosen for this
+            // game, the one chosen for everything, or Onera's own. Resolved per
+            // job rather than held by the downloader, because the answer
+            // depends on which game the transfer is for.
+            let store = ContentAddressedStore::new(
+                self.download_root_for_slug(&job.game_slug).await?,
+            );
             let outcome = self
                 .downloader
-                .fetch_resumable(
+                .fetch_resumable_into(
+                    &store,
                     &target,
                     job.expected_hash.as_ref(),
                     &job.temp_path,
@@ -1292,6 +1329,7 @@ impl Onera {
                     filename: request.filename.clone(),
                     expected_size: request.expected_size,
                     expected_hash: request.expected_hash.clone(),
+                    grant: request.grant.clone(),
                 },
                 progress,
                 cancel,
@@ -1306,9 +1344,11 @@ impl Onera {
             "inspected archive"
         );
 
-        // 3. Extract into a staging directory unique to this operation.
+        // 3. Extract into a staging directory unique to this operation, under
+        //    the root this game stages in — the default one unless the user
+        //    moved it, which they do when the game lives on another disk.
         let staging_key = onera_core::ids::OperationId::new();
-        let staging = self.paths.staging_for(staging_key);
+        let staging = self.staging_for(request.local_game_id, staging_key).await?;
         let manifest = self
             .archives
             .extract(&outcome.path, &staging, progress, cancel)
@@ -1537,7 +1577,9 @@ impl Onera {
                         kind: "retained installation",
                         id: installation.to_string(),
                     })?;
-                let staging = self.paths.staging_for(onera_core::ids::OperationId::new());
+                let staging = self
+                    .staging_for(game, onera_core::ids::OperationId::new())
+                    .await?;
                 extracted.insert(installation, staging.clone());
                 let manifest = self
                     .archives
@@ -1765,17 +1807,17 @@ impl Onera {
     }
 }
 
-async fn cleanup_expired_staging(paths: &crate::Paths) -> Result<u64> {
-    let mut entries = match tokio::fs::read_dir(paths.staging()).await {
+async fn cleanup_expired_staging(root: &std::path::Path) -> Result<u64> {
+    let mut entries = match tokio::fs::read_dir(root).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(CoreError::fs(paths.staging(), error)),
+        Err(error) => return Err(CoreError::fs(root, error)),
     };
     let mut removed = 0;
     while let Some(entry) = entries
         .next_entry()
         .await
-        .map_err(|error| CoreError::fs(paths.staging(), error))?
+        .map_err(|error| CoreError::fs(root, error))?
     {
         let path = entry.path();
         let result = if entry
@@ -1819,6 +1861,9 @@ pub struct InstallRequest {
     pub expected_size: Option<u64>,
     /// Hash to check against, when the provider published one.
     pub expected_hash: Option<FileHash>,
+    /// A download the provider's website authorised, when the request came
+    /// from a browser holding one. Passed straight through to the download.
+    pub grant: Option<DownloadGrant>,
 }
 
 /// Provider file to download independently of an installation plan.
@@ -1836,6 +1881,13 @@ pub struct DownloadRequest {
     pub expected_size: Option<u64>,
     /// Provider hash metadata. Only trusted algorithms drive integrity checks.
     pub expected_hash: Option<FileHash>,
+    /// A download the provider's website authorised, when the request came
+    /// from a browser holding one.
+    ///
+    /// It is never persisted with the job: a grant outlives its click by
+    /// minutes, so a job resumed after a restart resolves afresh and says so if
+    /// the provider refuses.
+    pub grant: Option<DownloadGrant>,
 }
 
 /// Result of a completed, inspected download.
@@ -1946,6 +1998,9 @@ pub struct BrowserAction {
     pub provider_mod_id: ProviderModId,
     /// The file the host resolved, when it could resolve one unambiguously.
     pub provider_file_id: Option<ProviderFileId>,
+    /// A download the provider's website authorised for that file, when the
+    /// request came from a "Mod manager download" rather than Onera's button.
+    pub download_grant: Option<DownloadGrant>,
     /// The page the user was on, recorded so the mod can be reopened later.
     pub page_url: Option<String>,
     /// Whether the user asked for this to happen, rather than merely be noted.
@@ -2108,6 +2163,7 @@ mod tests {
             provider: ProviderId::nexus(),
             provider_file_id: ProviderFileId::new(name),
             provider_version_id: None,
+            provider_download_id: None,
             provider_file_group_id: None,
             position: None,
             release_id: ReleaseId::new(),
@@ -2184,7 +2240,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(cleanup_expired_staging(&paths).await.unwrap(), 2);
+        assert_eq!(cleanup_expired_staging(&paths.staging()).await.unwrap(), 2);
         assert!(tokio::fs::read_dir(paths.staging())
             .await
             .unwrap()

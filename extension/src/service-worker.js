@@ -13,8 +13,9 @@
  * @module service-worker
  */
 
-import { actionsFor } from './mod-actions.js';
+import { actionsFor, transferActionFor } from './mod-actions.js';
 import { canonicalModUrl, identifyModPage } from './page-identity.js';
+import { parseNxmUrl } from './nxm.js';
 import { send } from './native.js';
 
 /** Commands the popup and content script may ask for. */
@@ -27,6 +28,7 @@ const ACTIONS = Object.freeze({
   MOD_VIEW: 'mod_view',
   APP_STATE: 'app_state',
   ENSURE_APP: 'ensure_app',
+  NXM: 'nxm_download',
 });
 
 /** Actions that queue work for the desktop, and therefore need it running. */
@@ -60,6 +62,9 @@ export async function handle(message) {
   }
   if (action === ACTIONS.ENSURE_APP) {
     return ensureDesktop();
+  }
+  if (action === ACTIONS.NXM) {
+    return handOverDownload(url);
   }
 
   if (
@@ -120,6 +125,48 @@ export async function handle(message) {
     return { ...result, desktop: desktop.data ?? null };
   }
   return result;
+}
+
+/**
+ * Take a download the provider's site authorised and queue it in Onera.
+ *
+ * The link arrives from a page, so nothing in it is believed: it is parsed and
+ * bounded here, and the native host checks it again before it becomes a
+ * request. What travels on is the same thing every other action sends —
+ * identifiers — plus the nonce, which is the one piece Onera cannot obtain for
+ * itself and the entire reason this path exists.
+ *
+ * Whether the mod is installed or merely downloaded follows the same rule the
+ * page's own buttons use, so pressing "Mod manager download" does what pressing
+ * Onera's button would have done.
+ *
+ * @param {unknown} rawUrl - The captured `nxm://` address.
+ * @returns {Promise<{ ok: boolean, data?: unknown, code?: string, message?: string }>}
+ */
+export async function handOverDownload(rawUrl) {
+  const link = parseNxmUrl(rawUrl);
+  if (link === null) {
+    return { ok: false, code: 'malformed', message: 'That is not a Nexus download link.' };
+  }
+
+  const identity = { gameDomain: link.gameDomain, modId: link.modId };
+  const state = await send(ACTIONS.MOD_STATE, {
+    game_domain: link.gameDomain,
+    mod_id: link.modId,
+  });
+  const action = transferActionFor(state.ok === true ? state.data : null);
+
+  const desktop = await ensureDesktop();
+  const result = await send(action, {
+    game_domain: link.gameDomain,
+    mod_id: link.modId,
+    // The site's own id for the file. The host knows both id spaces and
+    // matches on either, so this is passed on exactly as the link spelled it.
+    file_id: link.fileId,
+    page_url: canonicalModUrl(identity),
+    grant: link.grant,
+  });
+  return result.ok === true ? { ...result, desktop: desktop.data ?? null } : result;
 }
 
 /**

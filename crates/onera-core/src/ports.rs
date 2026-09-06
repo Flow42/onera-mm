@@ -80,6 +80,38 @@ pub struct DownloadTarget {
     pub filename: String,
 }
 
+/// A time-limited permission to download one file, issued by the provider's
+/// own website rather than by its API.
+///
+/// Nexus issues a plain download location to premium accounts only. Everyone
+/// else gets one by pressing "Mod manager download" on the mod page, which
+/// mints a single-use nonce bound to one file and a few minutes. Onera cannot
+/// produce that nonce — it can only be handed one, by the browser extension —
+/// so it travels as a value from the click that created it to the request that
+/// spends it.
+///
+/// It is not a credential: it authorizes one download, not the account. It is
+/// still held in a [`Secret`], because a nonce in a log is a nonce someone else
+/// can spend before it expires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadGrant {
+    /// The nonce, exactly as the provider issued it.
+    pub key: Secret,
+    /// When the provider stops honouring it.
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl DownloadGrant {
+    /// Whether the provider will still honour this grant at `now`.
+    ///
+    /// Checked before a grant is spent, so an expired one produces "press the
+    /// button again" rather than a bare provider rejection.
+    #[must_use]
+    pub fn is_valid_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.expires_at > now
+    }
+}
+
 /// Identity of the account a credential belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountInfo {
@@ -185,6 +217,11 @@ pub trait ModProvider: Send + Sync {
 
     /// Resolve a file into something the downloader can fetch.
     ///
+    /// `grant` is a permission the provider's website issued for this exact
+    /// file, when the request came from a browser that had one. A provider that
+    /// needs no such thing ignores it; one that does — see [`DownloadGrant`] —
+    /// may be unable to resolve anything without it.
+    ///
     /// # Errors
     /// Fails if the provider refuses the download (e.g. it requires a paid
     /// tier or an interactive confirmation).
@@ -193,6 +230,7 @@ pub trait ModProvider: Send + Sync {
         game_slug: &str,
         mod_id: &ProviderModId,
         file_id: &ProviderFileId,
+        grant: Option<&DownloadGrant>,
         cancel: &CancelToken,
     ) -> Result<DownloadTarget>;
 
@@ -556,6 +594,7 @@ mod tests {
                 _: &str,
                 _: &ProviderModId,
                 _: &ProviderFileId,
+                _: Option<&DownloadGrant>,
                 _: &CancelToken,
             ) -> Result<DownloadTarget> {
                 Err(crate::CoreError::Unsupported("test".into()))

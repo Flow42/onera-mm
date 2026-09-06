@@ -27,13 +27,17 @@ import type {
   CleanRestoreReport,
   DependencyOverride,
   DependencySnapshot,
+  DownloadDirChange,
   DownloadJob,
   DownloadOutcome,
+  DownloadPaths,
+  GamePaths,
   GameBaseline,
   DiscoveredGame,
   InboxOutcome,
   InstallPlanView,
   InstalledMod,
+  ModContents,
   InboxRequest,
   InterruptedOperation,
   LocalGame,
@@ -46,6 +50,7 @@ import type {
   ProfileMember,
   RemovalPreview,
   ResolutionResult,
+  StagingChange,
   StartupStatus,
   VerifyReport,
 } from './types';
@@ -188,6 +193,36 @@ export const commands = {
   confirmGame: (game: DiscoveredGame) => call<string>('confirm_game', { game }),
   addManualGame: (path: string) => call<DiscoveredGame>('add_manual_game', { path }),
   localGames: () => call<LocalGame[]>('local_games'),
+  /** Where a game is installed, and where its archives are extracted. */
+  gamePaths: (gameId: string) => call<GamePaths>('game_paths', { gameId }),
+  /**
+   * Ask for a staging directory and move to it.
+   *
+   * The picker lives in the backend because the choice and its consequences —
+   * the emptiness check, and moving whatever the old directory still held — are
+   * one operation. `null` means the user cancelled.
+   */
+  pickGameStagingRoot: (gameId: string) =>
+    call<StagingChange | null>('pick_game_staging_root', { gameId }),
+  resetGameStagingRoot: (gameId: string) =>
+    call<StagingChange>('reset_game_staging_root', { gameId }),
+  /**
+   * Where downloads are kept.
+   *
+   * With a game id, the answer for that game — which is the shared directory
+   * when it has none of its own, and says which it is. Without, the shared
+   * setting itself.
+   */
+  downloadPaths: (gameId?: string) =>
+    call<DownloadPaths>('download_paths', { gameId: gameId ?? null }),
+  /** Ask for a download directory and move what is already there. */
+  pickDownloadRoot: (gameId?: string) =>
+    call<DownloadDirChange | null>('pick_download_root', { gameId: gameId ?? null }),
+  /** Drop an override, moving the archives it held back where they belong. */
+  resetDownloadRoot: (gameId?: string) =>
+    call<DownloadDirChange>('reset_download_root', { gameId: gameId ?? null }),
+  /** A game's own icon, found in its installation directory, or null. */
+  gameIcon: (gameId: string) => call<string | null>('game_icon', { gameId }),
 
   /* mods */
   fetchMod: (gameDomain: string, modId: string) =>
@@ -198,6 +233,12 @@ export const commands = {
   /** A mod's artwork as a data URI, or null when it has none. */
   modArtwork: (modId: string) => call<string | null>('mod_artwork', { modId }),
   installedMods: (gameId: string) => call<InstalledMod[]>('installed_mods', { gameId }),
+  /** Which files one installed mod owns. `limit` bounds the list, not the count. */
+  modContents: (gameId: string, installationId: string, limit: number) =>
+    call<ModContents>('mod_contents', { gameId, installationId, limit }),
+  /** Show a mod's files in the system file manager; returns what was opened. */
+  browseModFiles: (gameId: string, installationId: string) =>
+    call<string>('browse_mod_files', { gameId, installationId }),
   checkUpdates: (gameId: string) => call<InstalledMod[]>('check_updates', { gameId }),
   inboxRequests: () => call<InboxRequest[]>('inbox_requests'),
   dismissInboxRequest: (requestId: string) => call<void>('dismiss_inbox_request', { requestId }),

@@ -140,6 +140,7 @@ impl Downloader {
         cancel: &CancelToken,
     ) -> Result<DownloadOutcome> {
         self.fetch_internal(
+            None,
             target,
             trusted_expected(expected_hash),
             None,
@@ -167,6 +168,41 @@ impl Downloader {
         cancel: &CancelToken,
     ) -> Result<DownloadOutcome> {
         self.fetch_internal(
+            None,
+            target,
+            trusted_expected(expected_hash),
+            Some(partial_path),
+            progress,
+            cancel,
+        )
+        .await
+    }
+
+    /// Fetch into a caller-chosen store, resuming a partial transfer.
+    ///
+    /// Same guarantees as [`Downloader::fetch_resumable`]; the difference is
+    /// only *where the bytes are filed*. Onera keeps downloads in a directory
+    /// the user can change, per game, and the downloader has no business
+    /// knowing which game a transfer is for — so the caller that does know
+    /// hands it the store.
+    ///
+    /// Deduplication follows the store: a file already present in the chosen
+    /// directory is not downloaded again, and one present in a *different*
+    /// directory is, because the caller asked for it to be there.
+    ///
+    /// # Errors
+    /// As [`Downloader::fetch_resumable`].
+    pub async fn fetch_resumable_into(
+        &self,
+        destination: &dyn ArchiveStore,
+        target: &DownloadTarget,
+        expected_hash: Option<&FileHash>,
+        partial_path: &Path,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<DownloadOutcome> {
+        self.fetch_internal(
+            Some(destination),
             target,
             trusted_expected(expected_hash),
             Some(partial_path),
@@ -178,18 +214,23 @@ impl Downloader {
 
     async fn fetch_internal(
         &self,
+        destination: Option<&dyn ArchiveStore>,
         target: &DownloadTarget,
         expected_hash: Option<&FileHash>,
         partial_path: Option<&Path>,
         progress: &dyn ProgressSink,
         cancel: &CancelToken,
     ) -> Result<DownloadOutcome> {
+        // Where this one download is filed. The downloader's own store is the
+        // answer unless the caller named another, which is how a download for a
+        // game with its own directory reaches it.
+        let store = destination.unwrap_or(&*self.store);
         // Deduplication is safe only for hashes Onera computes itself. Provider
         // MD5 values remain display metadata and never drive integrity policy.
         if let Some(hash) = expected_hash {
-            if self.store.contains(hash).await? {
+            if store.contains(hash).await? {
                 return Ok(DownloadOutcome {
-                    path: self.store.path_for(hash),
+                    path: store.path_for(hash),
                     hash: hash.clone(),
                     bytes: 0,
                     deduplicated: true,
@@ -211,7 +252,10 @@ impl Downloader {
                 }
                 return Err(CoreError::Cancelled);
             }
-            match self.attempt(target, partial_path, progress, cancel).await {
+            match self
+                .attempt(store, target, partial_path, progress, cancel)
+                .await
+            {
                 Ok(outcome) => {
                     if let Some(expected) = expected_hash {
                         if &outcome.hash != expected {
@@ -251,6 +295,7 @@ impl Downloader {
 
     async fn attempt(
         &self,
+        store: &dyn ArchiveStore,
         target: &DownloadTarget,
         partial_path: Option<&Path>,
         progress: &dyn ProgressSink,
@@ -439,7 +484,7 @@ impl Downloader {
         }
 
         let hash = FileHash::blake3(*hasher.finalize().as_bytes());
-        let path = self.store.promote(&temp, &hash).await?;
+        let path = store.promote(&temp, &hash).await?;
         progress.emit(ProgressEvent::Finished {
             stage: Stage::Downloading,
             success: true,

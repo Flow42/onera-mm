@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use onera_core::ids::{ProviderFileId, ProviderId, ProviderModId};
-use onera_core::ports::{AccountInfo, AuthProvider, Credential, ModProvider};
+use onera_core::ports::{AccountInfo, AuthProvider, Credential, DownloadGrant, ModProvider};
 use onera_core::progress::CancelToken;
 use onera_core::redact::Secret;
 use onera_core::{CoreError, Result};
@@ -13,7 +13,7 @@ use onera_nexus::{NexusClient, NexusConfig, RetryPolicy};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// An auth provider that always returns a fixed key, so the client can be
@@ -416,12 +416,129 @@ async fn a_download_location_is_resolved_and_must_be_https() {
             "cyberpunk2077",
             &ProviderModId::new("107"),
             &ProviderFileId::new("100"),
+            None,
             &CancelToken::new(),
         )
         .await
         .unwrap();
     assert_eq!(target.url.host_str(), Some("cdn.example.test"));
     assert_eq!(target.url.scheme(), "https");
+}
+
+#[tokio::test]
+async fn a_download_is_resolved_through_the_game_scoped_file_id() {
+    // v1 does not know the v3 mod-file-version id every other call carries, so
+    // a download resolved with it alone answers 404. The client translates.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v3/games/cyberpunk2077/mods/107"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mod_body("1", "CET")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v3/mods/1/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "mod_files": [{ "id": "10", "name": "Main file" }] }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v3/mod-files/10/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "versions": [
+                { "id": "14315126151661", "game_scoped_id": "154093", "name": "CET 1.31",
+                  "version": "1.31.0", "category": "main",
+                  "uploaded_at": "2024-05-01T10:00:00Z", "is_primary": true }
+            ] }
+        })))
+        .mount(&server)
+        .await;
+    // Mounted on the game-scoped path only: a request with the v3 id 404s.
+    Mock::given(method("GET"))
+        .and(path(
+            "/v1/games/cyberpunk2077/mods/107/files/154093/download_link.json",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            { "name": "Nexus CDN", "URI": "https://cdn.example.test/file.zip?sig=abc" }
+        ])))
+        .mount(&server)
+        .await;
+
+    let target = client(&server, RetryPolicy::none())
+        .resolve_download(
+            "cyberpunk2077",
+            &ProviderModId::new("107"),
+            &ProviderFileId::new("14315126151661"),
+            None,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(target.url.host_str(), Some("cdn.example.test"));
+}
+
+#[tokio::test]
+async fn a_website_grant_is_spent_on_the_download_endpoint() {
+    // The same endpoint answers a premium account with nothing but the API key,
+    // and everyone else only when the nonce from a "Mod manager download" is
+    // presented with it. Without this the free-account path cannot work at all.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/v1/games/cyberpunk2077/mods/107/files/100/download_link.json",
+        ))
+        .and(query_param("key", "Ab3-_cd9"))
+        .and(query_param("expires", "4102444800"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            { "name": "Nexus CDN", "URI": "https://cdn.example.test/file.zip?sig=abc" }
+        ])))
+        .mount(&server)
+        .await;
+
+    // Far enough ahead that the test is not a clock away from failing.
+    let grant = DownloadGrant {
+        key: Secret::new("Ab3-_cd9"),
+        expires_at: chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap(),
+    };
+    let target = client(&server, RetryPolicy::none())
+        .resolve_download(
+            "cyberpunk2077",
+            &ProviderModId::new("107"),
+            &ProviderFileId::new("100"),
+            Some(&grant),
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(target.url.host_str(), Some("cdn.example.test"));
+}
+
+#[tokio::test]
+async fn an_expired_grant_is_refused_before_it_is_sent() {
+    // Spending a lapsed nonce earns a bare rejection that tells the user
+    // nothing. The mock is mounted to fail the test if the request is made.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let grant = DownloadGrant {
+        key: Secret::new("Ab3-_cd9"),
+        expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+    };
+    let err = client(&server, RetryPolicy::none())
+        .resolve_download(
+            "cyberpunk2077",
+            &ProviderModId::new("107"),
+            &ProviderFileId::new("100"),
+            Some(&grant),
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("expired"), "{err}");
 }
 
 #[tokio::test]
@@ -437,6 +554,7 @@ async fn an_empty_download_list_explains_what_to_do() {
             "cyberpunk2077",
             &ProviderModId::new("107"),
             &ProviderFileId::new("100"),
+            None,
             &CancelToken::new(),
         )
         .await

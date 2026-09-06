@@ -227,13 +227,18 @@ async fn handle(onera: &Onera, request: Request) -> Response {
             mod_id,
             file_id,
             page_url,
+            grant,
         }
         | Command::DownloadAndInstall {
             game_domain,
             mod_id,
             file_id,
             page_url,
+            grant,
         } => {
+            // Already checked by `validate`; this only unwraps it into the
+            // core's type, so a malformed grant cannot reach the database.
+            let grant = grant.as_ref().and_then(|g| g.to_grant().ok());
             let details = match onera
                 .fetch_mod(&game_domain, &mod_id.as_str().into(), &cancel)
                 .await
@@ -245,10 +250,17 @@ async fn handle(onera: &Onera, request: Request) -> Response {
             // When the user did not name a file and more than one is plausible,
             // the host refuses to guess and asks the desktop app to prompt.
             let chosen = match &file_id {
-                Some(wanted) => details
-                    .files
-                    .iter()
-                    .find(|f| f.provider_file_id.as_str() == wanted),
+                // A file named by Onera's own button carries the id the API
+                // keys on; one named by a "Mod manager download" carries the
+                // site's. They are the same file, so either is accepted — and
+                // what gets queued is always the first, because that is what
+                // the rest of Onera looks a file up by.
+                Some(wanted) => details.files.iter().find(|f| {
+                    f.provider_file_id.as_str() == wanted
+                        || f.provider_download_id
+                            .as_ref()
+                            .is_some_and(|id| id.as_str() == wanted)
+                }),
                 None if details.needs_file_selection() => None,
                 None => details
                     .primary_file()
@@ -273,6 +285,9 @@ async fn handle(onera: &Onera, request: Request) -> Response {
                         provider_mod_id: ProviderModId::new(mod_id),
                         provider_file_id: None,
                         page_url,
+                        // Nothing to spend it on until the user picks a file,
+                        // and it would be stale by then.
+                        download_grant: None,
                         auto_run: true,
                     })
                     .await
@@ -302,6 +317,7 @@ async fn handle(onera: &Onera, request: Request) -> Response {
                     provider_mod_id: ProviderModId::new(mod_id),
                     provider_file_id: Some(file.provider_file_id.clone()),
                     page_url,
+                    download_grant: grant,
                     // The user pressed a button on the mod's own page: the
                     // desktop is meant to act on this, not file it.
                     auto_run: true,

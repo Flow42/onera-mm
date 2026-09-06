@@ -22,7 +22,8 @@ vi.mock('../../extension/src/native.js', () => ({
 vi.stubGlobal('chrome', { runtime: { onMessage: { addListener: vi.fn() } } });
 
 // @ts-expect-error - plain JS module with JSDoc types.
-const { handle, ensureDesktop } = await import('../../extension/src/service-worker.js');
+const { handle, ensureDesktop, handOverDownload } =
+  await import('../../extension/src/service-worker.js');
 
 const MOD_PAGE = 'https://www.nexusmods.com/cyberpunk2077/mods/107';
 
@@ -131,6 +132,42 @@ describe('handle', () => {
     expect(result.data.reachable).toBe(false);
     expect(result.data.message).toBe('offline');
     expect(result.data.view.buttons).toHaveLength(3);
+  });
+});
+
+describe('handOverDownload', () => {
+  const LINK =
+    'nxm://cyberpunk2077/mods/4198/files/154093?key=Ab3-_cd9&expires=1757200000&user_id=1';
+
+  it('turns a captured download link into a transfer the desktop can run', async () => {
+    replies.mod_state = { ok: true, data: { game_registered: true } };
+    const result = await handOverDownload(LINK);
+
+    expect(result.ok).toBe(true);
+    expect(types()).toEqual(['mod_state', 'app_state', 'download_and_install']);
+    expect(payloadOf('download_and_install')).toEqual({
+      game_domain: 'cyberpunk2077',
+      mod_id: '4198',
+      // The site's own id for the file, exactly as the link spelled it.
+      file_id: '154093',
+      page_url: MOD_PAGE.replace('107', '4198'),
+      grant: { key: 'Ab3-_cd9', expires: 1757200000 },
+    });
+  });
+
+  it('downloads without installing when no game is registered for the slug', async () => {
+    replies.mod_state = { ok: true, data: { game_registered: false } };
+    await handOverDownload(LINK);
+    expect(types()).toContain('download');
+    expect(types()).not.toContain('download_and_install');
+  });
+
+  it('refuses anything that is not a download link, without asking the host', async () => {
+    for (const url of [undefined, 'https://evil.test/x', 'nxm://cyberpunk2077/mods/4198']) {
+      const result = await handOverDownload(url);
+      expect(result, String(url)).toMatchObject({ ok: false, code: 'malformed' });
+    }
+    expect(sent).toHaveLength(0);
   });
 });
 

@@ -491,6 +491,124 @@ override stops applying, and the requirement resurfaces. The frontend must send
 back the fingerprint it displayed rather than a fresh one, so accepting a risk
 cannot silently cover a requirement the user never saw.
 
+## Library commands
+
+The shapes behind the games list, one game's page, and the file view inside a
+mod card.
+
+### `game_paths`
+
+`{ gameId }` → the two directories a game has:
+
+```jsonc
+{
+  "install_root": "/games/SteamLibrary/steamapps/common/Cyberpunk 2077",
+  "staging_root": "/home/user/.local/state/onera/staging",
+  "staging_is_default": true, // false once the user has chosen one
+  "staging_entries": 0, // work in progress, never a store
+}
+```
+
+### `pick_game_staging_root` / `reset_game_staging_root` / `set_game_staging_root`
+
+`{ gameId }` → `{ root, moved, previous }`, or `null` if the user cancelled the
+picker. The picker runs in the backend on purpose: choosing the directory,
+checking it and moving what the old one still held are one decision, and
+splitting them would leave the window able to point staging somewhere the user
+never saw.
+
+**Everything under a staging root is deleted when Onera starts**, which is what
+every refusal here is protecting:
+
+| Refused                                                                                                  | Because                                                        |
+| -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| a directory with anything in it                                                                          | the sweep would delete it                                      |
+| a directory that contains a game, `$XDG_DATA_HOME`, the config, the cache, the logs, or a home directory | the same                                                       |
+| a directory **inside** a registered game                                                                 | an extraction in progress would look like a modified game file |
+| a relative path                                                                                          | it is not a location                                           |
+
+Being inside the user's home is fine — that is where a sensible answer usually
+is. Anything the old root still held is moved across, so an interrupted install
+is not abandoned by a settings change.
+
+### `download_paths` / `pick_download_root` / `reset_download_root`
+
+`{ gameId }`, optional — with a game it answers for that game, without it for
+the shared setting:
+
+```jsonc
+{
+  "root": "/mnt/games/cp2077-mods",
+  "scope": "game", // or "global", or "default" for Onera's own directory
+  "inherited": "/home/user/.local/share/onera/archives", // what dropping the override restores
+  "archives": 12,
+  "bytes": 5033164800,
+}
+```
+
+Three levels, most specific first: the directory chosen for **this game**, the
+one chosen for **everything**, then Onera's own under `$XDG_DATA_HOME`. A
+download names its game by the provider's slug, so a slug matching exactly one
+confirmed installation uses that game's setting and an ambiguous one falls back
+to the shared setting rather than guessing.
+
+`pick_download_root` opens the picker, checks the directory and **moves the
+archives that belong to the scope being changed**, rewriting
+`archives.stored_path` as each file lands — the catalogue points at archives by
+absolute path, so moving files without rewriting rows would lose every one of
+them. It returns `{ root, moved, bytes, previous }`, or `null` if the user
+cancelled. Changing the shared directory moves only what is still in it, so a
+game that has its own keeps what it put there.
+
+Unlike a staging directory, a download directory may already hold other files:
+nothing here is ever swept. What is refused is a directory **inside a registered
+game** (verification would read the archives as modified game files) or **inside
+a staging root** (the next startup would delete them), and a relative path.
+
+### `game_icon`
+
+`{ gameId }` → a `data:` URI, or `null`. Found by a bounded, shallow search of
+the installation directory: a capped number of entries, a capped file size, and
+no decoding — the bytes are handed to the window with the type the extension
+implies, and a game that ships no picture answers `null`, which the cards
+already draw as initials.
+
+### `mod_contents`
+
+`{ gameId, installationId, limit }` → which files a mod owns, from the
+deployment record rather than from a directory listing:
+
+```jsonc
+{
+  "kind": "installed", // or "archive" when nothing is deployed, or "none"
+  "browse": "/games/…/Cyberpunk 2077", // the deepest directory holding them all
+  "total": 14, // what the mod owns, whatever `limit` returned
+  "entries": [
+    {
+      "root_key": "game",
+      "path": "archive/pc/mod/ArchiveXL.archive",
+      "absolute": "/games/…/archive/pc/mod/ArchiveXL.archive",
+      "exists": true,
+      "size": 2048,
+    },
+  ],
+}
+```
+
+`limit` bounds the list and never the count, so a truncated view can say how
+much it left out. A file that is no longer on disk is returned with
+`exists: false` rather than dropped: something outside Onera removed it, which
+is exactly what a file list should show.
+
+### `browse_mod_files`
+
+`{ gameId, installationId }` → opens `browse` in the system file manager and
+returns the path. The directory is recomputed from the deployment record on each
+call rather than accepted from the window; a command that opened a path it was
+handed would be a command that opens any directory on request. A mod deployed
+into two roots opens where its branches meet, because opening one of them would
+hide half of what it installed.
+
 ## Browser handoff commands
 
 The browser extension queues work and the desktop runs it, so these shapes are

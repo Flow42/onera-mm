@@ -45,6 +45,10 @@ const API_KEY: &str = "a-valid-looking-nexus-api-key-0123";
 const GAME_SLUG: &str = "cyberpunk2077";
 const MOD_ID: &str = "107";
 const FILE_ID: &str = "100";
+/// The same file, spelled the way the provider's own site spells it — the id a
+/// "Mod manager download" hands over, and the only one its download endpoint
+/// answers to.
+const SITE_FILE_ID: &str = "5000";
 
 /// Build a zip the way a real Cyberpunk mod is packaged: content under a
 /// cosmetic top-level directory, plus a readme.
@@ -132,7 +136,8 @@ impl Harness {
             .and(path("/v3/mod-files/10/versions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": { "versions": [{
-                    "id": FILE_ID, "name": "Test Mod 1.0", "version": "1.0.0",
+                    "id": FILE_ID, "game_scoped_id": SITE_FILE_ID,
+                    "name": "Test Mod 1.0", "version": "1.0.0",
                     "category": "main", "uploaded_at": "2025-01-01T00:00:00Z",
                     "is_primary": true
                 }] }
@@ -157,8 +162,9 @@ impl Harness {
 
         // --- download resolution and payload ---------------------------
         Mock::given(method("GET"))
+            // Mounted on the site's id, because that is the one v1 knows.
             .and(path(format!(
-                "/v1/games/{GAME_SLUG}/mods/{MOD_ID}/files/{FILE_ID}/download_link.json"
+                "/v1/games/{GAME_SLUG}/mods/{MOD_ID}/files/{SITE_FILE_ID}/download_link.json"
             )))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 { "name": "CDN", "URI": format!("{}/cdn/mod.zip", server.uri()) }
@@ -236,6 +242,7 @@ fn install_request(
         filename: "test-mod-1.0.zip".into(),
         expected_size: file.size_bytes,
         expected_hash: None,
+        grant: None,
     }
 }
 
@@ -1140,6 +1147,7 @@ async fn a_queued_browser_request_installs_without_further_input() {
             page_url: Some(format!(
                 "https://www.nexusmods.com/{GAME_SLUG}/mods/{MOD_ID}"
             )),
+            download_grant: None,
             auto_run: true,
         })
         .await
@@ -1192,6 +1200,109 @@ async fn a_queued_browser_request_installs_without_further_input() {
     assert!(!state.update_available);
 }
 
+/// A download the provider's own website authorised, handed over by the browser
+/// extension. This is the only path an account without a paid tier has: the API
+/// refuses to issue a location to it, and the nonce from a "Mod manager
+/// download" is what makes the same endpoint answer.
+///
+/// The request also names the file the way the *site* does, which is not the id
+/// Onera keys on — so this covers the whole handoff, not just the nonce.
+#[tokio::test]
+async fn a_download_the_website_authorised_installs_without_further_input() {
+    let h = Harness::new(&[
+        ("Test Mod v1.0/archive/pc/mod/testmod.archive", b"payload"),
+        ("Test Mod v1.0/r6/scripts/testmod.reds", b"script"),
+    ])
+    .await;
+    h.onera.set_api_key(Secret::new(API_KEY)).await.unwrap();
+    h.onera.confirm_game(&h.discovered()).await.unwrap();
+
+    let request = h
+        .onera
+        .enqueue_browser_action(BrowserAction {
+            kind: InboxRequestKind::DownloadAndInstall,
+            game_slug: GAME_SLUG.into(),
+            provider_mod_id: ProviderModId::new(MOD_ID),
+            // What a `nxm://` link names, which the API would call something
+            // else entirely.
+            provider_file_id: Some(onera_core::ids::ProviderFileId::new(SITE_FILE_ID)),
+            page_url: Some(format!(
+                "https://www.nexusmods.com/{GAME_SLUG}/mods/{MOD_ID}"
+            )),
+            download_grant: Some(onera_core::ports::DownloadGrant {
+                key: Secret::new("Ab3-_cd9"),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+            }),
+            auto_run: true,
+        })
+        .await
+        .unwrap();
+    assert!(request.is_runnable(chrono::Utc::now()));
+
+    // The grant survives the trip through the database, because the process
+    // that received it is not the one that spends it.
+    let reloaded = h
+        .onera
+        .inbox_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.id == request.id)
+        .expect("the request was queued");
+    assert_eq!(
+        reloaded
+            .download_grant
+            .as_ref()
+            .map(|grant| grant.key.expose().to_owned()),
+        Some("Ab3-_cd9".to_owned())
+    );
+
+    let leased = h.onera.lease_inbox_request(&reloaded).await.unwrap();
+    let outcome = onera_app::run_request(&h.onera, &leased, &NullProgress, &CancelToken::new())
+        .await
+        .unwrap();
+    let onera_app::RanRequest::Installed { name, files } = outcome else {
+        panic!("a plan over untouched paths needs no decision");
+    };
+    assert_eq!(name, "Test Mod");
+    assert_eq!(files, 2);
+    assert!(h.game_file("r6/scripts/testmod.reds").is_some());
+}
+
+/// A grant that lapsed before the desktop got to it is not a provider failure
+/// to puzzle over: it is one more click on the page that issued it.
+#[tokio::test]
+async fn an_expired_grant_says_what_to_do_about_it() {
+    let h = Harness::new(&[("Test Mod v1.0/r6/scripts/testmod.reds", b"script")]).await;
+    h.onera.set_api_key(Secret::new(API_KEY)).await.unwrap();
+    h.onera.confirm_game(&h.discovered()).await.unwrap();
+
+    let request = h
+        .onera
+        .enqueue_browser_action(BrowserAction {
+            kind: InboxRequestKind::Download,
+            game_slug: GAME_SLUG.into(),
+            provider_mod_id: ProviderModId::new(MOD_ID),
+            provider_file_id: Some(onera_core::ids::ProviderFileId::new(SITE_FILE_ID)),
+            page_url: None,
+            download_grant: Some(onera_core::ports::DownloadGrant {
+                key: Secret::new("Ab3-_cd9"),
+                expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+            }),
+            auto_run: true,
+        })
+        .await
+        .unwrap();
+
+    let error = onera_app::run_request(&h.onera, &request, &NullProgress, &CancelToken::new())
+        .await
+        .unwrap_err();
+    let message = format!("{error}");
+    assert!(message.contains("expired"), "{message}");
+    assert!(message.contains("Mod manager download"), "{message}");
+    assert!(!message.contains("Ab3-_cd9"), "{message}");
+}
+
 /// A request that names no file is a question, not an instruction: the mod page
 /// offered several and only the user can say which they meant.
 #[tokio::test]
@@ -1208,6 +1319,7 @@ async fn a_request_without_a_file_waits_for_the_user() {
             provider_mod_id: ProviderModId::new(MOD_ID),
             provider_file_id: None,
             page_url: None,
+            download_grant: None,
             auto_run: true,
         })
         .await
@@ -1233,6 +1345,7 @@ async fn an_install_request_with_no_registered_game_is_never_run_unattended() {
             provider_mod_id: ProviderModId::new(MOD_ID),
             provider_file_id: Some(onera_core::ids::ProviderFileId::new(FILE_ID)),
             page_url: None,
+            download_grant: None,
             auto_run: true,
         })
         .await
@@ -1249,6 +1362,7 @@ async fn an_install_request_with_no_registered_game_is_never_run_unattended() {
             provider_mod_id: ProviderModId::new(MOD_ID),
             provider_file_id: Some(onera_core::ids::ProviderFileId::new(FILE_ID)),
             page_url: None,
+            download_grant: None,
             auto_run: true,
         })
         .await

@@ -91,6 +91,7 @@ async fn fixture() -> Fixture {
         provider: provider.clone(),
         provider_file_id: provider_file.clone(),
         provider_version_id: Some(ProviderVersionId::new("opaque-version")),
+        provider_download_id: None,
         provider_file_group_id: Some(ProviderFileGroupId::new("opaque-group")),
         position: Some(17),
         release_id: release,

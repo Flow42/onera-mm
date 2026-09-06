@@ -110,5 +110,40 @@
     }
   }
 
+  // The page's own "Mod manager download" ends in a `nxm://` address, which the
+  // page-world script catches and posts here. This side re-checks the sender —
+  // any script on the page can post a message — and lets the service worker do
+  // the parsing, which is where every other piece of untrusted input is checked.
+  window.addEventListener('message', (event) => {
+    if (event.source !== window || event.origin !== window.location.origin) {
+      return;
+    }
+    const data = event.data;
+    if (data === null || typeof data !== 'object' || data.channel !== 'onera:nxm') {
+      return;
+    }
+    void handOver(data.url);
+  });
+
+  /**
+   * Send a captured download link to Onera and say what happened.
+   *
+   * @param {unknown} url - The candidate address, still unvalidated.
+   */
+  async function handOver(url) {
+    status.textContent = 'Handing the download to Onera…';
+    try {
+      const response = await chrome.runtime.sendMessage({ action: 'nxm_download', url });
+      if (response?.ok === true) {
+        status.textContent = 'Sent to Onera — running it now.';
+        setTimeout(() => void refresh(), 4000);
+      } else {
+        status.textContent = String(response?.message ?? 'Onera could not take that download.');
+      }
+    } catch {
+      status.textContent = 'The Onera extension could not be reached.';
+    }
+  }
+
   await refresh();
 })();

@@ -41,7 +41,7 @@ use std::time::Duration;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The schema version this build understands.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// A pooled SQLite database.
 #[derive(Debug, Clone)]
@@ -404,7 +404,7 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(version, "8");
+        assert_eq!(version, SCHEMA_VERSION.to_string());
         assert_eq!(member, ("profile".into(), "file-42".into()));
         assert_eq!(position.0, None, "legacy position must remain unresolved");
         assert_eq!(dependency_tables, 2);

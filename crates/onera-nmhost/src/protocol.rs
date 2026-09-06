@@ -17,6 +17,9 @@
 //! user, so the host validates length, encoding, version and payload shape
 //! before acting.
 
+use chrono::DateTime;
+use onera_core::ports::DownloadGrant;
+use onera_core::redact::Secret;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
@@ -87,6 +90,10 @@ pub enum Command {
         /// reopen it later. Validated as a provider URL before it is stored.
         #[serde(default)]
         page_url: Option<String>,
+        /// A download the provider's website authorised, when the request came
+        /// from its own "Mod manager download" rather than from Onera's button.
+        #[serde(default)]
+        grant: Option<WireGrant>,
     },
     /// Download and then install, previewing conflicts first.
     DownloadAndInstall {
@@ -99,7 +106,64 @@ pub enum Command {
         /// The page this was requested from.
         #[serde(default)]
         page_url: Option<String>,
+        /// A download the provider's website authorised.
+        #[serde(default)]
+        grant: Option<WireGrant>,
     },
+}
+
+/// A permission the provider's website minted for one file, as it crosses the
+/// transport.
+///
+/// This is the single exception to "the extension sends identifiers and nothing
+/// else", and it is a narrow one: the value is useless for anything but
+/// downloading the file it names, it stops working within minutes, and Onera
+/// cannot obtain one by itself — only a browser where the user pressed the
+/// button can. It is turned into a [`DownloadGrant`](onera_core::ports::DownloadGrant)
+/// after validation and never logged.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireGrant {
+    /// The nonce, exactly as the site issued it.
+    pub key: String,
+    /// Unix seconds after which the provider stops honouring it.
+    pub expires: i64,
+}
+
+impl std::fmt::Debug for WireGrant {
+    /// Prints the expiry and never the key: a nonce in a log is a nonce
+    /// somebody else can spend before it lapses.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireGrant")
+            .field("key", &onera_core::redact::REDACTED)
+            .field("expires", &self.expires)
+            .finish()
+    }
+}
+
+impl WireGrant {
+    /// Convert into the core's grant, or explain why it cannot be one.
+    ///
+    /// # Errors
+    /// Returns a message for a nonce with the wrong shape or an expiry that is
+    /// not a time.
+    pub fn to_grant(&self) -> Result<DownloadGrant, String> {
+        if self.key.is_empty() || self.key.len() > 128 {
+            return Err("grant.key must be between 1 and 128 characters".to_owned());
+        }
+        if !self
+            .key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err("grant.key contains characters that are not allowed".to_owned());
+        }
+        let expires_at = DateTime::from_timestamp(self.expires, 0)
+            .ok_or_else(|| "grant.expires is not a time".to_owned())?;
+        Ok(DownloadGrant {
+            key: Secret::new(self.key.clone()),
+            expires_at,
+        })
+    }
 }
 
 /// A response from the host.
@@ -284,17 +348,24 @@ pub fn validate(request: &Request) -> Result<(), Response> {
             mod_id,
             file_id,
             page_url,
+            grant,
         }
         | Command::DownloadAndInstall {
             game_domain,
             mod_id,
             file_id,
             page_url,
+            grant,
         } => {
             check("game_domain", game_domain)?;
             check("mod_id", mod_id)?;
             if let Some(id) = file_id {
                 check("file_id", id)?;
+            }
+            if let Some(grant) = grant {
+                grant.to_grant().map_err(|why| {
+                    error_response(&request.id, ErrorCode::Malformed, why)
+                })?;
             }
             match page_url {
                 Some(url) => check_page_url(&request.id, url),
@@ -445,6 +516,7 @@ mod tests {
                     mod_id: "107".into(),
                     file_id: None,
                     page_url: None,
+                    grant: None,
                 },
             ),
             (
@@ -454,6 +526,7 @@ mod tests {
                     mod_id: "107".into(),
                     file_id: Some("100".into()),
                     page_url: None,
+                    grant: None,
                 },
             ),
         ];
@@ -485,12 +558,67 @@ mod tests {
                     mod_id: "107".into(),
                     file_id: Some("100".into()),
                     page_url: Some("https://www.nexusmods.com/cyberpunk2077/mods/107".into()),
+                    grant: None,
                 },
             ),
         ];
         for (json, expected) in cases {
             let parsed = read_message(&mut Cursor::new(frame(json))).unwrap();
             assert_eq!(parsed.command, expected, "{json}");
+        }
+    }
+
+    #[test]
+    fn a_grant_from_the_website_parses_and_is_checked() {
+        let json = r#"{"v":1,"id":"a","type":"download","game_domain":"cyberpunk2077",
+            "mod_id":"4198","file_id":"154093","grant":{"key":"Ab3-_cd9","expires":1757200000}}"#;
+        let parsed = read_message(&mut Cursor::new(frame(json))).unwrap();
+        let Command::Download { grant, .. } = &parsed.command else {
+            panic!("expected a download");
+        };
+        let grant = grant.as_ref().expect("the grant survived the transport");
+        assert!(validate(&parsed).is_ok());
+        let converted = grant.to_grant().unwrap();
+        assert_eq!(converted.key.expose(), "Ab3-_cd9");
+        assert_eq!(converted.expires_at.timestamp(), 1_757_200_000);
+        // The nonce is as loggable as an API key, which is to say not at all.
+        assert!(!format!("{grant:?}").contains("Ab3-_cd9"), "{grant:?}");
+    }
+
+    #[test]
+    fn a_grant_that_is_not_one_is_refused_at_the_boundary() {
+        for grant in [
+            WireGrant {
+                key: String::new(),
+                expires: 1_757_200_000,
+            },
+            WireGrant {
+                key: "a".repeat(129),
+                expires: 1_757_200_000,
+            },
+            // A key is a nonce, not a place to hide a query string or a path.
+            WireGrant {
+                key: "abc&redirect=http://evil.test".into(),
+                expires: 1_757_200_000,
+            },
+            WireGrant {
+                key: "abc/../../x".into(),
+                expires: 1_757_200_000,
+            },
+            WireGrant {
+                key: "Ab3".into(),
+                expires: i64::MAX,
+            },
+        ] {
+            let request = request(Command::Download {
+                game_domain: "cyberpunk2077".into(),
+                mod_id: "4198".into(),
+                file_id: Some("154093".into()),
+                page_url: None,
+                grant: Some(grant.clone()),
+            });
+            assert!(grant.to_grant().is_err(), "{grant:?}");
+            assert!(validate(&request).is_err(), "{grant:?}");
         }
     }
 
@@ -506,6 +634,7 @@ mod tests {
                 mod_id: "107".into(),
                 file_id: None,
                 page_url: Some(url.to_owned()),
+                grant: None,
             });
             assert!(validate(&request).is_ok(), "{url} should be accepted");
         }
@@ -531,6 +660,7 @@ mod tests {
                 mod_id: "107".into(),
                 file_id: None,
                 page_url: Some(url.to_owned()),
+                grant: None,
             });
             assert!(validate(&request).is_err(), "{url} should be rejected");
         }
@@ -547,6 +677,7 @@ mod tests {
             mod_id: "107".into(),
             file_id: None,
             page_url: Some(long),
+            grant: None,
         });
         assert!(validate(&request).is_err());
     }
@@ -672,6 +803,7 @@ mod tests {
             mod_id: "107".into(),
             file_id: Some("file_100-a".into()),
             page_url: Some("https://www.nexusmods.com/cyberpunk2077/mods/107".into()),
+            grant: None,
         });
         assert!(validate(&request).is_ok());
     }

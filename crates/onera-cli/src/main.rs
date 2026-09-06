@@ -1415,6 +1415,9 @@ async fn install(
                 filename: file.name.clone(),
                 expected_size: file.size_bytes,
                 expected_hash: file.published_hash.clone(),
+                // Nothing on the command line carries a website's permission to
+                // download; the CLI is a premium-account or cached-archive path.
+                grant: None,
             },
             progress,
             cancel,

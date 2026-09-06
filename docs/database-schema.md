@@ -62,11 +62,14 @@ distinction between absent and present provider file/version IDs.
 
 ### Local installations
 
-| Table                 | Holds                                  | Notes                                                                                                                                 |
-| --------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `local_game_installs` | A game on this machine                 | Install root, compat prefix and user-data roots are modelled **separately** because on Linux they are genuinely different directories |
-| `deploy_roots`        | Resolved deployment directories        | Keyed by an adapter-defined `root_key`                                                                                                |
-| `adapter_versions`    | Which adapter version last wrote state | Lets a future adapter detect state it does not understand                                                                             |
+| Table                 | Holds                                          | Notes                                                                                                                                                                                      |
+| --------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `local_game_installs` | A game on this machine                         | Install root, compat prefix and user-data roots are modelled **separately** because on Linux they are genuinely different directories                                                      |
+| `deploy_roots`        | Resolved deployment directories                | Keyed by an adapter-defined `root_key`                                                                                                                                                     |
+| `adapter_versions`    | Which adapter version last wrote state         | Lets a future adapter detect state it does not understand                                                                                                                                  |
+| `game_staging_roots`  | Where one game's archives are extracted        | Only for a game the user moved off the default root; no row means the default. A preference about how Onera works, not a detected fact, which is why it is not a column on the install row |
+| `game_download_roots` | Where one game's downloads are kept            | Overrides `app_directories`; no row means the shared setting. Moving one rewrites `archives.stored_path` for every archive it moves                                                        |
+| `app_directories`     | Application-wide directories, keyed by purpose | Currently `downloads`. A row rather than a column so the next configurable directory is data, not a migration                                                                              |
 
 ### Content storage
 
@@ -100,10 +103,10 @@ distinction between absent and present provider file/version IDs.
 
 ### Downloads and browser handoff
 
-| Table            | Holds                             | Notes                                                                                                                       |
-| ---------------- | --------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `download_jobs`  | Persisted download state          | Stores provider game/mod/file identifiers and a stable partial path, never the signed URL: those expire and are credentials |
-| `inbox_requests` | Durable Native Messaging requests | Queued until the desktop completes, fails, or the user dismisses the requested action                                       |
+| Table            | Holds                             | Notes                                                                                                                                                                                                                                                                                       |
+| ---------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `download_jobs`  | Persisted download state          | Stores provider game/mod/file identifiers and a stable partial path, never the signed URL: those expire and are credentials                                                                                                                                                                 |
+| `inbox_requests` | Durable Native Messaging requests | Queued until the desktop completes, fails, or the user dismisses the requested action. `download_key`/`download_expires_at` hold a website-issued download grant — not a credential: one file, a few minutes — because the host process that received it exits before the desktop spends it |
 
 Queued, running, and paused downloads resume on startup. Onera re-resolves a
 fresh provider URL, sends a byte-range request for the retained partial, and

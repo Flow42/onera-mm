@@ -11,8 +11,9 @@ use onera_core::plan::{
     ConflictChoice, FileClassification, InstallPlan, PlannedFile, ScopedRule, TargetLocation,
 };
 use onera_core::ports::{
-    BackupStore, DeploymentStore, JournalEntry, JournalStatus, OperationJournal,
+    BackupStore, DeploymentStore, DownloadGrant, JournalEntry, JournalStatus, OperationJournal,
 };
+use onera_core::redact::Secret;
 use onera_core::RelPath;
 use onera_db::backup::FileBackupStore;
 use onera_db::jobs::{InboxRequest, InboxRequestKind, InboxState};
@@ -82,6 +83,7 @@ async fn fixture() -> Fixture {
         provider: provider.clone(),
         provider_file_id: provider_file.clone(),
         provider_version_id: None,
+        provider_download_id: None,
         provider_file_group_id: None,
         position: None,
         release_id: release,
@@ -171,6 +173,72 @@ async fn browser_inbox_exposes_only_actionable_requests() {
         .await
         .unwrap();
     assert!(f.db.inbox_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_files_second_identifier_is_remembered() {
+    // Nexus names one file twice, and only the site's name resolves a download.
+    // A request arriving from the site is matched against this column, so
+    // losing it on the way to the database would break that match.
+    let f = fixture().await;
+    let stored = f
+        .db
+        .provider_file(&ProviderId::nexus(), &f.provider_file)
+        .await
+        .unwrap()
+        .expect("the fixture cached one");
+    assert_eq!(stored.provider_download_id, None);
+
+    let updated = ProviderFile {
+        provider_download_id: Some(ProviderFileId::new("154093")),
+        ..stored
+    };
+    f.db.upsert_provider_file(&updated).await.unwrap();
+    assert_eq!(
+        f.db.provider_file(&ProviderId::nexus(), &f.provider_file)
+            .await
+            .unwrap()
+            .and_then(|file| file.provider_download_id),
+        Some(ProviderFileId::new("154093"))
+    );
+}
+
+#[tokio::test]
+async fn a_download_the_website_authorised_survives_the_handoff() {
+    // The whole point of persisting a grant: the native host that received it
+    // exits as soon as the browser closes the port, and the desktop process
+    // that spends it may not have been running at the time.
+    let f = fixture().await;
+    let expires_at = chrono::DateTime::from_timestamp(1_757_200_000, 0).unwrap();
+    let request = InboxRequest {
+        download_grant: Some(DownloadGrant {
+            key: Secret::new("Ab3-_cd9"),
+            expires_at,
+        }),
+        ..InboxRequest::queued(
+            InboxRequestKind::Download,
+            "cyberpunk2077".into(),
+            ProviderModId::new("4198"),
+            Some(ProviderFileId::new("154093")),
+        )
+    };
+    f.db.put_inbox_request(&request).await.unwrap();
+
+    let read = f.db.inbox_requests().await.unwrap();
+    let grant = read[0]
+        .download_grant
+        .as_ref()
+        .expect("the grant came back with the request");
+    assert_eq!(grant.key.expose(), "Ab3-_cd9");
+    assert_eq!(grant.expires_at, expires_at);
+    assert!(grant.is_valid_at(expires_at - chrono::Duration::seconds(1)));
+    assert!(!grant.is_valid_at(expires_at));
+
+    // A grant never reaches the window: what the frontend renders is this
+    // struct, serialized.
+    let rendered = serde_json::to_string(&read[0]).unwrap();
+    assert!(!rendered.contains("Ab3-_cd9"), "{rendered}");
+    assert!(!rendered.contains("download_grant"), "{rendered}");
 }
 
 #[tokio::test]

@@ -18,6 +18,12 @@
       "matches": ["https://www.nexusmods.com/*/mods/*"],
       "js": ["src/content.js"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.nexusmods.com/*/mods/*"],
+      "js": ["src/nxm-intercept.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
     }
   ],
   "icons": { "48": "icons/onera-48.png", "128": "icons/onera-128.png" },

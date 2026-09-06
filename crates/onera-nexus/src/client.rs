@@ -15,7 +15,7 @@ use onera_core::domain::release::{FileCategory, Mod, ProviderFile, Release};
 use onera_core::hash::FileHash;
 use onera_core::ids::{GameId, ModId, ProviderFileId, ProviderId, ProviderModId, ReleaseId};
 use onera_core::ports::{
-    AuthProvider, Credential, DownloadTarget, FetchedImage, ModProvider, Page,
+    AuthProvider, Credential, DownloadGrant, DownloadTarget, FetchedImage, ModProvider, Page,
 };
 use onera_core::progress::CancelToken;
 use onera_core::redact::redact_url;
@@ -552,6 +552,9 @@ impl ModProvider for NexusClient {
                     provider: ProviderId::nexus(),
                     provider_file_id: ProviderFileId::new(v.id.clone()),
                     provider_version_id: Some(onera_core::ids::ProviderVersionId::new(v.id)),
+                    // The number in the site's own URLs, and the only id the v1
+                    // download endpoint answers to. See `game_scoped_file_id`.
+                    provider_download_id: v.game_scoped_id.map(ProviderFileId::new),
                     provider_file_group_id,
                     position: None,
                     // Filled in by the caller once the release is persisted; the
@@ -577,17 +580,54 @@ impl ModProvider for NexusClient {
         game_slug: &str,
         mod_id: &ProviderModId,
         file_id: &ProviderFileId,
+        grant: Option<&DownloadGrant>,
         cancel: &CancelToken,
     ) -> Result<DownloadTarget> {
+        // A lapsed nonce is worth saying out loud before anything is asked of
+        // the network: the fix is another click on the mod page, not a retry.
+        if let Some(grant) = grant {
+            if !grant.is_valid_at(chrono::Utc::now()) {
+                return Err(CoreError::InvalidInput(
+                    "the download link from the mod page has expired; press \"Mod manager download\" again".to_owned(),
+                ));
+            }
+        }
+
         // Download resolution is not in the v3 specification Onera was built
-        // against; the documented v1 endpoint is used until it is.
-        let url = self.v1(&format!(
+        // against; the documented v1 endpoint is used until it is. v1 and v3 do
+        // not share an id space, so the file id is translated first.
+        let v1_file_id = self
+            .game_scoped_file_id(game_slug, mod_id, file_id, cancel)
+            .await;
+        let mut url = self.v1(&format!(
             "/games/{}/mods/{}/files/{}/download_link.json",
             urlencode(game_slug),
             urlencode(mod_id.as_str()),
-            urlencode(file_id.as_str())
+            urlencode(v1_file_id.as_deref().unwrap_or(file_id.as_str()))
         ));
-        let links: Vec<DownloadLink> = self.get_json(&url, cancel).await?;
+        // The same endpoint serves two kinds of caller: a premium account, for
+        // which the key alone is enough, and everyone else, who must present
+        // the nonce the website minted for this one file.
+        if let Some(grant) = grant {
+            url.push_str(&format!(
+                "?key={}&expires={}",
+                urlencode(grant.key.expose()),
+                grant.expires_at.timestamp()
+            ));
+        }
+        let links: Vec<DownloadLink> = self.get_json(&url, cancel).await.map_err(|e| {
+            // The endpoint answers 403 to a valid key on a free account: it
+            // issues links without a nonce only to premium members. Reporting
+            // that as "not authenticated" sends the user to re-enter a key
+            // that is working perfectly, so it is restated here.
+            if e.is_auth() {
+                CoreError::Provider(
+                    "Nexus refused to issue a download location. Premium accounts can download directly; a free account has to start the download from the mod page's \"Mod manager download\" button, which Onera does not handle yet".to_owned(),
+                )
+            } else {
+                e
+            }
+        })?;
         let first = links.into_iter().next().ok_or_else(|| {
             CoreError::Provider(
                 "Nexus returned no download locations; a free account may need to start the download from the website".to_owned(),
@@ -665,6 +705,41 @@ impl ModProvider for NexusClient {
 }
 
 impl NexusClient {
+    /// The game-scoped id of a mod file version, which is what v1 calls a file id.
+    ///
+    /// v3 identifies a mod file version twice: by a global `id` — the value
+    /// every other v3 endpoint takes — and by a `game_scoped_id`, the number
+    /// that appears in the site's own URLs. The v1 download endpoint only
+    /// knows the second one, so handing it the id the rest of Onera carries
+    /// produces a 404 with no explanation. Everything upstream keeps using the
+    /// v3 id; the translation lives here, at the one call that needs it.
+    ///
+    /// `None` means the translation could not be made — an unknown mod, or a
+    /// version the mod no longer lists. The caller then uses the id it was
+    /// given, which is correct for an id that was already game-scoped, and
+    /// fails at the download endpoint exactly as it would have anyway.
+    async fn game_scoped_file_id(
+        &self,
+        game_slug: &str,
+        mod_id: &ProviderModId,
+        file_id: &ProviderFileId,
+        cancel: &CancelToken,
+    ) -> Option<String> {
+        let url = self.v3(&format!(
+            "/games/{}/mods/{}",
+            urlencode(game_slug),
+            urlencode(mod_id.as_str())
+        ));
+        let envelope: Envelope<WireMod> = self.get_json(&url, cancel).await.ok()?;
+        let versions = self.file_versions(&envelope.data.id, cancel).await.ok()?;
+        versions
+            .into_iter()
+            .find(|v| {
+                v.id == file_id.as_str() || v.game_scoped_id.as_deref() == Some(file_id.as_str())
+            })
+            .and_then(|v| v.game_scoped_id)
+    }
+
     /// Every file version across every file slot of a mod.
     async fn file_versions(
         &self,

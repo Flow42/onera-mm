@@ -106,6 +106,16 @@ pub struct ProviderFile {
     pub provider_file_id: ProviderFileId,
     /// Provider's opaque version identity for this file, when exposed.
     pub provider_version_id: Option<ProviderVersionId>,
+    /// The identifier the provider's *download* endpoint and its own site URLs
+    /// use for this file, when that differs from [`ProviderFile::provider_file_id`].
+    ///
+    /// Nexus has two id spaces for one file version — the global id every API
+    /// call takes, and the game-scoped number in the site's URLs — and only the
+    /// second one resolves a download. Onera keys on the first everywhere and
+    /// records the second here, so a request that arrives carrying a site id
+    /// (a browser handing over a "Mod manager download") still names a file
+    /// Onera can recognise. `None` means the provider has only one id space.
+    pub provider_download_id: Option<ProviderFileId>,
     /// Provider's opaque group of mutually superseding files, when exposed.
     pub provider_file_group_id: Option<ProviderFileGroupId>,
     /// Provider-defined ordering position within the file group.

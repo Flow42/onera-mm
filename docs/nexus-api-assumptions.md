@@ -56,6 +56,47 @@ and their tests.
 working. Mod metadata continues to work. This is the largest single external
 risk in the project, which is why it is written down here rather than buried.
 
+### v1 and v3 do not share an id space
+
+A mod file version has two identifiers in v3: `id`, the global one every v3
+endpoint takes, and `game_scoped_id`, the number the site's own URLs use. **The
+v1 download endpoint only accepts the second.** Handed the first it answers
+`404` with an empty problem body, which surfaces as `nexus resource not found:
+no detail` — the same message as a mod that does not exist.
+
+Onera carries the v3 `id` everywhere (it is what the dependency endpoints
+return and what the resolver matches on) and translates once, in
+`client.rs::game_scoped_file_id`, at the only call that needs the other space.
+The translation costs a mod lookup plus its file-version listing; if it cannot
+be made, the id is passed through as given, which is right for a job whose id
+was already game-scoped.
+
+The same split applies to mods: `GET /v3/games/{domain}/mods/{id}` takes the
+game-scoped id, while `GET /v3/mods/{id}/files` takes the global one.
+
+### Download links and account tier
+
+`download_link.json` issues a location without a nonce **only to premium
+accounts**. A free account gets `403` with a valid key, so the client restates
+that as a provider error rather than an authentication failure — the key is
+fine.
+
+The website's own **Mod manager download** button hands any account an `nxm://`
+link carrying `key` and `expires`, and the same endpoint accepts those:
+
+    GET /v1/games/{domain}/mods/{id}/files/{game_scoped_id}/download_link.json?key=…&expires=…
+
+That is the free-account path, and Onera takes it through the browser: the
+extension catches the link the page mints and hands the two values to the native
+host, which stores them with the queued request for the desktop to spend. See
+`docs/native-messaging.md`.
+
+**Assumptions:** the query parameters are named `key` and `expires`; `expires`
+is Unix seconds; the nonce is single-use and short-lived, so it is checked
+against the clock before it is spent and never retried.
+**If they change:** the browser handoff stops working for free accounts, with a
+provider error; premium downloads are unaffected.
+
 ## Data model mapping
 
 | Nexus concept                                    | Onera concept              |

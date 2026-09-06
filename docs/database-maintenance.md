@@ -18,7 +18,9 @@ Everything is under the XDG directories, so a backup tool that already covers
 | `$XDG_DATA_HOME/onera/onera.db`    | **The database.** Ownership, profiles, journal, baselines | **No**                                       |
 | `$XDG_DATA_HOME/onera/backups/`    | Content-addressed copies of overwritten files             | **No** — these are the user's original files |
 | `$XDG_DATA_HOME/onera/archives/`   | Downloaded mod archives, content-addressed                | Yes, by re-downloading                       |
+| a chosen download directory        | The same, for a game or for everything                    | Yes, by re-downloading                       |
 | `$XDG_STATE_HOME/onera/staging/`   | Per-operation staging directories                         | Yes — discarded on recovery                  |
+| a game's chosen staging directory  | The same, for a game staged off the default root          | Yes — swept on startup like the default one  |
 | `$XDG_STATE_HOME/onera/logs/`      | Logs                                                      | Yes                                          |
 | `$XDG_CACHE_HOME/onera/downloads/` | Partial downloads                                         | Yes                                          |
 

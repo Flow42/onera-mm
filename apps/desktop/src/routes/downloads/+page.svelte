@@ -1,9 +1,20 @@
+<!--
+  The transfer queue.
+
+  Deliberately global rather than per game: the queue is shared, and a job
+  names the provider's own game slug, which is not the same identifier as a
+  registered installation. Filtering it by the game the user came from would be
+  a guess, so every job is shown and each says which slug it belongs to.
+-->
 <script lang="ts">
+  import CardList from '$lib/components/CardList.svelte';
+  import ViewToggle from '$lib/components/ViewToggle.svelte';
   import { onProgress } from '$lib/bridge';
   import { fraction, initial, reduce, type OperationProgress } from '$lib/progress.svelte';
   import { formatBytes } from '$lib/plan-view';
   import { commands } from '$lib/bridge';
   import type { DownloadJob } from '$lib/types';
+  import { viewMode } from '$lib/view-mode.svelte';
   import { onMount } from 'svelte';
 
   // Downloads are performed by the native application, never by the browser, so
@@ -13,6 +24,8 @@
   let busy = $state(false);
   let loading = $state(true);
   let error = $state<string | null>(null);
+
+  const layout = viewMode('downloads', 'list');
 
   async function refresh() {
     loading = true;
@@ -39,6 +52,19 @@
     }
   }
 
+  /**
+   * How far one job has got, as a fraction.
+   *
+   * Null when the provider never reported a size: a job of unknown length is
+   * shown as indeterminate rather than as a bar that would have to invent a
+   * denominator.
+   */
+  function progressOf(job: DownloadJob): number | null {
+    return job.expected_size === null || job.expected_size <= 0
+      ? null
+      : Math.min(1, job.bytes_downloaded / job.expected_size);
+  }
+
   // `onMount` must return its cleanup synchronously, so the subscription is
   // started in the background and torn down through a captured handle.
   onMount(() => {
@@ -53,11 +79,28 @@
   });
 </script>
 
-<h1>Downloads</h1>
-<p><button onclick={resume} disabled={busy}>{busy ? 'Resuming…' : 'Resume incomplete'}</button></p>
+<header class="page-heading">
+  <div>
+    <h1>Downloads</h1>
+    <p class="lede">
+      The queue is shared across every game. Transfers are performed by Onera itself, never by the
+      browser.
+    </p>
+  </div>
+  <div class="toolbar">
+    <ViewToggle
+      mode={layout.current}
+      onchange={(mode) => layout.set(mode)}
+      label="Downloads layout"
+    />
+    <button onclick={resume} disabled={busy}>{busy ? 'Resuming…' : 'Resume incomplete'}</button>
+  </div>
+</header>
+
 {#if error !== null}<p class="error" role="alert">{error}</p>{/if}
-<div class="panel">
-  <p>{active.stage}{active.detail === null ? '' : `: ${active.detail}`}</p>
+
+<div class="panel current">
+  <p class="stage">{active.stage}{active.detail === null ? '' : `: ${active.detail}`}</p>
   {#if fraction(active) === null}
     <progress></progress>
   {:else}
@@ -69,26 +112,53 @@
 
 {#if loading}
   <p class="muted">Loading downloads…</p>
-{:else}<table>
-    <thead><tr><th>File</th><th>Status</th><th>Progress</th><th>Attempts</th></tr></thead>
-    <tbody>
-      {#each jobs as job (job.id)}
-        <tr>
-          <td
-            >{job.filename}<br /><span class="muted">{job.game_slug} / {job.provider_mod_id}</span
-            ></td
-          >
-          <td class:severity-danger={job.state === 'failed'}>{job.state}</td>
-          <td>
-            {formatBytes(job.bytes_downloaded)}{job.expected_size === null
-              ? ''
-              : ` / ${formatBytes(job.expected_size)}`}
-          </td>
-          <td>{job.attempts}</td>
-        </tr>
-        {#if job.error !== null}<tr><td colspan="4" class="severity-danger">{job.error}</td></tr
-          >{/if}
-      {/each}
-    </tbody>
-  </table>{/if}
-{#if !loading && error === null && jobs.length === 0}<p class="muted">No downloads yet.</p>{/if}
+{:else}
+  <CardList mode={layout.current} label="Download jobs">
+    {#each jobs as job (job.id)}
+      <li class="card" class:failed={job.state === 'failed'}>
+        <span class="icon" aria-hidden="true">⇣</span>
+        <div class="body">
+          <h2 class="title">{job.filename}</h2>
+          <p class="meta">
+            <span class="tag" class:severity-danger={job.state === 'failed'}>{job.state}</span>
+            <span class="muted"
+              >{formatBytes(job.bytes_downloaded)}{job.expected_size === null
+                ? ''
+                : ` / ${formatBytes(job.expected_size)}`}</span
+            >
+            <span class="muted tile-hide">attempt {job.attempts}</span>
+          </p>
+          {#if progressOf(job) === null}
+            <p class="muted tile-hide">The provider did not report a size for this file.</p>
+          {:else}
+            <progress value={progressOf(job)}></progress>
+          {/if}
+          <p class="path">{job.game_slug} / {job.provider_mod_id}</p>
+          {#if job.error !== null}<p class="severity-danger">{job.error}</p>{/if}
+        </div>
+      </li>
+    {/each}
+  </CardList>
+{/if}
+{#if !loading && error === null && jobs.length === 0}<p class="empty">No downloads yet.</p>{/if}
+
+<style>
+  .current {
+    margin-bottom: 1.25rem;
+  }
+  .stage {
+    margin: 0 0 0.5rem;
+    font-weight: 500;
+  }
+  /* A job carries several lines — a bar, its slug, sometimes an error — so the
+     mark sits at the top of them rather than floating in the middle. */
+  .card {
+    align-items: flex-start;
+  }
+  .card.failed {
+    border-color: #ff6f8659;
+  }
+  .card progress {
+    margin-top: 0.45rem;
+  }
+</style>

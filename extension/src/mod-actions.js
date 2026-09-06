@@ -112,6 +112,22 @@ export function actionsFor(state) {
 }
 
 /**
+ * The transfer a download that arrived from outside Onera should become.
+ *
+ * A download link the user minted on the mod page says which file, not what to
+ * do with it. Installing is what a mod manager is for, so that is the answer
+ * wherever Onera has a game to install into — and a plain download where it has
+ * not, because queueing an install with nowhere to put it would only park the
+ * request until the user came back to answer for it.
+ *
+ * @param {ModState | null | undefined} state - The host's answer, if it replied.
+ * @returns {string} One of [`ACTION`]'s transfer actions.
+ */
+export function transferActionFor(state) {
+  return state?.game_registered === true ? ACTION.DOWNLOAD_AND_INSTALL : ACTION.DOWNLOAD;
+}
+
+/**
  * Render a version for display.
  *
  * Versions are provider strings and are never parsed or compared here; this

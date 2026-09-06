@@ -386,6 +386,9 @@ impl Onera {
                     filename: file.name.clone(),
                     expected_size: file.size_bytes,
                     expected_hash: file.published_hash.clone(),
+                    // A profile is applied from Onera's own records, with no
+                    // browser click behind it to have authorised anything.
+                    grant: None,
                 },
                 progress,
                 cancel,
@@ -395,7 +398,7 @@ impl Onera {
         // Inspect before extracting, exactly as a single install does: an
         // archive acquired for a profile gets no weaker safety treatment.
         self.archives.inspect(&outcome.path, cancel).await?;
-        let staging = self.paths.staging_for(OperationId::new());
+        let staging = self.staging_for(game, OperationId::new()).await?;
         let extracted = self
             .archives
             .extract(&outcome.path, &staging, progress, cancel)

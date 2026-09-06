@@ -359,6 +359,7 @@ async fn provider_candidate_identity_and_unresolved_legacy_metadata_round_trip()
         provider: ProviderId::nexus(),
         provider_file_id: ProviderFileId::new("resolved-file"),
         provider_version_id: Some(ProviderVersionId::new("opaque-version")),
+        provider_download_id: None,
         provider_file_group_id: Some(ProviderFileGroupId::new("opaque-chain")),
         position: Some(9_223_372_036_854_775_000),
         release_id: release,
@@ -372,6 +373,7 @@ async fn provider_candidate_identity_and_unresolved_legacy_metadata_round_trip()
     let unresolved = ProviderFile {
         provider_file_id: ProviderFileId::new("legacy-file"),
         provider_version_id: None,
+        provider_download_id: None,
         provider_file_group_id: None,
         position: None,
         name: "legacy.zip".into(),

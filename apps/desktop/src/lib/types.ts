@@ -37,6 +37,63 @@ export interface LocalGame {
   confirmed: boolean;
 }
 
+/** Where one game lives, and where Onera extracts its archives. */
+export interface GamePaths {
+  install_root: string;
+  staging_root: string;
+  /** Whether staging is Onera's own directory rather than a chosen one. */
+  staging_is_default: boolean;
+  /** What is in the staging directory: unfinished work, never a store. */
+  staging_entries: number;
+}
+
+/** Where downloads are kept, and which setting decided that. */
+export interface DownloadPaths {
+  root: string;
+  /** `default` is Onera's own directory; `global` is shared; `game` overrides it. */
+  scope: 'default' | 'global' | 'game';
+  /** What this game would use without its own setting. Null for the shared one. */
+  inherited: string | null;
+  /** Archives Onera has recorded in the directory. */
+  archives: number;
+  bytes: number;
+}
+
+/** The result of moving a download directory. */
+export interface DownloadDirChange {
+  root: string;
+  moved: number;
+  bytes: number;
+  previous: string;
+}
+
+/** The result of moving a game's staging directory. */
+export interface StagingChange {
+  root: string;
+  /** Entries carried over from the directory that was in use before. */
+  moved: number;
+  previous: string;
+}
+
+/** One file a mod owns, as the deployment record has it. */
+export interface ModFileEntry {
+  root_key: string;
+  path: string;
+  absolute: string;
+  exists: boolean;
+  size: number | null;
+}
+
+/** A mod's files and the one directory that holds them all. */
+export interface ModContents {
+  kind: 'installed' | 'archive' | 'none';
+  /** The directory a file manager would be opened at, when there is one. */
+  browse: string | null;
+  entries: ModFileEntry[];
+  /** How many files the mod owns, whatever the list was capped at. */
+  total: number;
+}
+
 export interface ProviderFileView {
   id: string;
   name: string;

@@ -1,66 +1,174 @@
 /* A single stylesheet: the application is small enough that a component
    framework would cost more than it saves, and a fixed palette keeps the
-   conflict severities legible. */
+   conflict severities legible.
+
+   Everything the shell and the pages share lives here — surfaces, cards, the
+   two list layouts, and the severity colours. Component styles stay scoped to
+   their component; anything a page renders inside a shared list component has
+   to be styled from here, because scoped rules do not cross that boundary. */
 :root {
-  --bg: #17171a;
-  --panel: #1f1f24;
-  --line: #33333a;
-  --text: #f2f2f4;
-  --muted: #a1a1aa;
-  --accent: #7aa2f7;
-  --accent-soft: #7aa2f733;
-  --warning: #e0af68;
-  --danger: #f7768e;
-  --ok: #9ece6a;
   color-scheme: dark;
+
+  /* Surfaces, from the window backdrop up to a raised card. */
+  --bg: #0c0d12;
+  --bg-glow: #1a1c2b;
+  --surface: #14161e;
+  --surface-raised: #191c26;
+  --surface-sunken: #101219;
+  --line: #242833;
+  --line-strong: #333a4a;
+
+  --text: #e9ebf2;
+  --muted: #939bb0;
+  --faint: #6b7288;
+
+  --accent: #7c8cff;
+  --accent-strong: #97a3ff;
+  --accent-ink: #0b0c14;
+  --accent-soft: #7c8cff1f;
+  --accent-line: #7c8cff59;
+
+  --warning: #f0b25c;
+  --danger: #ff6f86;
+  --ok: #79d99a;
+
+  --radius-sm: 8px;
+  --radius: 12px;
+  --radius-lg: 16px;
+
+  --shadow-card: 0 1px 2px #00000059, 0 8px 24px -16px #000000cc;
+  --shadow-raised: 0 2px 6px #00000066, 0 20px 40px -24px #000000e6;
+
+  /* One duration for the menu movement, so the shell and anything that
+     animates with it stay in step. */
+  --step: 200ms;
+  --ease: cubic-bezier(0.22, 0.68, 0.35, 1);
+}
+
+* {
+  box-sizing: border-box;
 }
 
 body {
   margin: 0;
   background: var(--bg);
+  /* Two very soft lights rather than a flat fill: the window reads as a
+     surface with depth without any of it competing with the content. */
+  background-image:
+    radial-gradient(900px 500px at 12% -8%, #2a2d4a4d, transparent 70%),
+    radial-gradient(700px 460px at 100% 0%, #1d3a4740, transparent 65%);
+  background-attachment: fixed;
   color: var(--text);
   font:
-    14px/1.5 system-ui,
+    14px/1.55 'Inter var',
+    Inter,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
     sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
+
 h1 {
-  font-size: 1.25rem;
-  margin: 0 0 1rem;
+  font-size: 1.4rem;
+  font-weight: 620;
+  letter-spacing: -0.02em;
+  margin: 0 0 0.35rem;
 }
 h2 {
-  font-size: 1rem;
-  margin: 1.5rem 0 0.5rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 1.75rem 0 0.6rem;
 }
+h3 {
+  font-size: 0.9rem;
+  font-weight: 600;
+  margin: 0 0 0.3rem;
+}
+a {
+  color: var(--accent-strong);
+  text-decoration-color: #7c8cff66;
+  text-underline-offset: 2px;
+}
+
+code {
+  font-family: ui-monospace, 'JetBrains Mono', 'SFMono-Regular', Menlo, monospace;
+  font-size: 0.88em;
+  color: var(--text);
+}
+
 button {
   font: inherit;
-  padding: 0.4rem 0.8rem;
-  border-radius: 6px;
-  border: 1px solid var(--line);
-  background: var(--panel);
+  font-weight: 500;
+  padding: 0.42rem 0.85rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line-strong);
+  background: linear-gradient(180deg, #23283400, #0000001a), var(--surface-raised);
   color: inherit;
   cursor: pointer;
+  transition:
+    background-color 120ms var(--ease),
+    border-color 120ms var(--ease),
+    transform 80ms var(--ease);
+}
+button:hover:not(:disabled) {
+  border-color: var(--accent-line);
+  background: var(--surface-raised);
+}
+button:active:not(:disabled) {
+  transform: translateY(1px);
 }
 button:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
 }
 button.primary {
-  background: var(--accent);
-  color: #10101a;
+  background: linear-gradient(180deg, var(--accent-strong), var(--accent));
+  color: var(--accent-ink);
   border-color: transparent;
+  font-weight: 600;
 }
 button.danger {
-  border-color: var(--danger);
+  border-color: #ff6f8659;
   color: var(--danger);
 }
-input {
+button.danger:hover:not(:disabled) {
+  border-color: var(--danger);
+  background: #ff6f8614;
+}
+button.ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+}
+button.ghost:hover:not(:disabled) {
+  background: #ffffff0a;
+  color: var(--text);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+input,
+select,
+textarea {
   font: inherit;
-  padding: 0.4rem;
-  border-radius: 6px;
+  padding: 0.45rem 0.6rem;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--line);
-  background: var(--panel);
+  background: var(--surface-sunken);
   color: inherit;
   width: 100%;
+}
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: var(--accent-line);
 }
 /* The rule above is for text fields; a checkbox stretched to the full width of
    its label is what makes a tick box drift away from the words it belongs to. */
@@ -68,7 +176,9 @@ input[type='checkbox'] {
   width: auto;
   padding: 0;
   margin: 0;
+  accent-color: var(--accent);
 }
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -76,9 +186,17 @@ table {
 th,
 td {
   text-align: left;
-  padding: 0.35rem 0.5rem;
+  padding: 0.45rem 0.6rem;
   border-bottom: 1px solid var(--line);
 }
+th {
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
 .muted {
   color: var(--muted);
 }
@@ -93,14 +211,284 @@ td {
   color: var(--muted);
 }
 .panel {
-  background: var(--panel);
+  background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 1rem;
+  border-radius: var(--radius);
+  padding: 1rem 1.1rem;
+  box-shadow: var(--shadow-card);
 }
 .error {
   color: var(--danger);
 }
+/* The default control is a green plate on every platform; these three rules
+   are what make a bar belong to the rest of the window. An indeterminate bar
+   is deliberately a moving stripe rather than a full one: an operation of
+   unknown length must not look like an operation that is nearly done. */
 progress {
   width: 100%;
+  height: 6px;
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--surface-sunken);
+}
+progress::-webkit-progress-bar {
+  background: var(--surface-sunken);
+  border-radius: 999px;
+}
+progress::-webkit-progress-value {
+  background: linear-gradient(90deg, var(--accent), var(--accent-strong));
+  border-radius: 999px;
+}
+progress::-moz-progress-bar {
+  background: var(--accent);
+  border-radius: 999px;
+}
+progress:indeterminate {
+  background-image: linear-gradient(
+    90deg,
+    #7c8cff00 0%,
+    var(--accent) 40%,
+    var(--accent-strong) 60%,
+    #7c8cff00 100%
+  );
+  background-size: 40% 100%;
+  background-repeat: no-repeat;
+  animation: progress-sweep 1.4s linear infinite;
+}
+progress:indeterminate::-webkit-progress-bar {
+  background: transparent;
+}
+@keyframes progress-sweep {
+  from {
+    background-position: -40% 0;
+  }
+  to {
+    background-position: 140% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  progress:indeterminate {
+    animation: none;
+  }
+}
+
+/* A pill for a version, a state or a count. */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface-sunken);
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+}
+.tag.new {
+  border-color: var(--accent-line);
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+}
+
+/* The page header every view opens with: title, one line of orientation, and
+   whatever controls belong to the whole view. */
+.page-heading {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.25rem;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 1.25rem;
+}
+.page-heading .lede {
+  margin: 0;
+  color: var(--muted);
+  max-width: 62ch;
+}
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+/* ---------------------------------------------------------------------------
+   Cards, and the two shapes a list of them takes.
+
+   `rows` is one card per line across the full width; `tiles` is a square grid
+   that fills row-first and stays start-aligned, so a short last row sits under
+   the beginning of the one above it rather than being spread across it. These
+   live in the global sheet because the cards are written by the pages and the
+   list element by a shared component — scoped styles would not reach across.
+   --------------------------------------------------------------------------- */
+.cards {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.cards.rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.cards.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(196px, 1fr));
+  justify-content: start;
+  align-content: start;
+  gap: 0.75rem;
+}
+
+.card {
+  position: relative;
+  display: flex;
+  gap: 0.9rem;
+  align-items: center;
+  padding: 0.8rem 0.9rem;
+  background: linear-gradient(180deg, #ffffff08, #ffffff00 60%), var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-card);
+  transition:
+    border-color 140ms var(--ease),
+    transform 140ms var(--ease),
+    box-shadow 140ms var(--ease);
+}
+.card:hover {
+  border-color: var(--line-strong);
+  box-shadow: var(--shadow-raised);
+}
+/* A card that is itself a way into something deeper lifts on hover; a card
+   that only carries information does not, so the two are told apart before
+   anything is clicked. */
+.card.actionable:hover {
+  border-color: var(--accent-line);
+  transform: translateY(-1px);
+}
+.card.selected {
+  border-color: var(--accent-line);
+  background: linear-gradient(180deg, var(--accent-soft), #ffffff00 70%), var(--surface);
+}
+
+/* The whole card is the target, without nesting a button inside a button: the
+   link is stretched over the card and the real controls are lifted above it. */
+.card .stretch::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+}
+.card .stretch {
+  color: inherit;
+  text-decoration: none;
+}
+.card .above {
+  position: relative;
+  z-index: 1;
+}
+
+.card .icon {
+  flex: none;
+  width: 64px;
+  height: 64px;
+  border-radius: 10px;
+  overflow: hidden;
+  background: linear-gradient(140deg, #2b3048, #1b1e2b);
+  border: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 1.15rem;
+  letter-spacing: 0.02em;
+}
+.card .icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.card .body {
+  flex: 1;
+  min-width: 0;
+}
+.card .title {
+  font-size: 0.98rem;
+  font-weight: 600;
+  margin: 0 0 0.2rem;
+  /* A mod or game name can be very long; it must not push the actions off. */
+  overflow-wrap: anywhere;
+}
+.card .meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.7rem;
+  align-items: center;
+  margin: 0.25rem 0 0;
+  font-size: 0.88rem;
+}
+.path {
+  color: var(--faint);
+  font-family: ui-monospace, 'JetBrains Mono', 'SFMono-Regular', Menlo, monospace;
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+.card .path {
+  margin: 0.3rem 0 0;
+}
+.card .actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+/* Tile shape: square, artwork on top, the same content stacked. */
+.cards.tiles .card {
+  flex-direction: column;
+  align-items: stretch;
+  aspect-ratio: 1;
+  padding: 0.75rem;
+  gap: 0.6rem;
+}
+.cards.tiles .card .icon {
+  width: 100%;
+  height: auto;
+  flex: 1;
+  min-height: 0;
+  font-size: 1.6rem;
+}
+.cards.tiles .card .body {
+  flex: none;
+}
+.cards.tiles .card .title {
+  font-size: 0.9rem;
+  /* Two lines at most, so every tile in a row keeps the same square. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+.cards.tiles .card .dates,
+.cards.tiles .card .path,
+.cards.tiles .card .tile-hide {
+  display: none;
+}
+.cards.tiles .card .actions {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+/* An empty list is a state with something to say, not a blank area. */
+.empty {
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  text-align: center;
+  color: var(--muted);
+  background: #ffffff04;
 }

@@ -12,13 +12,17 @@
 
 pub mod baseline;
 pub mod clean;
+pub mod contents;
+pub mod downloads;
 pub mod flow;
+pub mod icon;
 pub mod inbox;
 pub mod logging;
 pub mod paths;
 pub mod presence;
 pub mod profile;
 pub mod secrets;
+pub mod staging;
 
 pub use baseline::{BaselineCapturePreview, BaselineStatusReport};
 pub use clean::{
@@ -29,7 +33,11 @@ pub use flow::{
     BrowserAction, DownloadRequest, DownloadedArchive, InstallRequest, InstalledModInfo,
     ModArtwork, ModStateInfo, Onera, PreparedInstall, PreparedState, ProfileDetails,
 };
+pub use contents::{ModContents, ModFileEntry, ModLocationKind};
+pub use downloads::{DownloadDirChange, DownloadDirInfo, DownloadScope};
+pub use icon::GameIcon;
 pub use inbox::{run_request, RanRequest};
 pub use paths::Paths;
 pub use presence::{DesktopPresence, Presence};
 pub use secrets::{InMemorySecretStore, KeyringSecretStore};
+pub use staging::{StagingChange, StagingInfo};

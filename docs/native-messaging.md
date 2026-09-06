@@ -127,16 +127,50 @@ UTF-8 JSON. On top of that Onera defines a versioned envelope:
 
 ### Commands
 
-| Type                   | Fields                  | Does                                                                 |
-| ---------------------- | ----------------------- | -------------------------------------------------------------------- |
-| `ping`                 | —                       | Liveness and version                                                 |
-| `status`               | —                       | Authentication, registered games, and whether the window runs        |
-| `app_state`            | —                       | Whether the desktop window is running, and whether it can be started |
-| `launch_app`           | —                       | Starts the desktop window if it is not already running               |
-| `mod_state`            | `game_domain`, `mod_id` | What Onera already has for one mod                                   |
-| `add_mod`              | `game_domain`, `mod_id` | Fetches metadata and queues an Add Mod inbox item                    |
-| `download`             | `+ file_id`, `page_url` | Resolves the file and queues a durable desktop download              |
-| `download_and_install` | `+ file_id`, `page_url` | Resolves the file and queues an installation                         |
+| Type                   | Fields                           | Does                                                                 |
+| ---------------------- | -------------------------------- | -------------------------------------------------------------------- |
+| `ping`                 | —                                | Liveness and version                                                 |
+| `status`               | —                                | Authentication, registered games, and whether the window runs        |
+| `app_state`            | —                                | Whether the desktop window is running, and whether it can be started |
+| `launch_app`           | —                                | Starts the desktop window if it is not already running               |
+| `mod_state`            | `game_domain`, `mod_id`          | What Onera already has for one mod                                   |
+| `add_mod`              | `game_domain`, `mod_id`          | Fetches metadata and queues an Add Mod inbox item                    |
+| `download`             | `+ file_id`, `page_url`, `grant` | Resolves the file and queues a durable desktop download              |
+| `download_and_install` | `+ file_id`, `page_url`, `grant` | Resolves the file and queues an installation                         |
+
+### Downloads the website authorised
+
+Nexus issues a download location straight to a **premium** account. Every other
+account gets one by pressing **Mod manager download** on the mod page, which
+mints a `nxm://` link carrying a nonce (`key`) and an expiry (`expires`); the
+same API endpoint accepts those and refuses without them. Onera cannot produce a
+nonce — only a browser where the user pressed the button can — so this is the
+one value that travels _inwards_ over this transport besides identifiers:
+
+```jsonc
+{
+  "v": 1,
+  "id": "ext-m3k2-8",
+  "type": "download_and_install",
+  "game_domain": "cyberpunk2077",
+  "mod_id": "4198",
+  // The id the *site* uses for the file, which is not the one the API keys on.
+  // The host matches a request against either.
+  "file_id": "154093",
+  "grant": { "key": "Ab3-_cd9", "expires": 1757200000 },
+}
+```
+
+The extension catches that link in the page's own world (`nxm-intercept.js`),
+parses it as untrusted input (`nxm.js`) and sends the fields above; it never
+forwards the raw address. The grant is not a credential: it authorises one file
+for a few minutes and nothing else. It is stored with the queued request —
+because the host process that received it exits long before the desktop spends
+it — and it is redacted in every log and never serialized to the window.
+
+A grant that lapsed before the desktop reached it fails the request with a
+message saying to press the button again, rather than with whatever the provider
+says to a stale nonce.
 
 ### Is the window running, and starting it
 
@@ -251,6 +285,10 @@ the user could be registered under the host name.
 - The request id must be 1–128 characters.
 - `game_domain`, `mod_id` and `file_id` must be 1–64 characters of
   `[A-Za-z0-9_-]`. `../../etc/passwd` and `107 OR 1=1` are rejected.
+- `grant.key`, when present, must be 1–128 characters of `[A-Za-z0-9_-]`, and
+  `grant.expires` must be a representable Unix timestamp. A key is a nonce and
+  nothing else: one carrying `&`, `/` or `..` would be an attempt to reshape the
+  request it is spent on, and is refused.
 - `page_url` must be an `https://www.nexusmods.com/<game>/mods/<id>` address of
   at most 512 characters, with no query string, fragment or credential. It is
   the one field an extension supplies that Onera later hands back to a browser,
@@ -268,6 +306,8 @@ the user could be registered under the host name.
 - **Anything the page chose.** The extension re-derives a mod's identity from
   the URL rather than trusting what a content script sends, and rebuilds
   `page_url` from that identity — so a tab's query string never reaches Onera.
+  A captured `nxm://` link is held to the same rule: the host is sent parsed,
+  validated identifiers and a nonce, never the address the page produced.
 
 ## Troubleshooting
 

@@ -147,10 +147,11 @@ impl ModProvider for DependencyBlindProvider {
         game_slug: &str,
         mod_id: &ProviderModId,
         file_id: &onera_core::ids::ProviderFileId,
+        grant: Option<&onera_core::ports::DownloadGrant>,
         cancel: &CancelToken,
     ) -> onera_core::Result<onera_core::ports::DownloadTarget> {
         self.0
-            .resolve_download(game_slug, mod_id, file_id, cancel)
+            .resolve_download(game_slug, mod_id, file_id, grant, cancel)
             .await
     }
     // The one override: the trait's own default, restated deliberately.
@@ -874,6 +875,7 @@ async fn an_installed_mod_can_be_adopted_by_a_profile_without_a_download() {
                 filename: "test-mod-1.0.zip".into(),
                 expected_size: file.size_bytes,
                 expected_hash: None,
+                grant: None,
             },
             &NullProgress,
             &CancelToken::new(),

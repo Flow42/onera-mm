@@ -84,15 +84,33 @@ pub async fn run_request(
         .provider_file_id
         .as_ref()
         .ok_or_else(|| CoreError::InvalidInput("the request names no file".to_owned()))?;
+    // A request from the extension's own buttons names the file by the id
+    // Onera keys on; one that came from the provider's "Mod manager download"
+    // names it the way the website does. Both are the same file, so both are
+    // accepted here rather than making the browser guess which space to use.
     let file = details
         .files
         .iter()
-        .find(|candidate| candidate.provider_file_id == *file_id)
+        .find(|candidate| {
+            candidate.provider_file_id == *file_id
+                || candidate.provider_download_id.as_ref() == Some(file_id)
+        })
         .ok_or_else(|| CoreError::NotFound {
             kind: "provider file",
             id: file_id.as_str().to_owned(),
         })?
         .clone();
+
+    // The grant was minted for one file at one moment. Spending it after it
+    // lapsed produces a provider rejection that says nothing useful, so the
+    // request fails here with the sentence that tells the user what to do.
+    if let Some(grant) = &request.download_grant {
+        if !grant.is_valid_at(chrono::Utc::now()) {
+            return Err(CoreError::InvalidInput(format!(
+                "the download link for {name} expired before Onera could use it; press \"Mod manager download\" on the mod page again"
+            )));
+        }
+    }
 
     if request.kind == InboxRequestKind::Download {
         let outcome = onera
@@ -104,6 +122,7 @@ pub async fn run_request(
                     filename: file.name.clone(),
                     expected_size: file.size_bytes,
                     expected_hash: file.published_hash.clone(),
+                    grant: request.download_grant.clone(),
                 },
                 progress,
                 cancel,
@@ -130,6 +149,7 @@ pub async fn run_request(
                 filename: file.name.clone(),
                 expected_size: file.size_bytes,
                 expected_hash: file.published_hash.clone(),
+                grant: request.download_grant.clone(),
             },
             progress,
             cancel,
