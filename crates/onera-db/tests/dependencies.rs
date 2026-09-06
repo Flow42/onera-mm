@@ -341,6 +341,7 @@ async fn provider_candidate_identity_and_unresolved_legacy_metadata_round_trip()
             game_slug: "test-game".into(),
             name: "Catalog Mod".into(),
             author: None,
+            thumbnail_url: None,
         })
         .await
         .unwrap();

@@ -13,8 +13,10 @@
 pub mod baseline;
 pub mod clean;
 pub mod flow;
+pub mod inbox;
 pub mod logging;
 pub mod paths;
+pub mod presence;
 pub mod profile;
 pub mod secrets;
 
@@ -24,8 +26,10 @@ pub use clean::{
     UnknownExtra,
 };
 pub use flow::{
-    DownloadRequest, DownloadedArchive, InstallRequest, InstalledModInfo, Onera, PreparedInstall,
-    PreparedState, ProfileDetails,
+    BrowserAction, DownloadRequest, DownloadedArchive, InstallRequest, InstalledModInfo,
+    ModArtwork, ModStateInfo, Onera, PreparedInstall, PreparedState, ProfileDetails,
 };
+pub use inbox::{run_request, RanRequest};
 pub use paths::Paths;
+pub use presence::{DesktopPresence, Presence};
 pub use secrets::{InMemorySecretStore, KeyringSecretStore};

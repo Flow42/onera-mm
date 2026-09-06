@@ -19,6 +19,7 @@
 
 pub mod commands;
 pub mod state;
+pub mod watcher;
 
 use state::AppState;
 use tauri::Manager as _;
@@ -35,8 +36,16 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             // probe — so it is awaited here rather than deferred: a window that
             // paints before the database is usable would only be able to show
             // errors.
-            let state = tauri::async_runtime::block_on(AppState::start(handle))?;
+            let state = tauri::async_runtime::block_on(AppState::start(handle.clone()))?;
             app.manage(state);
+
+            // Started after the state is managed, because both loops reach it
+            // through the handle: a watcher that ran first would find nothing.
+            watcher::spawn_heartbeat(
+                onera_app::Presence::discover(&onera_app::Paths::discover()?.state),
+                env!("CARGO_PKG_VERSION").to_owned(),
+            );
+            watcher::spawn_inbox_watcher(handle);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -50,6 +59,9 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             commands::add_manual_game,
             commands::local_games,
             commands::fetch_mod,
+            commands::open_mod_page,
+            commands::open_nexus_mod,
+            commands::mod_artwork,
             commands::installed_mods,
             commands::check_updates,
             commands::inbox_requests,

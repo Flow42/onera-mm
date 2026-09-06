@@ -109,12 +109,14 @@ impl ApiKeyAuth {
 /// The account payload the validate endpoint returns.
 #[derive(Debug, serde::Deserialize)]
 struct ValidateResponse {
-    #[serde(alias = "user_id")]
     user_id: Option<serde_json::Value>,
-    #[serde(alias = "name")]
     name: Option<String>,
-    #[serde(alias = "is_premium", alias = "is_premium?")]
+    // The endpoint returns *both* `is_premium` and the legacy `is_premium?`.
+    // Aliasing them onto one field makes serde reject the body as a duplicate
+    // field, so each key gets its own field and the pair is merged below.
     is_premium: Option<bool>,
+    #[serde(rename = "is_premium?")]
+    is_premium_legacy: Option<bool>,
     email: Option<String>,
 }
 
@@ -183,7 +185,7 @@ impl AuthProvider for ApiKeyAuth {
                 .map(|v| v.to_string().trim_matches('"').to_owned())
                 .unwrap_or_default(),
             username: parsed.name.unwrap_or_else(|| "Nexus user".to_owned()),
-            premium: parsed.is_premium,
+            premium: parsed.is_premium.or(parsed.is_premium_legacy),
             email: parsed.email,
         })
     }
@@ -237,6 +239,19 @@ mod tests {
     fn a_plausible_key_passes_the_shape_check() {
         let key = Secret::new("aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789--abc");
         assert!(ApiKeyAuth::precheck(&key).is_ok());
+    }
+
+    #[test]
+    fn the_live_validate_body_parses_with_both_premium_spellings() {
+        // Verbatim shape of the v1 endpoint: it sends the legacy `is_premium?`
+        // and `is_supporter?` keys alongside the current ones.
+        let body = r#"{"user_id":12345,"key":"abc","name":"TestUser",
+            "email":"user@example.com","profile_url":"https://example.invalid/a.png",
+            "is_premium?":false,"is_supporter?":true,
+            "is_premium":true,"is_supporter":true}"#;
+        let parsed: ValidateResponse = serde_json::from_str(body).expect("parses");
+        assert_eq!(parsed.is_premium.or(parsed.is_premium_legacy), Some(true));
+        assert_eq!(parsed.name.as_deref(), Some("TestUser"));
     }
 
     #[test]

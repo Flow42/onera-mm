@@ -141,6 +141,17 @@ fn the_documented_flows_have_the_commands_they_name() {
             "recovery",
             &["startup_status", "interrupted_operations", "roll_back"][..],
         ),
+        (
+            "browser handoff",
+            &[
+                "inbox_requests",
+                "complete_inbox_request",
+                "dismiss_inbox_request",
+                "installed_mods",
+                "mod_artwork",
+                "open_nexus_mod",
+            ][..],
+        ),
     ] {
         for command in commands {
             assert!(

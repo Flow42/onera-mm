@@ -41,7 +41,7 @@ use std::time::Duration;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The schema version this build understands.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// A pooled SQLite database.
 #[derive(Debug, Clone)]
@@ -404,10 +404,102 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(version, "7");
+        assert_eq!(version, "8");
         assert_eq!(member, ("profile".into(), "file-42".into()));
         assert_eq!(position.0, None, "legacy position must remain unresolved");
         assert_eq!(dependency_tables, 2);
+    }
+
+    /// A database from the dependencies release gains the browser-handoff
+    /// columns without any existing request becoming something the desktop runs
+    /// on its own. A user queued those under the old rules, where nothing
+    /// happened until they clicked.
+    #[tokio::test]
+    async fn a_version_seven_inbox_request_never_becomes_auto_runnable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("onera-v7.sqlite3");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        for sql in [
+            include_str!("../migrations/0001_initial.sql"),
+            include_str!("../migrations/0002_product_completion.sql"),
+            include_str!("../migrations/0003_desired_state.sql"),
+            include_str!("../migrations/0004_active_lineage.sql"),
+            include_str!("../migrations/0005_baselines.sql"),
+            include_str!("../migrations/0006_profiles.sql"),
+            include_str!("../migrations/0007_dependencies.sql"),
+        ] {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        }
+        sqlx::query(
+            "CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for migration in MIGRATOR.iter().filter(|migration| migration.version <= 7) {
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations
+                    (version, description, success, checksum, execution_time)
+                 VALUES (?1, ?2, 1, ?3, 0)",
+            )
+            .bind(migration.version)
+            .bind(migration.description.as_ref())
+            .bind(migration.checksum.as_ref())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::raw_sql(
+            "INSERT INTO providers VALUES
+                ('nexus', 'Nexus', 'https://example.invalid', '2026-01-01T00:00:00Z');
+             INSERT INTO games VALUES
+                ('game', 'nexus', 'test', 'Test', NULL, '2026-01-01T00:00:00Z');
+             INSERT INTO mods VALUES
+                ('mod', 'nexus', '42', 'test', 'Mod', NULL, '2026-01-01T00:00:00Z');
+             INSERT INTO inbox_requests VALUES
+                ('3f1d2c48-0b8a-4c1e-9a77-2c5b6d0e4a91', 'download', 'nexus', 'test',
+                 '42', 'file-42', 'queued', NULL,
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = Database::open(&path).await.unwrap();
+        let request = db
+            .inbox_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.provider_mod_id.as_str() == "42")
+            .expect("the queued request survives the migration");
+        assert!(!request.auto_run, "a migrated request must not run itself");
+        assert_eq!(request.page_url, None);
+        assert_eq!(request.local_game_id, None);
+        assert_eq!(request.started_at, None);
+        // And the mod it names keeps its identity, with room for artwork.
+        let (thumbnail,): (Option<String>,) =
+            sqlx::query_as("SELECT thumbnail_url FROM mods WHERE id = 'mod'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(thumbnail, None);
     }
 
     /// A user who installed the first Onera release must reach the baseline

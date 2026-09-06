@@ -133,6 +133,7 @@ impl World {
                 game_slug: "testgame".into(),
                 name: "Test Mod".into(),
                 author: None,
+                thumbnail_url: None,
             })
             .await
             .unwrap();
@@ -184,6 +185,7 @@ impl World {
                 game_slug: "testgame".into(),
                 name: format!("Other Mod {provider_mod_id}"),
                 author: None,
+                thumbnail_url: None,
             })
             .await
             .unwrap();

@@ -20,7 +20,7 @@
 //! directory containing the marker files the adapter validates.
 
 use onera_app::secrets::InMemorySecretStore;
-use onera_app::{InstallRequest, Onera, Paths};
+use onera_app::{BrowserAction, InstallRequest, Onera, Paths};
 use onera_core::domain::game::InstallSource;
 use onera_core::domain::profile::{DesiredModState, MemberPin, MemberPriority};
 use onera_core::ids::ProviderModId;
@@ -30,6 +30,7 @@ use onera_core::plan::{
 use onera_core::progress::{CancelToken, NullProgress, RecordingProgress};
 use onera_core::redact::Secret;
 use onera_core::{CoreError, RelPath};
+use onera_db::jobs::InboxRequestKind;
 use onera_discovery::DiscoveredGame;
 use onera_install::remove::ModifiedFilePolicy;
 use onera_install::verify::VerifyStatus;
@@ -134,6 +135,21 @@ impl Harness {
                     "id": FILE_ID, "name": "Test Mod 1.0", "version": "1.0.0",
                     "category": "main", "uploaded_at": "2025-01-01T00:00:00Z",
                     "is_primary": true
+                }] }
+            })))
+            .mount(&server)
+            .await;
+
+        // --- mod display details (the only source of artwork) ----------
+        //
+        // The address deliberately points at a host the provider does not own,
+        // which is how the test exercises the refusal without a network call.
+        Mock::given(method("POST"))
+            .and(path("/v3/mods/batch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "mods": [{
+                    "id": "1", "name": "Test Mod",
+                    "thumbnail_url": "https://cdn.example.test/thumb.jpg"
                 }] }
             })))
             .mount(&server)
@@ -1098,4 +1114,211 @@ async fn returning_to_clean_without_a_baseline_is_refused() {
         .await
         .unwrap_err();
     assert!(matches!(error, CoreError::NotFound { .. }), "{error:?}");
+}
+
+/// The path the browser extension actually drives: a request arrives naming a
+/// mod and a file, and the desktop runs it to completion without anyone
+/// clicking anything else.
+#[tokio::test]
+async fn a_queued_browser_request_installs_without_further_input() {
+    let h = Harness::new(&[
+        ("Test Mod v1.0/archive/pc/mod/testmod.archive", b"payload"),
+        ("Test Mod v1.0/r6/scripts/testmod.reds", b"script"),
+    ])
+    .await;
+    h.onera.set_api_key(Secret::new(API_KEY)).await.unwrap();
+    let game = h.onera.confirm_game(&h.discovered()).await.unwrap();
+
+    // The host resolved the file and recorded the page the user was on.
+    let request = h
+        .onera
+        .enqueue_browser_action(BrowserAction {
+            kind: InboxRequestKind::DownloadAndInstall,
+            game_slug: GAME_SLUG.into(),
+            provider_mod_id: ProviderModId::new(MOD_ID),
+            provider_file_id: Some(onera_core::ids::ProviderFileId::new(FILE_ID)),
+            page_url: Some(format!(
+                "https://www.nexusmods.com/{GAME_SLUG}/mods/{MOD_ID}"
+            )),
+            auto_run: true,
+        })
+        .await
+        .unwrap();
+    assert!(
+        request.auto_run,
+        "a request naming a file and one registered game runs itself"
+    );
+    assert_eq!(request.local_game_id, Some(game));
+    assert!(
+        request.page_url.is_some(),
+        "the page is kept so the mod can be reopened"
+    );
+    assert!(request.is_runnable(chrono::Utc::now()));
+
+    // What the desktop's watcher does, with nothing else in between.
+    let leased = h.onera.lease_inbox_request(&request).await.unwrap();
+    assert!(
+        !leased.is_runnable(request.created_at),
+        "a leased request is not started twice"
+    );
+    let outcome = onera_app::run_request(&h.onera, &leased, &NullProgress, &CancelToken::new())
+        .await
+        .unwrap();
+    let onera_app::RanRequest::Installed { name, files } = outcome else {
+        panic!("a plan over untouched paths needs no decision");
+    };
+    assert_eq!(name, "Test Mod");
+    assert_eq!(files, 2);
+    assert_eq!(
+        h.game_file("archive/pc/mod/testmod.archive").unwrap(),
+        b"payload"
+    );
+
+    h.onera.complete_inbox_request(leased.id).await.unwrap();
+    assert!(h.onera.inbox_requests().await.unwrap().is_empty());
+
+    // And the state the extension asks about now reflects it.
+    let state = h
+        .onera
+        .mod_state(GAME_SLUG, &ProviderModId::new(MOD_ID), &CancelToken::new())
+        .await
+        .unwrap();
+    assert!(state.is_installed());
+    assert!(state.downloaded);
+    assert!(state.game_registered);
+    assert_eq!(state.local_game_id, Some(game));
+    assert_eq!(state.installations[0].version, "1.0.0");
+    // One release exists, so nothing is newer than what was just installed.
+    assert!(!state.update_available);
+}
+
+/// A request that names no file is a question, not an instruction: the mod page
+/// offered several and only the user can say which they meant.
+#[tokio::test]
+async fn a_request_without_a_file_waits_for_the_user() {
+    let h = Harness::new(&[("Test Mod v1.0/r6/scripts/testmod.reds", b"script")]).await;
+    h.onera.set_api_key(Secret::new(API_KEY)).await.unwrap();
+    h.onera.confirm_game(&h.discovered()).await.unwrap();
+
+    let request = h
+        .onera
+        .enqueue_browser_action(BrowserAction {
+            kind: InboxRequestKind::DownloadAndInstall,
+            game_slug: GAME_SLUG.into(),
+            provider_mod_id: ProviderModId::new(MOD_ID),
+            provider_file_id: None,
+            page_url: None,
+            auto_run: true,
+        })
+        .await
+        .unwrap();
+    assert!(!request.auto_run);
+    assert!(!request.is_runnable(chrono::Utc::now()));
+    assert_eq!(request.state, onera_db::jobs::InboxState::WaitingForUser);
+}
+
+/// An install has to land somewhere. With no registered game the request is
+/// still kept — the user may register one in a moment — but the desktop does
+/// not choose a destination on their behalf.
+#[tokio::test]
+async fn an_install_request_with_no_registered_game_is_never_run_unattended() {
+    let h = Harness::new(&[("Test Mod v1.0/r6/scripts/testmod.reds", b"script")]).await;
+    h.onera.set_api_key(Secret::new(API_KEY)).await.unwrap();
+
+    let install = h
+        .onera
+        .enqueue_browser_action(BrowserAction {
+            kind: InboxRequestKind::DownloadAndInstall,
+            game_slug: GAME_SLUG.into(),
+            provider_mod_id: ProviderModId::new(MOD_ID),
+            provider_file_id: Some(onera_core::ids::ProviderFileId::new(FILE_ID)),
+            page_url: None,
+            auto_run: true,
+        })
+        .await
+        .unwrap();
+    assert!(!install.auto_run);
+    assert_eq!(install.local_game_id, None);
+
+    // A plain download needs no game at all, so it still runs.
+    let download = h
+        .onera
+        .enqueue_browser_action(BrowserAction {
+            kind: InboxRequestKind::Download,
+            game_slug: GAME_SLUG.into(),
+            provider_mod_id: ProviderModId::new(MOD_ID),
+            provider_file_id: Some(onera_core::ids::ProviderFileId::new(FILE_ID)),
+            page_url: None,
+            auto_run: true,
+        })
+        .await
+        .unwrap();
+    assert!(download.auto_run);
+    let outcome = onera_app::run_request(&h.onera, &download, &NullProgress, &CancelToken::new())
+        .await
+        .unwrap();
+    assert!(matches!(outcome, onera_app::RanRequest::Downloaded { .. }));
+}
+
+/// A mod page the user has never acted on costs nothing to answer: the state is
+/// read from the local catalogue, and no request is made of the provider.
+#[tokio::test]
+async fn an_unknown_mod_is_answered_without_asking_the_provider() {
+    let h = Harness::new(&[("Test Mod v1.0/r6/scripts/testmod.reds", b"script")]).await;
+    h.onera.set_api_key(Secret::new(API_KEY)).await.unwrap();
+    h.onera.confirm_game(&h.discovered()).await.unwrap();
+
+    let before = h.server.received_requests().await.unwrap().len();
+    let state = h
+        .onera
+        .mod_state(GAME_SLUG, &ProviderModId::new("999"), &CancelToken::new())
+        .await
+        .unwrap();
+    assert!(!state.is_installed());
+    assert!(!state.downloaded);
+    assert_eq!(state.name, None);
+    // The game is registered even though the mod is unknown, which is what the
+    // extension needs to know whether "install" is worth offering.
+    assert!(state.game_registered);
+    assert_eq!(
+        h.server.received_requests().await.unwrap().len(),
+        before,
+        "a mod Onera has never seen must not cost an API request"
+    );
+}
+
+/// Artwork is fetched from the provider's own hosts and nowhere else. The
+/// address arrives inside an API response, which is not the same as being safe
+/// to request.
+#[tokio::test]
+async fn artwork_on_a_host_the_provider_does_not_own_is_never_fetched() {
+    let h = Harness::new(&[("Test Mod v1.0/r6/scripts/testmod.reds", b"script")]).await;
+    h.onera.set_api_key(Secret::new(API_KEY)).await.unwrap();
+    let details = h
+        .onera
+        .fetch_mod(GAME_SLUG, &ProviderModId::new(MOD_ID), &CancelToken::new())
+        .await
+        .unwrap();
+
+    // The address is recorded — refusing to fetch it is a decision made later,
+    // not a reason to forget what the provider said.
+    let stored = h
+        .onera
+        .database()
+        .mod_by_id(details.mod_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.thumbnail_url.as_deref(),
+        Some("https://cdn.example.test/thumb.jpg")
+    );
+
+    // And the list still draws: no artwork, no error, no request.
+    assert!(h
+        .onera
+        .mod_artwork(details.mod_id, &CancelToken::new())
+        .await
+        .unwrap()
+        .is_none());
 }

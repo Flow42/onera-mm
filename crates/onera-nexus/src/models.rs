@@ -45,6 +45,37 @@ pub struct WireMod {
     /// Author, when the endpoint provides one.
     #[serde(default)]
     pub author: Option<String>,
+    /// Artwork address, when the endpoint provides one.
+    ///
+    /// The mod-details endpoint does not currently return it; the batch display
+    /// endpoint does. Accepting it here means a future details response that
+    /// starts including artwork needs no second request.
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
+}
+
+/// One row of the batch mod-display endpoint.
+///
+/// The batch endpoint is the only documented v3 source of mod artwork, so it is
+/// asked separately after the mod's own details.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WireModDetail {
+    /// Composite mod uid, echoing the request value.
+    pub id: String,
+    /// Display name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Artwork address. Null for a mod with no image, or one under moderation.
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
+}
+
+/// The batch mod-display response body.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WireModsBatchResponse {
+    /// One row per resolvable id. Unknown ids contribute no row.
+    #[serde(default)]
+    pub mods: Vec<WireModDetail>,
 }
 
 /// A mod file: the persistent slot on a mod page whose versions change.

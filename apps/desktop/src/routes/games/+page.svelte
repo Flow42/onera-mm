@@ -32,6 +32,16 @@
     await refresh();
   }
 
+  /** Click handler: a rejected confirm has to reach the user, not the console. */
+  async function confirmClicked(game: DiscoveredGame) {
+    error = null;
+    try {
+      await confirm(game);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+  }
+
   async function addManual() {
     error = null;
     try {
@@ -96,7 +106,7 @@
           {:else if game.validation.valid}
             <!-- Detection is a suggestion: nothing is managed until confirmed,
                  because a wrong match would aim writes at the wrong directory. -->
-            <button onclick={() => confirm(game)}>Confirm</button>
+            <button onclick={() => confirmClicked(game)}>Confirm</button>
           {:else}
             <span class="severity-danger" title={game.validation.findings.join('; ')}
               >not valid</span

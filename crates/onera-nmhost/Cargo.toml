@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 onera-app.workspace = true
 onera-core.workspace = true
+onera-db.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

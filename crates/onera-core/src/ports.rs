@@ -35,6 +35,15 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// An image fetched from a provider, ready to be cached or embedded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedImage {
+    /// Raw encoded bytes, exactly as served.
+    pub bytes: Vec<u8>,
+    /// MIME type reported by the provider, e.g. `image/jpeg`.
+    pub content_type: String,
+}
+
 /// A page of results from a provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page<T> {
@@ -186,6 +195,22 @@ pub trait ModProvider: Send + Sync {
         file_id: &ProviderFileId,
         cancel: &CancelToken,
     ) -> Result<DownloadTarget>;
+
+    /// Fetch a provider-hosted image, such as a mod thumbnail.
+    ///
+    /// The URL always comes from a provider response, never from a user or a
+    /// page: an implementation must still confirm it points at a host the
+    /// provider owns before requesting it. Returning `Ok(None)` means "this
+    /// provider serves no images", which is why the default does exactly that
+    /// — a provider without artwork needs no code and can never be mistaken
+    /// for one whose fetch failed.
+    ///
+    /// # Errors
+    /// Fails on transport errors and cancellation.
+    async fn fetch_image(&self, url: &str, cancel: &CancelToken) -> Result<Option<FetchedImage>> {
+        let _ = (url, cancel);
+        Ok(None)
+    }
 
     /// What this provider can say about dependencies, before anything is asked.
     ///

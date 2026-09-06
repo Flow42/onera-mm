@@ -5,7 +5,8 @@ use crate::{db_err, Database};
 use chrono::{DateTime, Utc};
 use onera_core::domain::download::{DownloadJob, JobState};
 use onera_core::ids::{
-    ArchiveId, DownloadJobId, InboxRequestId, ProviderFileId, ProviderId, ProviderModId,
+    ArchiveId, DownloadJobId, InboxRequestId, LocalGameId, ProviderFileId, ProviderId,
+    ProviderModId,
 };
 use onera_core::{CoreError, Result};
 use serde::{Deserialize, Serialize};
@@ -138,6 +139,22 @@ pub struct InboxRequest {
     pub state: InboxState,
     /// Redacted failure message.
     pub error: Option<String>,
+    /// The provider page the request was made from, as the browser saw it.
+    pub page_url: Option<String>,
+    /// The local game the request targets, when exactly one adapter claimed the
+    /// slug and that game is registered.
+    pub local_game_id: Option<LocalGameId>,
+    /// Whether the desktop may act on this request without asking first.
+    ///
+    /// Only ever true for a request the user made by clicking a button, and
+    /// never enough on its own to write into a game: an install still stops at
+    /// a plan that needs a decision.
+    pub auto_run: bool,
+    /// When the desktop last picked the request up, if it has.
+    ///
+    /// Acts as a lease. A request whose lease is older than the desktop's own
+    /// startup was left behind by a dead process and may be retried.
+    pub started_at: Option<DateTime<Utc>>,
     /// Creation time.
     pub created_at: DateTime<Utc>,
     /// Last update time.
@@ -163,9 +180,27 @@ impl InboxRequest {
             provider_file_id,
             state: InboxState::Queued,
             error: None,
+            page_url: None,
+            local_game_id: None,
+            auto_run: false,
+            started_at: None,
             created_at: at,
             updated_at: at,
         }
+    }
+
+    /// Whether the desktop's watcher should start this request now.
+    ///
+    /// `lease_floor` is the moment before which a lease is considered
+    /// abandoned — the desktop passes its own start time, so a request left
+    /// running by a process that died is picked up again while one being
+    /// worked on right now is left alone.
+    #[must_use]
+    pub fn is_runnable(&self, lease_floor: DateTime<Utc>) -> bool {
+        self.auto_run
+            && self.state == InboxState::Queued
+            && self.provider_file_id.is_some()
+            && self.started_at.is_none_or(|at| at < lease_floor)
     }
 }
 
@@ -276,10 +311,12 @@ impl Database {
         sqlx::query(
             "INSERT INTO inbox_requests
                (id, request_kind, provider_id, game_slug, provider_mod_id,
-                provider_file_id, state, error, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                provider_file_id, state, error, created_at, updated_at,
+                page_url, local_game_id, auto_run, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(id) DO UPDATE SET provider_file_id = ?6, state = ?7,
-               error = ?8, updated_at = ?10",
+               error = ?8, updated_at = ?10, page_url = ?11, local_game_id = ?12,
+               auto_run = ?13, started_at = ?14",
         )
         .bind(request.id.to_string())
         .bind(request.kind.as_str())
@@ -296,6 +333,10 @@ impl Database {
         .bind(&request.error)
         .bind(request.created_at.to_rfc3339())
         .bind(request.updated_at.to_rfc3339())
+        .bind(&request.page_url)
+        .bind(request.local_game_id.map(|id| id.to_string()))
+        .bind(i64::from(request.auto_run))
+        .bind(request.started_at.map(|at| at.to_rfc3339()))
         .execute(self.pool())
         .await
         .map_err(db_err)?;
@@ -309,7 +350,8 @@ impl Database {
     pub async fn inbox_requests(&self) -> Result<Vec<InboxRequest>> {
         let rows = sqlx::query(
             "SELECT id, request_kind, provider_id, game_slug, provider_mod_id,
-                    provider_file_id, state, error, created_at, updated_at
+                    provider_file_id, state, error, created_at, updated_at,
+                    page_url, local_game_id, auto_run, started_at
              FROM inbox_requests
              WHERE state IN ('queued', 'waiting_for_user', 'failed')
              ORDER BY created_at",
@@ -406,6 +448,18 @@ fn row_to_inbox(row: sqlx::sqlite::SqliteRow) -> Result<InboxRequest> {
             .map(ProviderFileId::new),
         state: InboxState::parse(&state)?,
         error: row.try_get("error").map_err(db_err)?,
+        page_url: row.try_get("page_url").map_err(db_err)?,
+        local_game_id: row
+            .try_get::<Option<String>, _>("local_game_id")
+            .map_err(db_err)?
+            .map(|value| uuid(&value).map(LocalGameId::from))
+            .transpose()?,
+        auto_run: row.try_get::<i64, _>("auto_run").map_err(db_err)? != 0,
+        started_at: row
+            .try_get::<Option<String>, _>("started_at")
+            .map_err(db_err)?
+            .map(|value| from_timestamp(&value))
+            .transpose()?,
         created_at: from_timestamp(&created)?,
         updated_at: from_timestamp(&updated)?,
     })

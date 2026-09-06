@@ -62,6 +62,13 @@ input {
   color: inherit;
   width: 100%;
 }
+/* The rule above is for text fields; a checkbox stretched to the full width of
+   its label is what makes a tick box drift away from the words it belongs to. */
+input[type='checkbox'] {
+  width: auto;
+  padding: 0;
+  margin: 0;
+}
 table {
   width: 100%;
   border-collapse: collapse;

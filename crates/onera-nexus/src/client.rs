@@ -14,7 +14,9 @@ use onera_core::domain::game::Game;
 use onera_core::domain::release::{FileCategory, Mod, ProviderFile, Release};
 use onera_core::hash::FileHash;
 use onera_core::ids::{GameId, ModId, ProviderFileId, ProviderId, ProviderModId, ReleaseId};
-use onera_core::ports::{AuthProvider, Credential, DownloadTarget, ModProvider, Page};
+use onera_core::ports::{
+    AuthProvider, Credential, DownloadTarget, FetchedImage, ModProvider, Page,
+};
 use onera_core::progress::CancelToken;
 use onera_core::redact::redact_url;
 use onera_core::{CoreError, Result};
@@ -30,6 +32,21 @@ pub const DEFAULT_V1_BASE: &str = "https://api.nexusmods.com/v1";
 
 /// Header the personal-API-key scheme uses, per the v3 specification.
 const API_KEY_HEADER: &str = "apikey";
+
+/// Batch endpoint that resolves composite mod uids to display details.
+///
+/// The only documented v3 source of mod artwork; the per-mod details endpoint
+/// returns identity and nothing to look at.
+const MODS_BATCH_PATH: &str = "/mods/batch";
+
+/// Largest image accepted from the provider's CDN.
+///
+/// A mod thumbnail is tens of kilobytes. The bound exists so a wrong or hostile
+/// URL cannot make a mod list allocate without limit.
+const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// The only host suffix artwork is fetched from.
+const IMAGE_HOST_SUFFIX: &str = "nexusmods.com";
 
 /// Largest response body Onera will read from Nexus.
 ///
@@ -312,6 +329,30 @@ impl NexusClient {
         ))
     }
 
+    /// Look one mod's artwork address up through the batch display endpoint.
+    ///
+    /// Best-effort by construction: a mod list must still draw when the
+    /// experimental endpoint is unavailable, so a failure is logged and becomes
+    /// "no artwork" rather than failing the metadata fetch that asked for it.
+    async fn thumbnail_url(&self, mod_uid: &str, cancel: &CancelToken) -> Option<String> {
+        let url = self.v3(MODS_BATCH_PATH);
+        let payload = serde_json::json!({ "mod_ids": [mod_uid] });
+        let response: std::result::Result<Envelope<WireModsBatchResponse>, _> =
+            self.post_json(&url, &payload, cancel).await;
+        match response {
+            Ok(envelope) => envelope
+                .data
+                .mods
+                .into_iter()
+                .find(|row| row.id == mod_uid)
+                .and_then(|row| row.thumbnail_url),
+            Err(error) => {
+                tracing::debug!(%error, "no artwork for this mod");
+                None
+            }
+        }
+    }
+
     fn v3(&self, path: &str) -> String {
         format!("{}{path}", self.config.v3_base.trim_end_matches('/'))
     }
@@ -337,7 +378,41 @@ impl NexusClient {
 /// oversized body is abandoned instead of being allocated and then rejected.
 /// The failure is [`CoreError::Unsupported`] and therefore not retried: asking
 /// the same endpoint again would produce the same oversized answer.
-async fn read_bounded(mut response: reqwest::Response, url: &str) -> Result<String> {
+async fn read_bounded(response: reqwest::Response, url: &str) -> Result<String> {
+    let buffer = read_bounded_bytes(response, url, MAX_RESPONSE_BYTES).await?;
+    String::from_utf8(buffer)
+        .map_err(|_| CoreError::Provider(format!("response from {} is not UTF-8", redact_url(url))))
+}
+
+/// Accept only an `https` URL on a host the provider owns.
+///
+/// Artwork addresses arrive inside API responses, but "it came from the API" is
+/// not the same as "it is safe to request": the check is what keeps a swapped
+/// or malformed address from turning a mod list into a request to a host of
+/// someone else's choosing.
+fn provider_image_url(raw: &str) -> Result<url::Url> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| CoreError::InvalidInput(format!("artwork address is not a URL: {e}")))?;
+    if parsed.scheme() != "https" {
+        return Err(CoreError::Unsupported(
+            "artwork is only fetched over https".to_owned(),
+        ));
+    }
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    if host != IMAGE_HOST_SUFFIX && !host.ends_with(&format!(".{IMAGE_HOST_SUFFIX}")) {
+        return Err(CoreError::Unsupported(format!(
+            "artwork host {host:?} does not belong to the provider"
+        )));
+    }
+    Ok(parsed)
+}
+
+/// Read a response body as bytes, refusing to buffer more than `limit`.
+async fn read_bounded_bytes(
+    mut response: reqwest::Response,
+    url: &str,
+    limit: usize,
+) -> Result<Vec<u8>> {
     let mut buffer: Vec<u8> = Vec::new();
     loop {
         let chunk = response
@@ -345,16 +420,15 @@ async fn read_bounded(mut response: reqwest::Response, url: &str) -> Result<Stri
             .await
             .map_err(|e| CoreError::Provider(format!("cannot read response body: {e}")))?;
         let Some(chunk) = chunk else { break };
-        if buffer.len() + chunk.len() > MAX_RESPONSE_BYTES {
+        if buffer.len() + chunk.len() > limit {
             return Err(CoreError::Unsupported(format!(
-                "response from {} exceeds the {MAX_RESPONSE_BYTES}-byte limit",
+                "response from {} exceeds the {limit}-byte limit",
                 redact_url(url)
             )));
         }
         buffer.extend_from_slice(&chunk);
     }
-    String::from_utf8(buffer)
-        .map_err(|_| CoreError::Provider(format!("response from {} is not UTF-8", redact_url(url))))
+    Ok(buffer)
 }
 
 /// Resolve when the token is cancelled.
@@ -410,6 +484,13 @@ impl ModProvider for NexusClient {
         let envelope: Envelope<WireMod> = self.get_json(&url, cancel).await?;
         let wire = envelope.data;
 
+        // The details endpoint carries identity, not artwork, so the address is
+        // asked for separately. It is never worth failing a mod fetch over.
+        let thumbnail_url = match wire.thumbnail_url {
+            Some(url) => Some(url),
+            None => self.thumbnail_url(&wire.id, cancel).await,
+        };
+
         let the_mod = Mod {
             id: ModId::new(),
             provider: ProviderId::nexus(),
@@ -417,6 +498,7 @@ impl ModProvider for NexusClient {
             game_slug: game_slug.to_owned(),
             name: wire.name.unwrap_or_else(|| format!("Mod {mod_id}")),
             author: wire.author,
+            thumbnail_url,
         };
 
         // Releases come from the mod's file versions: a release is one published
@@ -519,6 +601,47 @@ impl ModProvider for NexusClient {
             expected_size: None,
             filename: file_id.to_string(),
         })
+    }
+
+    /// Fetch a provider-hosted image.
+    ///
+    /// Two rules make this safe to call with an address that came out of a JSON
+    /// response: the host must belong to the provider, and no credential is
+    /// attached. An API key sent to a CDN would be a key disclosed to whoever
+    /// operates it, and a URL that has been tampered with must not become a
+    /// request to an arbitrary host.
+    async fn fetch_image(&self, url: &str, cancel: &CancelToken) -> Result<Option<FetchedImage>> {
+        let parsed = provider_image_url(url)?;
+        cancel.check()?;
+
+        let response = self.http.get(parsed.as_str()).send().await.map_err(|e| {
+            CoreError::Provider(format!(
+                "cannot fetch artwork: {}",
+                redact_url(&e.to_string())
+            ))
+        })?;
+        if !response.status().is_success() {
+            return Err(map_status(response.status().as_u16(), None, None));
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or(value).trim().to_owned())
+            .unwrap_or_default();
+        if !content_type.starts_with("image/") {
+            return Err(CoreError::Unsupported(format!(
+                "{} did not return an image",
+                redact_url(url)
+            )));
+        }
+
+        let bytes = read_bounded_bytes(response, url, MAX_IMAGE_BYTES).await?;
+        Ok(Some(FetchedImage {
+            bytes,
+            content_type,
+        }))
     }
 
     fn dependency_capability(&self) -> DependencyCapability {
@@ -646,6 +769,30 @@ mod tests {
         // Removed and archived files are downloadable in principle but must not
         // be presented as ordinary options.
         assert_eq!(map_category(WireCategory::Removed), FileCategory::Unknown);
+    }
+
+    #[test]
+    fn artwork_is_only_fetched_from_the_providers_own_hosts() {
+        for url in [
+            "https://staticdelivr.nexusmods.com/mods/3333/images/107/107.jpg",
+            "https://images.nexusmods.com/x.png",
+            "https://nexusmods.com/x.png",
+        ] {
+            assert!(provider_image_url(url).is_ok(), "{url} should be accepted");
+        }
+
+        for url in [
+            // A suffix match on the bare string would accept the first two.
+            "https://www.nexusmods.com.evil.test/x.png",
+            "https://evil-nexusmods.com/x.png",
+            "https://cdn.example.test/x.png",
+            // Plaintext leaks which mods a user is looking at.
+            "http://images.nexusmods.com/x.png",
+            "file:///etc/passwd",
+            "not a url",
+        ] {
+            assert!(provider_image_url(url).is_err(), "{url} should be refused");
+        }
     }
 
     #[test]

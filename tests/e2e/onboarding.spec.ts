@@ -132,16 +132,81 @@ test('installed mods are rendered from the native read model', async ({ page }) 
         installation_id: 'installation-1',
         mod_id: 'mod-1',
         name: 'Cyber Engine Tweaks',
+        author: 'yamashi',
         version: '1.2.3',
         installed_at: '2026-01-01T00:00:00Z',
+        published_at: '2025-12-01T00:00:00Z',
         update_available: false,
         latest_version: null,
+        latest_published_at: null,
+        game_slug: 'cyberpunk2077',
+        provider_mod_id: '107',
+        thumbnail_url: null,
       },
     ],
+    mod_artwork: null,
   });
   await page.goto('/mods');
   await expect(page.getByText('Cyber Engine Tweaks')).toBeVisible();
   await expect(page.getByText('1.2.3')).toBeVisible();
+  // The card carries both dates and a way back to the mod's own page.
+  const card = page.getByRole('listitem').filter({ hasText: 'Cyber Engine Tweaks' });
+  await expect(card.getByText(/^Installed \S/)).toBeVisible();
+  await expect(card.getByText(/^Latest version /)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Open on Nexus' })).toBeEnabled();
+});
+
+test('a request the desktop ran on its own is reported wherever the user is', async ({ page }) => {
+  await page.addInitScript(() => {
+    // A stub that keeps the event channel, so the shell can be driven the way
+    // the inbox watcher drives it.
+    const listeners: Record<string, ((payload: unknown) => void)[]> = {};
+    // @ts-expect-error - injected for the test to drive the event channel.
+    window.__ONERA_EMIT__ = (event: string, payload: unknown) =>
+      (listeners[event] ?? []).forEach((listener) => listener(payload));
+    // @ts-expect-error - injected for the app to pick up.
+    window.__ONERA_TEST_BRIDGE__ = {
+      invoke: async (command: string) => {
+        if (command === 'local_games' || command === 'installed_mods') return [];
+        throw { code: 'internal', message: `no stub for ${command}` };
+      },
+      listen: async (event: string, handler: (payload: unknown) => void) => {
+        (listeners[event] ??= []).push(handler);
+        return () => {};
+      },
+    };
+  });
+  await page.goto('/mods');
+
+  // The shell subscribes asynchronously, so the event is repeated until it
+  // lands rather than raced against the subscription.
+  await expect
+    .poll(async () => {
+      await page.evaluate(() => {
+        // @ts-expect-error - the test-only emitter injected above.
+        window.__ONERA_EMIT__('onera://inbox', {
+          request_id: 'request-1',
+          outcome: 'done',
+          message: 'Cyber Engine Tweaks installed (2 files)',
+        });
+      });
+      return page.getByText('Cyber Engine Tweaks installed (2 files)').count();
+    })
+    .toBeGreaterThan(0);
+
+  // A plan that stopped for a decision offers the way to it.
+  await page.evaluate(() => {
+    // @ts-expect-error - the test-only emitter injected above.
+    window.__ONERA_EMIT__('onera://inbox', {
+      request_id: 'request-2',
+      outcome: 'needs_decision',
+      message: 'Nova City is ready to install but needs a decision',
+    });
+  });
+  await expect(page.getByRole('link', { name: 'Review it' })).toBeVisible();
+
+  await page.getByRole('button', { name: 'Dismiss' }).click();
+  await expect(page.getByText(/needs a decision/)).toHaveCount(0);
 });
 
 test('persisted download jobs are visible after navigation', async ({ page }) => {

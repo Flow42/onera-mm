@@ -31,6 +31,7 @@ import type {
   DownloadOutcome,
   GameBaseline,
   DiscoveredGame,
+  InboxOutcome,
   InstallPlanView,
   InstalledMod,
   InboxRequest,
@@ -149,6 +150,18 @@ export async function onProgress(handler: (event: ProgressEvent) => void): Promi
   return active.listen<ProgressEvent>('onera://progress', handler);
 }
 
+/**
+ * Subscribe to browser requests the desktop ran on its own.
+ *
+ * The window does not have to be on any particular page for a request to run —
+ * the watcher works whether anyone is looking — so this exists to tell the user
+ * what happened while they were elsewhere.
+ */
+export async function onInbox(handler: (event: InboxOutcome) => void): Promise<() => void> {
+  const active = await resolve();
+  return active.listen<InboxOutcome>('onera://inbox', handler);
+}
+
 /** A progress event, mirroring `onera_core::progress::ProgressEvent`. */
 export type ProgressEvent =
   | { type: 'started'; stage: string; total: number | null }
@@ -179,6 +192,11 @@ export const commands = {
   /* mods */
   fetchMod: (gameDomain: string, modId: string) =>
     call<ModDetails>('fetch_mod', { gameDomain, modId }),
+  openModPage: (adapterId: string) => call<void>('open_mod_page', { adapterId }),
+  openNexusMod: (gameSlug: string, providerModId: string) =>
+    call<void>('open_nexus_mod', { gameSlug, providerModId }),
+  /** A mod's artwork as a data URI, or null when it has none. */
+  modArtwork: (modId: string) => call<string | null>('mod_artwork', { modId }),
   installedMods: (gameId: string) => call<InstalledMod[]>('installed_mods', { gameId }),
   checkUpdates: (gameId: string) => call<InstalledMod[]>('check_updates', { gameId }),
   inboxRequests: () => call<InboxRequest[]>('inbox_requests'),

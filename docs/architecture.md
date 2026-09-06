@@ -88,7 +88,8 @@ The only places that build absolute paths are the ones that own a root.
 
 **Adapters are thin.** A Tauri command parses arguments, calls one `onera-app`
 method and shapes the result. A CLI subcommand does the same. The browser
-extension sends two strings. If a driver needs a decision, the decision belongs
+extension sends identifiers taken from a URL, and asks `onera-app` what it
+already knows about a mod rather than working it out from the page. If a driver needs a decision, the decision belongs
 in `onera-app` or deeper — which is why the CLI and the desktop application
 cannot disagree about what an install does.
 
@@ -102,10 +103,10 @@ recovery understands.
 ## Data flow for an install
 
 ```text
-extension ─(game domain, mod id)─► NM host ─► durable inbox
-                                                │
-                                      desktop Add Mod view
-                                                │
+extension ─(game domain, mod id, file)─► NM host ─► durable inbox
+                                                      │
+                                   desktop inbox watcher, or Add Mod view
+                                                      │
                           ┌─────────────────────┼─────────────────────┐
                           ▼                     ▼                     ▼
                    onera-nexus           onera-download        onera-archive
@@ -128,6 +129,13 @@ extension ─(game domain, mod id)─► NM host ─► durable inbox
 
 Everything before "user approves" is read-only with respect to the game
 directory. That is not a convention; the planner has no write capability.
+
+The desktop's inbox watcher runs a queued request as far as that "user approves"
+line and no further. A plan with nothing to decide is approved by the click that
+queued it, so the watcher applies it; a plan that would overwrite a file Onera
+did not install, one edited since it did, or one another mod provides, stops and
+waits — the same answer the Add Mod view would have reached, because it is the
+same code path.
 
 Enable/disable sets use the same boundary at a larger scope: `onera-app` loads
 the current stacks and retained mappings, the pure desired-state reconciler

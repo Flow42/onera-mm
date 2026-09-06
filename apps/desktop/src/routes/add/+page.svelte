@@ -10,13 +10,22 @@
   let games = $state<LocalGame[]>([]);
   let inbox = $state<InboxRequest[]>([]);
   let gameId = $state('');
-  let gameDomain = $state('cyberpunk2077');
+  let gameDomain = $state('');
   let providerModId = $state('');
   let details = $state<ModDetails | null>(null);
   let selectedFile = $state('');
   let activeRequest = $state<InboxRequest | null>(null);
   let busy = $state(false);
   let error = $state<string | null>(null);
+
+  async function openModPage(adapterId: string) {
+    error = null;
+    try {
+      await commands.openModPage(adapterId);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+  }
 
   async function refreshInbox() {
     inbox = await commands.inboxRequests();
@@ -109,22 +118,29 @@
   {/each}
 {/if}
 
-<h2>Find a Nexus mod</h2>
-<form
-  class="panel"
-  onsubmit={(event) => {
-    event.preventDefault();
-    void fetchDetails();
-  }}
->
-  <label for="domain">Nexus game domain</label>
-  <input id="domain" bind:value={gameDomain} required />
-  <label for="mod-id">Mod ID</label>
-  <input id="mod-id" bind:value={providerModId} required />
-  <p>
-    <button class="primary" type="submit" disabled={busy}>{busy ? 'Loading…' : 'Find mod'}</button>
-  </p>
-</form>
+{#if inbox.length === 0 && details === null}
+  <div class="panel">
+    <p>
+      Mods are added from the browser. On a mod's Nexus page, use the Onera browser extension's
+      download button and the request appears here, already tied to the file you picked.
+    </p>
+    <p class="muted">
+      Onera does not browse the catalogue itself: the page you were looking at is the only place
+      that knows which file of a mod you meant.
+    </p>
+    {#each games as game (game.id)}
+      <p>
+        <button onclick={() => openModPage(game.adapter_id)}>
+          Get mods for {game.adapter_id}
+        </button>
+        <span class="muted">{game.install_root}</span>
+      </p>
+    {/each}
+    {#if games.length === 0}
+      <p class="severity-warning">Register a game first — a mod is always installed into one.</p>
+    {/if}
+  </div>
+{/if}
 
 {#if details !== null}
   <h2>{details.name}</h2>

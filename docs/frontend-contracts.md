@@ -491,6 +491,70 @@ override stops applying, and the requirement resurfaces. The frontend must send
 back the fingerprint it displayed rather than a fresh one, so accepting a risk
 cannot silently cover a requirement the user never saw.
 
+## Browser handoff commands
+
+The browser extension queues work and the desktop runs it, so these shapes are
+what the window shows about something it did while nobody was looking. The
+protocol side is `docs/native-messaging.md`.
+
+### `installed_mods` / `check_updates`
+
+`{ gameId }` → one row per installation. The rows carry everything a card needs
+so that drawing a list of mods costs no further command per row:
+
+```jsonc
+{
+  "installation_id": "…",
+  "mod_id": "…",
+  "name": "Cyber Engine Tweaks",
+  "author": "yamashi",
+  "version": "1.2.3", // verbatim, never parsed
+  "installed_at": "2026-03-04T10:00:00Z",
+  "published_at": "2026-02-01T00:00:00Z", // of the installed release
+  "update_available": false,
+  "latest_version": null, // named only when genuinely newer
+  "latest_published_at": null,
+  "game_slug": "cyberpunk2077",
+  "provider_mod_id": "107",
+  "thumbnail_url": null, // address only; see `mod_artwork`
+}
+```
+
+`installed_mods` never contacts the provider, so `update_available` is always
+`false` there and `latest_version` always `null`. Only `check_updates` refreshes
+them. A card must not read "no update" from the cheap command as "up to date" —
+it means "not checked".
+
+### `mod_artwork`
+
+`{ modId }` → a `data:` URI, or `null`. Null covers three cases that look the
+same to a view and should render identically: the mod has no picture, the
+provider could not be reached, and the address pointed at a host the provider
+does not own. Artwork is fetched and cached by the core, never by the frontend:
+the window makes no network requests, and the content security policy needs no
+image host added to it.
+
+### `open_nexus_mod`
+
+`{ gameSlug, providerModId }` → opens the mod's own page. The address is rebuilt
+from the identifiers rather than taken from a stored URL, and both are checked
+against `[A-Za-z0-9_-]{1,64}` on each side. `ModCard.canOpenPage` mirrors that
+check so a card never offers a link the backend would refuse.
+
+### The `onera://inbox` event
+
+Emitted when the watcher finishes a browser request, wherever the user happens
+to be:
+
+```jsonc
+{ "request_id": "…", "outcome": "done", "message": "Test Mod installed (2 files)" }
+```
+
+`outcome` is `done`, `failed`, or `needs_decision`. The last one means a plan is
+waiting in `/add`: it was prepared but stops short of writing, because something
+in it would overwrite a file Onera did not install, one that was edited since it
+did, or one another mod provides.
+
 ## CLI equivalents
 
 Same application methods, same shapes. `--json` prints the payloads above

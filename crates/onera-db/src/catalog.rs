@@ -34,6 +34,12 @@ pub struct InstalledModRecord {
     pub provider_mod_id: ProviderModId,
     /// Cached display name.
     pub name: String,
+    /// Cached author.
+    pub author: Option<String>,
+    /// Cached provider artwork address.
+    pub thumbnail_url: Option<String>,
+    /// The game this installation belongs to.
+    pub local_game_id: onera_core::ids::LocalGameId,
     /// Installed version, verbatim.
     pub version: String,
     /// Provider publication time used for same-mod ordering.
@@ -163,9 +169,9 @@ impl Database {
     /// Propagates database and stored-value conversion errors.
     pub async fn installed_mods(&self, game: LocalGameId) -> Result<Vec<InstalledModRecord>> {
         let rows = sqlx::query(
-            "SELECT i.id AS installation_id, i.mod_id, i.installed_at,
-                    m.provider_id, m.game_slug, m.provider_mod_id, m.name,
-                    r.version, r.published_at
+            "SELECT i.id AS installation_id, i.mod_id, i.installed_at, i.local_game_id,
+                    m.provider_id, m.game_slug, m.provider_mod_id, m.name, m.author,
+                    m.thumbnail_url, r.version, r.published_at
              FROM installations i
              JOIN mods m ON m.id = i.mod_id
              JOIN releases r ON r.id = i.release_id
@@ -177,30 +183,47 @@ impl Database {
         .await
         .map_err(db_err)?;
 
-        rows.into_iter()
-            .map(|row| {
-                let installation: String = row.try_get("installation_id").map_err(db_err)?;
-                let mod_id: String = row.try_get("mod_id").map_err(db_err)?;
-                let installed: String = row.try_get("installed_at").map_err(db_err)?;
-                let published: Option<String> = row.try_get("published_at").map_err(db_err)?;
-                Ok(InstalledModRecord {
-                    installation_id: onera_core::ids::InstallationId::from(uuid(&installation)?),
-                    mod_id: ModId::from(uuid(&mod_id)?),
-                    provider: ProviderId::new(
-                        row.try_get::<String, _>("provider_id").map_err(db_err)?,
-                    ),
-                    game_slug: row.try_get("game_slug").map_err(db_err)?,
-                    provider_mod_id: ProviderModId::new(
-                        row.try_get::<String, _>("provider_mod_id")
-                            .map_err(db_err)?,
-                    ),
-                    name: row.try_get("name").map_err(db_err)?,
-                    version: row.try_get("version").map_err(db_err)?,
-                    published_at: published.map(|value| from_timestamp(&value)).transpose()?,
-                    installed_at: from_timestamp(&installed)?,
-                })
-            })
-            .collect()
+        rows.into_iter().map(row_to_installed_mod).collect()
+    }
+
+    /// Every current installation of one provider mod, across all games.
+    ///
+    /// Named for the records it returns rather than for the installations it
+    /// finds, because [`onera_core::ports::DeploymentStore`] already has an
+    /// `installations_of_mod` that answers a different question — which
+    /// installations of a lineage are active in one game.
+    ///
+    /// The browser extension asks this question by provider identity, because a
+    /// mod page knows nothing about which local game a user registered it
+    /// under.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn installed_records_of_mod(
+        &self,
+        provider: &ProviderId,
+        game_slug: &str,
+        provider_mod_id: &ProviderModId,
+    ) -> Result<Vec<InstalledModRecord>> {
+        let rows = sqlx::query(
+            "SELECT i.id AS installation_id, i.mod_id, i.installed_at, i.local_game_id,
+                    m.provider_id, m.game_slug, m.provider_mod_id, m.name, m.author,
+                    m.thumbnail_url, r.version, r.published_at
+             FROM installations i
+             JOIN mods m ON m.id = i.mod_id
+             JOIN releases r ON r.id = i.release_id
+             WHERE i.state = 'installed'
+               AND m.provider_id = ?1 AND m.game_slug = ?2 AND m.provider_mod_id = ?3
+             ORDER BY i.installed_at DESC",
+        )
+        .bind(provider.as_str())
+        .bind(game_slug)
+        .bind(provider_mod_id.as_str())
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+
+        rows.into_iter().map(row_to_installed_mod).collect()
     }
 
     /// Register a provider, or update its display name and base URL.
@@ -464,20 +487,29 @@ impl Database {
         .map_err(db_err)?;
 
         if let Some((id,)) = existing {
-            sqlx::query("UPDATE mods SET name = ?2, author = ?3, updated_at = ?4 WHERE id = ?1")
-                .bind(&id)
-                .bind(&m.name)
-                .bind(&m.author)
-                .bind(now())
-                .execute(self.pool())
-                .await
-                .map_err(db_err)?;
+            // COALESCE keeps the artwork a previous refresh found: a response
+            // that omits the thumbnail means "not included", not "removed".
+            sqlx::query(
+                "UPDATE mods SET name = ?2, author = ?3, updated_at = ?4,
+                                thumbnail_url = COALESCE(?5, thumbnail_url)
+                 WHERE id = ?1",
+            )
+            .bind(&id)
+            .bind(&m.name)
+            .bind(&m.author)
+            .bind(now())
+            .bind(&m.thumbnail_url)
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?;
             return Ok(ModId::from(uuid(&id)?));
         }
 
         sqlx::query(
-            "INSERT INTO mods (id, provider_id, provider_mod_id, game_slug, name, author, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO mods
+               (id, provider_id, provider_mod_id, game_slug, name, author, updated_at,
+                thumbnail_url)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .bind(m.id.to_string())
         .bind(m.provider.as_str())
@@ -486,6 +518,7 @@ impl Database {
         .bind(&m.name)
         .bind(&m.author)
         .bind(now())
+        .bind(&m.thumbnail_url)
         .execute(self.pool())
         .await
         .map_err(db_err)?;
@@ -503,7 +536,7 @@ impl Database {
         provider_mod_id: &ProviderModId,
     ) -> Result<Option<Mod>> {
         let row = sqlx::query(
-            "SELECT id, name, author FROM mods
+            "SELECT id, name, author, thumbnail_url FROM mods
              WHERE provider_id = ?1 AND game_slug = ?2 AND provider_mod_id = ?3",
         )
         .bind(provider.as_str())
@@ -522,6 +555,7 @@ impl Database {
                 game_slug: game_slug.to_owned(),
                 name: row.try_get("name").map_err(db_err)?,
                 author: row.try_get("author").map_err(db_err)?,
+                thumbnail_url: row.try_get("thumbnail_url").map_err(db_err)?,
             })
         })
         .transpose()
@@ -533,7 +567,7 @@ impl Database {
     /// Propagates database errors.
     pub async fn mod_by_id(&self, id: ModId) -> Result<Option<Mod>> {
         let row = sqlx::query(
-            "SELECT provider_id, provider_mod_id, game_slug, name, author
+            "SELECT provider_id, provider_mod_id, game_slug, name, author, thumbnail_url
              FROM mods WHERE id = ?1",
         )
         .bind(id.to_string())
@@ -551,6 +585,7 @@ impl Database {
                 game_slug: row.try_get("game_slug").map_err(db_err)?,
                 name: row.try_get("name").map_err(db_err)?,
                 author: row.try_get("author").map_err(db_err)?,
+                thumbnail_url: row.try_get("thumbnail_url").map_err(db_err)?,
             })
         })
         .transpose()
@@ -850,6 +885,38 @@ impl Database {
         .transpose()
     }
 
+    /// Whether any file of one provider mod already has stored content.
+    ///
+    /// Answers "have I got this already?" without naming a file, which is the
+    /// only form the question takes on a mod page: the browser knows the mod,
+    /// not which of its files a user once chose.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn has_archive_for_mod(
+        &self,
+        provider: &ProviderId,
+        game_slug: &str,
+        provider_mod_id: &ProviderModId,
+    ) -> Result<bool> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1
+             FROM archive_provider_files apf
+             JOIN provider_files pf ON pf.id = apf.provider_file_id
+             JOIN releases r ON r.id = pf.release_id
+             JOIN mods m ON m.id = r.mod_id
+             WHERE m.provider_id = ?1 AND m.game_slug = ?2 AND m.provider_mod_id = ?3
+             LIMIT 1",
+        )
+        .bind(provider.as_str())
+        .bind(game_slug)
+        .bind(provider_mod_id.as_str())
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row.is_some())
+    }
+
     /// Record the manifest of an extracted archive.
     ///
     /// # Errors
@@ -880,4 +947,33 @@ impl Database {
         tx.commit().await.map_err(db_err)?;
         Ok(())
     }
+}
+
+/// Build one installed-mod row.
+///
+/// Shared by the per-game listing and the per-mod lookup so the two can never
+/// disagree about what an installation looks like.
+fn row_to_installed_mod(row: sqlx::sqlite::SqliteRow) -> Result<InstalledModRecord> {
+    let installation: String = row.try_get("installation_id").map_err(db_err)?;
+    let mod_id: String = row.try_get("mod_id").map_err(db_err)?;
+    let local_game: String = row.try_get("local_game_id").map_err(db_err)?;
+    let installed: String = row.try_get("installed_at").map_err(db_err)?;
+    let published: Option<String> = row.try_get("published_at").map_err(db_err)?;
+    Ok(InstalledModRecord {
+        installation_id: onera_core::ids::InstallationId::from(uuid(&installation)?),
+        mod_id: ModId::from(uuid(&mod_id)?),
+        provider: ProviderId::new(row.try_get::<String, _>("provider_id").map_err(db_err)?),
+        game_slug: row.try_get("game_slug").map_err(db_err)?,
+        provider_mod_id: ProviderModId::new(
+            row.try_get::<String, _>("provider_mod_id")
+                .map_err(db_err)?,
+        ),
+        name: row.try_get("name").map_err(db_err)?,
+        author: row.try_get("author").map_err(db_err)?,
+        thumbnail_url: row.try_get("thumbnail_url").map_err(db_err)?,
+        local_game_id: onera_core::ids::LocalGameId::from(uuid(&local_game)?),
+        version: row.try_get("version").map_err(db_err)?,
+        published_at: published.map(|value| from_timestamp(&value)).transpose()?,
+        installed_at: from_timestamp(&installed)?,
+    })
 }

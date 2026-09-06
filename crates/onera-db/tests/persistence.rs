@@ -64,6 +64,7 @@ async fn fixture() -> Fixture {
         game_slug: "cyberpunk2077".into(),
         name: "Cyber Engine Tweaks".into(),
         author: Some("yamashi".into()),
+        thumbnail_url: Some("https://staticdelivr.nexusmods.com/mods/107/thumb.jpg".into()),
     };
     let mod_id = db.upsert_mod(&m).await.unwrap();
 

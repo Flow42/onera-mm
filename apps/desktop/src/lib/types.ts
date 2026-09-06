@@ -90,10 +90,19 @@ export interface InstalledMod {
   installation_id: string;
   mod_id: string;
   name: string;
+  author: string | null;
+  /** Exactly as the author published it. Never parsed, never compared. */
   version: string;
   installed_at: string;
+  /** When the provider published the installed version, if it said. */
+  published_at: string | null;
   update_available: boolean;
   latest_version: string | null;
+  /** When the newest available version was published. */
+  latest_published_at: string | null;
+  game_slug: string;
+  provider_mod_id: string;
+  thumbnail_url: string | null;
 }
 
 export interface InboxRequest {
@@ -105,8 +114,21 @@ export interface InboxRequest {
   provider_file_id: string | null;
   state: 'queued' | 'waiting_for_user' | 'failed';
   error: string | null;
+  /** The provider page the request was made from, as the browser saw it. */
+  page_url: string | null;
+  local_game_id: string | null;
+  /** Whether the desktop runs this without being asked again. */
+  auto_run: boolean;
+  started_at: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** One inbox request finishing, as reported over `onera://inbox`. */
+export interface InboxOutcome {
+  request_id: string;
+  outcome: 'done' | 'needs_decision' | 'failed';
+  message: string;
 }
 
 export interface DownloadJob {

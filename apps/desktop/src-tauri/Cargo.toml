@@ -24,9 +24,11 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 onera-app = { path = "../../../crates/onera-app" }
 onera-archive = { path = "../../../crates/onera-archive" }
 onera-core = { path = "../../../crates/onera-core" }
+onera-db = { path = "../../../crates/onera-db" }
 onera-discovery = { path = "../../../crates/onera-discovery" }
 onera-games = { path = "../../../crates/onera-games" }
 onera-install = { path = "../../../crates/onera-install" }
@@ -40,8 +42,6 @@ tracing = "0.1"
 uuid = { version = "1" }
 
 [dev-dependencies]
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-onera-db = { path = "../../../crates/onera-db" }
 tauri = { version = "2", features = ["test"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

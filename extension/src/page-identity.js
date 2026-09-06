@@ -54,6 +54,22 @@ export function identifyModPage(rawUrl) {
 }
 
 /**
+ * The canonical address of a mod page.
+ *
+ * Rebuilt from the identity rather than passed through from the tab: the URL
+ * the user is on may carry a tab, a query string or a fragment, and the address
+ * Onera records should be the mod's page and nothing else. The native host
+ * validates the same shape, so anything this function cannot produce is
+ * something the host would refuse anyway.
+ *
+ * @param {{ gameDomain: string, modId: string }} identity - A parsed identity.
+ * @returns {string}
+ */
+export function canonicalModUrl(identity) {
+  return `https://www.nexusmods.com/${identity.gameDomain}/mods/${identity.modId}`;
+}
+
+/**
  * Whether a URL is a mod page this extension can act on.
  *
  * @param {string} rawUrl - The page URL.

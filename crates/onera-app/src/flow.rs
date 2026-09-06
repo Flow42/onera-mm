@@ -589,15 +589,7 @@ impl Onera {
             .installed_mods(game)
             .await?
             .into_iter()
-            .map(|record| InstalledModInfo {
-                installation_id: record.installation_id,
-                mod_id: record.mod_id,
-                name: record.name,
-                version: record.version,
-                installed_at: record.installed_at,
-                update_available: false,
-                latest_version: None,
-            })
+            .map(|record| InstalledModInfo::from_record(record, None))
             .collect())
     }
 
@@ -620,29 +612,8 @@ impl Onera {
             let details = self
                 .fetch_mod(&record.game_slug, &record.provider_mod_id, cancel)
                 .await?;
-            let latest = details
-                .releases
-                .iter()
-                .filter(|release| release.published_at.is_some())
-                .max_by_key(|release| release.published_at);
-            let update_available = match (record.published_at, latest.and_then(|r| r.published_at))
-            {
-                (Some(installed), Some(available)) => available > installed,
-                _ => false,
-            };
-            result.push(InstalledModInfo {
-                installation_id: record.installation_id,
-                mod_id: record.mod_id,
-                name: record.name,
-                version: record.version,
-                installed_at: record.installed_at,
-                update_available,
-                latest_version: if update_available {
-                    latest.map(|release| release.version.clone())
-                } else {
-                    None
-                },
-            });
+            let latest = newest_release(&details.releases);
+            result.push(InstalledModInfo::from_record(record, latest));
         }
         Ok(result)
     }
@@ -741,6 +712,165 @@ impl Onera {
         })
     }
 
+    /// What Onera already knows about the mod on a page the user is viewing.
+    ///
+    /// Called once per mod page by the browser extension, so it is built to be
+    /// cheap in the common case: a mod Onera has never seen is answered from
+    /// the local catalogue alone. The provider is asked only when the mod is
+    /// already downloaded or installed — exactly the case where "is there
+    /// something newer?" is a question worth a request.
+    ///
+    /// # Errors
+    /// Propagates database errors. A provider failure is *not* an error: the
+    /// local half of the answer is still worth returning, so an offline user
+    /// is told what they have rather than being told nothing.
+    pub async fn mod_state(
+        &self,
+        game_slug: &str,
+        provider_mod_id: &ProviderModId,
+        cancel: &CancelToken,
+    ) -> Result<ModStateInfo> {
+        let provider = ProviderId::nexus();
+        let local_game_id = self.local_game_for_slug(game_slug).await?;
+        let cached = self
+            .db
+            .find_mod(&provider, game_slug, provider_mod_id)
+            .await?;
+        let records = self
+            .db
+            .installed_records_of_mod(&provider, game_slug, provider_mod_id)
+            .await?;
+        let downloaded = self
+            .db
+            .has_archive_for_mod(&provider, game_slug, provider_mod_id)
+            .await?;
+
+        // Only a mod the user already has can have an update, so only that case
+        // spends a request. Failing to reach the provider downgrades the answer
+        // to the local facts instead of discarding them.
+        let latest = if records.is_empty() && !downloaded {
+            None
+        } else {
+            match self.fetch_mod(game_slug, provider_mod_id, cancel).await {
+                Ok(details) => newest_release(&details.releases).cloned(),
+                Err(error) => {
+                    tracing::debug!(%error, "could not refresh mod state from the provider");
+                    None
+                }
+            }
+        };
+
+        let installations: Vec<InstalledModInfo> = records
+            .into_iter()
+            .map(|record| InstalledModInfo::from_record(record, latest.as_ref()))
+            .collect();
+
+        Ok(ModStateInfo {
+            game_slug: game_slug.to_owned(),
+            provider_mod_id: provider_mod_id.clone(),
+            game_registered: local_game_id.is_some(),
+            local_game_id,
+            name: cached.map(|the_mod| the_mod.name),
+            downloaded,
+            update_available: installations.iter().any(|i| i.update_available),
+            latest_version: latest.as_ref().map(|release| release.version.clone()),
+            latest_published_at: latest.as_ref().and_then(|release| release.published_at),
+            installations,
+        })
+    }
+
+    /// The registered game a provider slug belongs to, when exactly one does.
+    ///
+    /// Ambiguity is answered with `None` rather than a guess: two registered
+    /// installations of the same game are a question for the user, and a
+    /// browser request that picked one silently could install into the wrong
+    /// copy.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn local_game_for_slug(&self, game_slug: &str) -> Result<Option<LocalGameId>> {
+        let Some(adapter) = onera_games::adapter_for_provider_slug(game_slug) else {
+            return Ok(None);
+        };
+        let mut matching = self
+            .db
+            .local_installs()
+            .await?
+            .into_iter()
+            .filter(|install| install.adapter_id == adapter.id() && install.confirmed);
+        match (matching.next(), matching.next()) {
+            (Some(only), None) => Ok(Some(only.id)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Provider artwork for one mod, as bytes ready to embed.
+    ///
+    /// The image is fetched once and cached under `$XDG_CACHE_HOME`, keyed by a
+    /// hash of its address, so a mod list redraws without touching the network
+    /// and no frontend ever makes a request of its own. `Ok(None)` means the
+    /// mod has no artwork, which is an ordinary state and not a failure.
+    ///
+    /// # Errors
+    /// Propagates database errors and cache-write failures. A provider failure
+    /// is reported as "no artwork": a list of mods must still draw when an
+    /// image server is unreachable.
+    pub async fn mod_artwork(
+        &self,
+        mod_id: ModId,
+        cancel: &CancelToken,
+    ) -> Result<Option<ModArtwork>> {
+        let Some(the_mod) = self.db.mod_by_id(mod_id).await? else {
+            return Err(CoreError::NotFound {
+                kind: "mod",
+                id: mod_id.to_string(),
+            });
+        };
+        let Some(url) = the_mod.thumbnail_url else {
+            return Ok(None);
+        };
+
+        let key = FileHash::blake3_of(url.as_bytes()).hex;
+        let cached = self.paths.thumbnails().join(&key);
+        if let Ok(bytes) = tokio::fs::read(&cached).await {
+            let content_type = tokio::fs::read_to_string(cached.with_extension("type"))
+                .await
+                .unwrap_or_else(|_| "image/jpeg".to_owned());
+            return Ok(Some(ModArtwork {
+                bytes,
+                content_type,
+            }));
+        }
+
+        let fetched = match self.provider.fetch_image(&url, cancel).await {
+            Ok(Some(image)) => image,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                tracing::debug!(%error, "could not fetch mod artwork");
+                return Ok(None);
+            }
+        };
+
+        let dir = self.paths.thumbnails();
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| CoreError::fs(&dir, e))?;
+        tokio::fs::write(&cached, &fetched.bytes)
+            .await
+            .map_err(|e| CoreError::fs(&cached, e))?;
+        // The type travels beside the bytes: a cached image whose format was
+        // forgotten would have to be sniffed to be displayed.
+        let type_path = cached.with_extension("type");
+        tokio::fs::write(&type_path, fetched.content_type.as_bytes())
+            .await
+            .map_err(|e| CoreError::fs(&type_path, e))?;
+
+        Ok(Some(ModArtwork {
+            bytes: fetched.bytes,
+            content_type: fetched.content_type,
+        }))
+    }
+
     // -----------------------------------------------------------------------
     // Browser inbox and downloads
     // -----------------------------------------------------------------------
@@ -761,6 +891,33 @@ impl Onera {
         Ok(request)
     }
 
+    /// Mark a request as being worked on right now.
+    ///
+    /// Taking the lease before any work starts is what stops two watchers, or
+    /// one watcher and a restart, from downloading the same file twice.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn lease_inbox_request(&self, request: &InboxRequest) -> Result<InboxRequest> {
+        let leased = InboxRequest {
+            started_at: Some(chrono::Utc::now()),
+            updated_at: chrono::Utc::now(),
+            ..request.clone()
+        };
+        self.db.put_inbox_request(&leased).await?;
+        Ok(leased)
+    }
+
+    /// Record that a request failed, keeping the redacted reason for the UI.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn fail_inbox_request(&self, id: InboxRequestId, error: &str) -> Result<()> {
+        self.db
+            .set_inbox_state(id, InboxState::Failed, Some(error))
+            .await
+    }
+
     /// Queue an Add Mod request from the browser.
     ///
     /// # Errors
@@ -770,8 +927,15 @@ impl Onera {
         game_slug: String,
         provider_mod_id: ProviderModId,
     ) -> Result<InboxRequest> {
-        self.enqueue_browser_request(InboxRequestKind::AddMod, game_slug, provider_mod_id, None)
-            .await
+        self.enqueue_browser_action(BrowserAction {
+            kind: InboxRequestKind::AddMod,
+            game_slug,
+            provider_mod_id,
+            provider_file_id: None,
+            page_url: None,
+            auto_run: false,
+        })
+        .await
     }
 
     /// Queue a browser download, optionally continuing into installation.
@@ -785,17 +949,56 @@ impl Onera {
         provider_file_id: ProviderFileId,
         install: bool,
     ) -> Result<InboxRequest> {
-        self.enqueue_browser_request(
-            if install {
+        self.enqueue_browser_action(BrowserAction {
+            kind: if install {
                 InboxRequestKind::DownloadAndInstall
             } else {
                 InboxRequestKind::Download
             },
             game_slug,
             provider_mod_id,
-            Some(provider_file_id),
-        )
+            provider_file_id: Some(provider_file_id),
+            page_url: None,
+            auto_run: false,
+        })
         .await
+    }
+
+    /// Queue a browser action with everything the desktop needs to run it.
+    ///
+    /// This is the path the extension's own buttons take. A request only
+    /// becomes auto-runnable when it names a file *and* resolves to exactly one
+    /// registered game: anything less would have the desktop choosing on the
+    /// user's behalf, which is the one thing the inbox exists to avoid.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn enqueue_browser_action(&self, action: BrowserAction) -> Result<InboxRequest> {
+        let local_game_id = self.local_game_for_slug(&action.game_slug).await?;
+        let kind = action.kind;
+        // A transfer with no file named is a question, not an instruction: the
+        // page offered several and only the user can say which they meant.
+        let needs_selection = kind != InboxRequestKind::AddMod && action.provider_file_id.is_none();
+        let mut request = InboxRequest {
+            page_url: action.page_url,
+            local_game_id,
+            // An install with nowhere to install to waits for the user; a plain
+            // download needs no game at all.
+            auto_run: action.auto_run
+                && !needs_selection
+                && (local_game_id.is_some() || kind != InboxRequestKind::DownloadAndInstall),
+            ..InboxRequest::queued(
+                kind,
+                action.game_slug,
+                action.provider_mod_id,
+                action.provider_file_id,
+            )
+        };
+        if needs_selection {
+            request.state = InboxState::WaitingForUser;
+        }
+        self.db.put_inbox_request(&request).await?;
+        Ok(request)
     }
 
     /// Queue a browser action that needs desktop file selection first.
@@ -808,19 +1011,19 @@ impl Onera {
         provider_mod_id: ProviderModId,
         install: bool,
     ) -> Result<InboxRequest> {
-        let mut request = InboxRequest::queued(
-            if install {
+        self.enqueue_browser_action(BrowserAction {
+            kind: if install {
                 InboxRequestKind::DownloadAndInstall
             } else {
                 InboxRequestKind::Download
             },
             game_slug,
             provider_mod_id,
-            None,
-        );
-        request.state = InboxState::WaitingForUser;
-        self.db.put_inbox_request(&request).await?;
-        Ok(request)
+            provider_file_id: None,
+            page_url: None,
+            auto_run: false,
+        })
+        .await
     }
 
     /// Actionable requests received from the browser extension.
@@ -1659,14 +1862,140 @@ pub struct InstalledModInfo {
     pub mod_id: ModId,
     /// Cached display name.
     pub name: String,
+    /// Cached author.
+    pub author: Option<String>,
     /// Installed version exactly as published.
     pub version: String,
     /// Installation timestamp.
     pub installed_at: chrono::DateTime<chrono::Utc>,
+    /// When the provider published the installed version, if it said.
+    pub published_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Whether a newer publication is available.
     pub update_available: bool,
     /// Newest available version, verbatim.
     pub latest_version: Option<String>,
+    /// When the newest available version was published.
+    pub latest_published_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Provider game slug, for building a page address.
+    pub game_slug: String,
+    /// Provider mod identifier, for building a page address.
+    pub provider_mod_id: ProviderModId,
+    /// Provider artwork address, when the provider offers one.
+    pub thumbnail_url: Option<String>,
+}
+
+impl InstalledModInfo {
+    /// Build a row from a stored installation and, when one was fetched, the
+    /// newest release the provider currently offers.
+    ///
+    /// Ordering is by publication date and never by parsing a version string:
+    /// two releases of the same mod are comparable only through the dates the
+    /// provider recorded for them.
+    #[must_use]
+    pub fn from_record(
+        record: onera_db::catalog::InstalledModRecord,
+        latest: Option<&Release>,
+    ) -> Self {
+        let latest_published_at = latest.and_then(|release| release.published_at);
+        let update_available = match (record.published_at, latest_published_at) {
+            (Some(installed), Some(available)) => available > installed,
+            _ => false,
+        };
+        Self {
+            installation_id: record.installation_id,
+            mod_id: record.mod_id,
+            name: record.name,
+            author: record.author,
+            version: record.version,
+            installed_at: record.installed_at,
+            published_at: record.published_at,
+            update_available,
+            latest_version: if update_available {
+                latest.map(|release| release.version.clone())
+            } else {
+                None
+            },
+            latest_published_at,
+            game_slug: record.game_slug,
+            provider_mod_id: record.provider_mod_id,
+            thumbnail_url: record.thumbnail_url,
+        }
+    }
+}
+
+/// The newest release a provider reported, ignoring any it could not date.
+///
+/// An undated release cannot be placed in a lineage, so it can neither be "the
+/// newest" nor evidence that something newer exists.
+#[must_use]
+fn newest_release(releases: &[Release]) -> Option<&Release> {
+    releases
+        .iter()
+        .filter(|release| release.published_at.is_some())
+        .max_by_key(|release| release.published_at)
+}
+
+/// One action the browser extension asked the desktop to perform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserAction {
+    /// What to do.
+    pub kind: InboxRequestKind,
+    /// Provider game slug from the page URL.
+    pub game_slug: String,
+    /// Provider mod identifier from the page URL.
+    pub provider_mod_id: ProviderModId,
+    /// The file the host resolved, when it could resolve one unambiguously.
+    pub provider_file_id: Option<ProviderFileId>,
+    /// The page the user was on, recorded so the mod can be reopened later.
+    pub page_url: Option<String>,
+    /// Whether the user asked for this to happen, rather than merely be noted.
+    pub auto_run: bool,
+}
+
+/// Provider artwork, cached locally and ready to hand to a view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModArtwork {
+    /// Encoded image bytes.
+    pub bytes: Vec<u8>,
+    /// MIME type of [`ModArtwork::bytes`].
+    pub content_type: String,
+}
+
+/// What Onera already knows about a mod the user is looking at.
+///
+/// The browser extension asks this before it draws its buttons, so the answer
+/// has to be complete enough to choose between "add", "already installed" and
+/// "update available" without a second round trip.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModStateInfo {
+    /// Provider game slug the question was asked about.
+    pub game_slug: String,
+    /// Provider mod identifier the question was asked about.
+    pub provider_mod_id: ProviderModId,
+    /// Whether an adapter claims this game *and* the user has registered it.
+    pub game_registered: bool,
+    /// The local game a request for this mod would target, when unambiguous.
+    pub local_game_id: Option<LocalGameId>,
+    /// Cached display name, if Onera has ever fetched this mod.
+    pub name: Option<String>,
+    /// Whether an archive for one of this mod's files is already stored.
+    pub downloaded: bool,
+    /// Every current installation of this mod, newest first.
+    pub installations: Vec<InstalledModInfo>,
+    /// Newest version the provider offers, when it was asked.
+    pub latest_version: Option<String>,
+    /// When that version was published.
+    pub latest_published_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether an installed copy is older than the newest publication.
+    pub update_available: bool,
+}
+
+impl ModStateInfo {
+    /// Whether at least one copy of this mod is installed.
+    #[must_use]
+    pub fn is_installed(&self) -> bool {
+        !self.installations.is_empty()
+    }
 }
 
 /// A downloaded, extracted, planned install that has not been applied.

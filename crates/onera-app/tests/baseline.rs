@@ -869,6 +869,7 @@ async fn activate_a_fake_mod(onera: &Onera, game: LocalGameId) {
             game_slug: "cyberpunk2077".into(),
             name: "A Mod".into(),
             author: None,
+            thumbnail_url: None,
         })
         .await
         .unwrap();

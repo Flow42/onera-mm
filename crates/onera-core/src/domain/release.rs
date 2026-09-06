@@ -32,6 +32,12 @@ pub struct Mod {
     pub name: String,
     /// Author as reported by the provider.
     pub author: Option<String>,
+    /// Provider-hosted thumbnail, when the provider offers one.
+    ///
+    /// Only the address is stored. The image itself is fetched by the
+    /// application layer and cached outside the database, so a mod list can be
+    /// drawn without the frontend making a request of its own.
+    pub thumbnail_url: Option<String>,
 }
 
 /// One published version of a [`Mod`].

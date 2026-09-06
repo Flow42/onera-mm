@@ -18,14 +18,16 @@
 
 mod protocol;
 
-use onera_app::{Onera, Paths};
+use onera_app::{BrowserAction, Onera, Paths, Presence};
 use onera_core::ids::ProviderModId;
 use onera_core::progress::CancelToken;
+use onera_db::jobs::InboxRequestKind;
 use protocol::{
     code_for, error_response, ok_response, read_message, validate, write_message, Command,
     ErrorCode, FramingError, Request, Response,
 };
 use std::io::{stdin, stdout};
+use std::time::SystemTime;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
@@ -72,6 +74,20 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
+/// The desktop heartbeat for this user.
+fn presence(onera: &Onera) -> Presence {
+    Presence::discover(&onera.paths.state)
+}
+
+/// Which inbox kind a transfer request becomes.
+const fn kind_for(install: bool) -> InboxRequestKind {
+    if install {
+        InboxRequestKind::DownloadAndInstall
+    } else {
+        InboxRequestKind::Download
+    }
+}
+
 /// Dispatch one validated request.
 async fn handle(onera: &Onera, request: Request) -> Response {
     if let Err(response) = validate(&request) {
@@ -94,6 +110,9 @@ async fn handle(onera: &Onera, request: Request) -> Response {
                     &id,
                     serde_json::json!({
                         "authenticated": authenticated,
+                        // Answering this here saves the popup a second round
+                        // trip before it can decide what to offer.
+                        "desktop_running": presence(onera).is_running().await,
                         "games": games
                             .iter()
                             .map(|g| serde_json::json!({
@@ -101,6 +120,72 @@ async fn handle(onera: &Onera, request: Request) -> Response {
                                 "adapter": g.adapter_id,
                             }))
                             .collect::<Vec<_>>(),
+                    }),
+                )
+            }
+            Err(e) => error_response(&id, code_for(&e), e.to_string()),
+        },
+
+        Command::AppState => {
+            let presence = presence(onera);
+            let record = presence.read().await;
+            let running = record
+                .as_ref()
+                .is_some_and(|record| onera_app::presence::is_live(record, SystemTime::now()));
+            ok_response(
+                &id,
+                serde_json::json!({
+                    "running": running,
+                    "version": record.map(|record| record.version),
+                    // Whether offering to start it is worth the user's time.
+                    "launchable": onera_app::presence::desktop_binary().is_some(),
+                }),
+            )
+        }
+
+        Command::LaunchApp => {
+            let presence = presence(onera);
+            if presence.is_running().await {
+                return ok_response(
+                    &id,
+                    serde_json::json!({ "running": true, "launched": false }),
+                );
+            }
+            match onera_app::presence::launch_desktop() {
+                // The window takes a moment to appear and longer to write its
+                // first heartbeat, so this reports what was started, not what is
+                // running. The extension polls `app_state` for the latter.
+                Ok(_) => ok_response(
+                    &id,
+                    serde_json::json!({ "running": false, "launched": true }),
+                ),
+                Err(e) => error_response(&id, code_for(&e), e.to_string()),
+            }
+        }
+
+        Command::ModState {
+            game_domain,
+            mod_id,
+        } => match onera
+            .mod_state(&game_domain, &mod_id.as_str().into(), &cancel)
+            .await
+        {
+            Ok(state) => {
+                let installed = state.installations.first();
+                ok_response(
+                    &id,
+                    serde_json::json!({
+                        "name": state.name,
+                        "game_registered": state.game_registered,
+                        "downloaded": state.downloaded,
+                        "installed": state.is_installed(),
+                        "installed_version": installed.map(|i| i.version.clone()),
+                        "installed_at": installed.map(|i| i.installed_at.to_rfc3339()),
+                        "update_available": state.update_available,
+                        "latest_version": state.latest_version,
+                        "latest_published_at": state
+                            .latest_published_at
+                            .map(|at| at.to_rfc3339()),
                     }),
                 )
             }
@@ -140,11 +225,13 @@ async fn handle(onera: &Onera, request: Request) -> Response {
             game_domain,
             mod_id,
             file_id,
+            page_url,
         }
         | Command::DownloadAndInstall {
             game_domain,
             mod_id,
             file_id,
+            page_url,
         } => {
             let details = match onera
                 .fetch_mod(&game_domain, &mod_id.as_str().into(), &cancel)
@@ -179,11 +266,14 @@ async fn handle(onera: &Onera, request: Request) -> Response {
                     );
                 }
                 return match onera
-                    .enqueue_download_selection_request(
-                        game_domain,
-                        ProviderModId::new(mod_id),
-                        should_install,
-                    )
+                    .enqueue_browser_action(BrowserAction {
+                        kind: kind_for(should_install),
+                        game_slug: game_domain,
+                        provider_mod_id: ProviderModId::new(mod_id),
+                        provider_file_id: None,
+                        page_url,
+                        auto_run: true,
+                    })
                     .await
                 {
                     Ok(request) => ok_response(
@@ -195,6 +285,7 @@ async fn handle(onera: &Onera, request: Request) -> Response {
                             "name": details.name,
                             "selection_required": true,
                             "install": should_install,
+                            "auto_run": request.auto_run,
                         }),
                     ),
                     Err(e) => error_response(&id, code_for(&e), e.to_string()),
@@ -204,12 +295,16 @@ async fn handle(onera: &Onera, request: Request) -> Response {
             // The durable inbox is the handoff: the popup may close and this
             // short-lived host process may exit without losing the request.
             match onera
-                .enqueue_download_request(
-                    game_domain,
-                    ProviderModId::new(mod_id),
-                    file.provider_file_id.clone(),
-                    should_install,
-                )
+                .enqueue_browser_action(BrowserAction {
+                    kind: kind_for(should_install),
+                    game_slug: game_domain,
+                    provider_mod_id: ProviderModId::new(mod_id),
+                    provider_file_id: Some(file.provider_file_id.clone()),
+                    page_url,
+                    // The user pressed a button on the mod's own page: the
+                    // desktop is meant to act on this, not file it.
+                    auto_run: true,
+                })
                 .await
             {
                 Ok(request) => ok_response(
@@ -222,6 +317,9 @@ async fn handle(onera: &Onera, request: Request) -> Response {
                         "file_id": file.provider_file_id.as_str(),
                         "file_name": file.name,
                         "install": should_install,
+                        // False means the desktop will ask something first —
+                        // usually which registered game to install into.
+                        "auto_run": request.auto_run,
                     }),
                 ),
                 Err(e) => error_response(&id, code_for(&e), e.to_string()),

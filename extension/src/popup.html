@@ -27,6 +27,32 @@
       .error {
         color: #ffb4a8;
       }
+      .app {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-bottom: 8px;
+        color: #a1a1aa;
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #a1a1aa;
+        flex: none;
+      }
+      .dot.running {
+        background: #9ece6a;
+      }
+      .dot.stopped {
+        background: #e0af68;
+      }
+      button.primary {
+        border-color: transparent;
+        background: #7aa2f7;
+        color: #10101a;
+        font-weight: 600;
+      }
       button {
         width: 100%;
         padding: 8px;
@@ -45,12 +71,12 @@
   </head>
   <body>
     <h1>Onera</h1>
-    <div class="status" id="status">Checking…</div>
-    <div id="actions" hidden>
-      <button data-action="add_mod">Add to Onera</button>
-      <button data-action="download">Download</button>
-      <button data-action="download_and_install">Download and install</button>
+    <div class="app">
+      <span class="dot" id="app-dot"></span><span id="app-state">Checking…</span>
     </div>
+    <div class="status" id="status">Checking…</div>
+    <button id="launch" hidden>Open Onera</button>
+    <div id="actions" hidden></div>
     <script type="module" src="popup.js"></script>
   </body>
 </html>

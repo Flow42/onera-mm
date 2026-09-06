@@ -30,6 +30,7 @@ core: the client only ever asks for a `Credential`.
 | Declared dependencies       | `GET /mod-file-versions/{id}/dependencies`                       | Experimental           |
 | Resolved candidates (batch) | `POST /mod-file-versions/dependencies/ranges/materialized/batch` | Experimental           |
 | Candidate identities        | `POST /mod-file-versions/batch`                                  | Experimental           |
+| Mod display details         | `POST /mods/batch`                                               | Experimental           |
 
 Several of these are marked **Experimental** by Nexus, meaning they may change
 significantly or be removed. Onera's wire types are correspondingly defensive:
@@ -229,6 +230,40 @@ Consequences, all implemented:
 
 An empty download-location list is reported with a message about free accounts
 needing to start the download from the website, because that is the usual cause.
+
+## Artwork
+
+v3 exposes mod images in exactly one place Onera can use: `POST /mods/batch`,
+which resolves composite mod uids to `{ name, summary, status, thumbnail_url,
+adult_content }`. The per-mod details endpoint carries identity and nothing to
+look at, so a mod's artwork costs one extra request when its metadata is
+refreshed.
+
+**Assumption:** the id accepted by `/mods/batch` is the same `id` the mod
+details endpoint returns. The spec describes both as the mod's unique
+identifier, distinct from the game-scoped id in the page URL.
+**If it is wrong:** the row simply does not come back, `thumbnail_url` stays
+null, and mods draw with their initials instead. `NexusClient::thumbnail_url`
+already treats every failure that way, so nothing else has to change.
+
+Two things v3 offers that Onera deliberately does not use:
+
+- `GET /games/{game_domain}/trending-mods` (`picture_url`) — a marketing feed,
+  not a lookup. It cannot answer "what does _this_ mod look like".
+- `GET /games/{game_domain}/dlcs` (`thumbnail_url`) — DLC artwork, unrelated to
+  a mod list.
+
+**There is no game icon or tile in v3.** The catalogue endpoint Onera uses for
+games is the v1 one, which returns a domain and a name. A games list therefore
+shows no artwork rather than guessing at a CDN path the specification does not
+document.
+
+Images are fetched by the core, never by the window or the extension, and only
+from `nexusmods.com` and its subdomains over https — an address inside an API
+response is not the same as an address that is safe to request. No credential is
+attached: an API key sent to a CDN is a key disclosed to whoever runs it. The
+bytes are cached under `$XDG_CACHE_HOME/onera/thumbnails`, keyed by a hash of
+the address, and reach the frontend as a `data:` URI.
 
 ## What Onera will not do
 

@@ -72,6 +72,7 @@ async fn fixture() -> Fixture {
             game_slug: "test".into(),
             name: "Example".into(),
             author: None,
+            thumbnail_url: None,
         })
         .await
         .unwrap();

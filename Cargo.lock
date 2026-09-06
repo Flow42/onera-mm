@@ -1656,6 +1656,7 @@ dependencies = [
  "anyhow",
  "onera-app",
  "onera-core",
+ "onera-db",
  "serde",
  "serde_json",
  "tempfile",

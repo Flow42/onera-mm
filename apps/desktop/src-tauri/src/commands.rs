@@ -15,6 +15,7 @@ use onera_install::remove::ModifiedFilePolicy;
 use serde_json::json;
 use std::str::FromStr;
 use tauri::State;
+use tauri_plugin_opener::OpenerExt as _;
 
 fn parse_game(id: &str) -> CommandResult<LocalGameId> {
     LocalGameId::from_str(id).map_err(|_| CommandError {
@@ -104,28 +105,10 @@ pub async fn account(state: State<'_, AppState>) -> CommandResult<serde_json::Va
 pub async fn discover_games(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let cancel = onera_core::progress::CancelToken::new();
     let found = state.onera.discover_games(&cancel).await?;
-    Ok(serde_json::to_value(
-        found
-            .iter()
-            .map(|g| {
-                json!({
-                    "adapter_id": g.adapter_id,
-                    "provider_slug": g.provider_slug,
-                    "name": g.name,
-                    "install_root": g.install_root,
-                    "compat_prefix": g.compat_prefix,
-                    "user_data_roots": g.user_data_roots,
-                    "source": format!("{:?}", g.source).to_lowercase(),
-                    "validation": {
-                        "valid": g.validation.valid,
-                        "reported_version": g.validation.reported_version,
-                        "findings": g.validation.findings,
-                    },
-                })
-            })
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or(serde_json::Value::Null))
+    // Serialize the domain type itself rather than rebuilding the shape by
+    // hand: the frontend hands the same value straight back to `confirm_game`,
+    // so the two sides have to agree field for field, `source` included.
+    Ok(serde_json::to_value(&found).unwrap_or(serde_json::Value::Null))
 }
 
 #[tauri::command]
@@ -160,6 +143,34 @@ pub async fn local_games(state: State<'_, AppState>) -> CommandResult<serde_json
             "confirmed": g.confirmed,
         }))
         .collect::<Vec<_>>()))
+}
+
+/// Open the provider's mod listing for a game in the user's browser.
+///
+/// Mods are added from the browser extension, so the desktop's only part in
+/// finding one is sending the user to the right page.
+#[tauri::command]
+pub fn open_mod_page(app: tauri::AppHandle, adapter_id: String) -> CommandResult<()> {
+    let adapter = onera_games::adapter_by_id(&adapter_id).ok_or_else(|| CommandError {
+        code: "internal".into(),
+        message: format!("no adapter named {adapter_id:?}"),
+    })?;
+    let slug = adapter
+        .provider_slugs()
+        .first()
+        .ok_or_else(|| CommandError {
+            code: "internal".into(),
+            message: "that game has no page on the provider".into(),
+        })?;
+    app.opener()
+        .open_url(
+            format!("https://www.nexusmods.com/{slug}/mods"),
+            None::<&str>,
+        )
+        .map_err(|e| CommandError {
+            code: "internal".into(),
+            message: format!("the browser could not be opened: {e}"),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +227,93 @@ pub async fn check_updates(
             .await?,
     )
     .unwrap_or(serde_json::Value::Null))
+}
+
+/// Open one mod's own page on the provider.
+///
+/// The address is rebuilt from the identifiers Onera stored rather than from a
+/// URL handed in by a caller: a stored string that reaches the system's URL
+/// handler is a string worth not trusting, and the provider's page shape is
+/// already known here.
+#[tauri::command]
+pub fn open_nexus_mod(
+    app: tauri::AppHandle,
+    game_slug: String,
+    provider_mod_id: String,
+) -> CommandResult<()> {
+    let safe = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 64
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    if !safe(&game_slug) || !safe(&provider_mod_id) {
+        return Err(CommandError {
+            code: "internal".into(),
+            message: "that mod has no page address Onera can open".into(),
+        });
+    }
+    app.opener()
+        .open_url(
+            format!("https://www.nexusmods.com/{game_slug}/mods/{provider_mod_id}"),
+            None::<&str>,
+        )
+        .map_err(|e| CommandError {
+            code: "internal".into(),
+            message: format!("the browser could not be opened: {e}"),
+        })
+}
+
+/// One mod's artwork, as a data URI the view can put straight into an `img`.
+///
+/// A data URI rather than a URL because the window makes no requests of its
+/// own: the image is fetched and cached by the core, and the frontend's content
+/// security policy needs no host added to it. `null` means the mod has no
+/// artwork, or that it could not be fetched — either way the list draws.
+#[tauri::command]
+pub async fn mod_artwork(
+    state: State<'_, AppState>,
+    mod_id: String,
+) -> CommandResult<Option<String>> {
+    let id = onera_core::ids::ModId::from_str(&mod_id).map_err(|_| CommandError {
+        code: "internal".into(),
+        message: "that is not a valid mod id".into(),
+    })?;
+    let cancel = onera_core::progress::CancelToken::new();
+    let Some(artwork) = state.onera.mod_artwork(id, &cancel).await? else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "data:{};base64,{}",
+        artwork.content_type,
+        base64(&artwork.bytes)
+    )))
+}
+
+/// Encode bytes as standard base64.
+///
+/// Written out rather than pulled in: one call site, no padding subtleties, and
+/// a dependency fewer in the crate that renders the window.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 #[tauri::command]
@@ -1210,6 +1308,29 @@ pub async fn diagnostics(state: State<'_, AppState>) -> CommandResult<serde_json
 mod tests {
     use super::*;
     use onera_core::CoreError;
+
+    #[test]
+    fn base64_matches_the_standard_encoding_including_padding() {
+        // The three residues are the whole of the encoding's difficulty.
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_covers_the_whole_byte_range() {
+        // A PNG is not text: an encoder that only worked on ASCII would pass
+        // every test above and still produce an unreadable image.
+        let bytes: Vec<u8> = (0..=255_u8).collect();
+        let encoded = base64(&bytes);
+        assert_eq!(encoded.len(), 344);
+        assert!(encoded.starts_with("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g"));
+        assert!(encoded.ends_with("+/w=="));
+    }
 
     #[test]
     fn identifier_arguments_are_parsed_not_trusted() {

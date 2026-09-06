@@ -234,16 +234,19 @@
         </table>
       {/if}
       {#if needsConfirmation}
-        <p>
-          <label>
+        <div class="confirm">
+          <label class="confirm-row">
             <input type="checkbox" bind:checked={storeVerified} />
-            I ran the store's own “verify installed files” and it finished.
+            <span>
+              <strong>Required before capturing:</strong>
+              I ran the store's own “verify installed files” and it finished.
+            </span>
           </label>
-        </p>
-        <p class="muted">
-          Onera cannot check this for you. The capture is a local observation stamped with the build
-          it saw — not a claim that the store attested every byte.
-        </p>
+          <p class="muted confirm-note">
+            Onera cannot check this for you. The capture is a local observation stamped with the
+            build it saw — not a claim that the store attested every byte.
+          </p>
+        </div>
       {:else}
         <p class="muted">
           This installation was not added from a store, so its baseline is a clearly labelled local
@@ -254,6 +257,11 @@
         <button class="primary" onclick={capture} disabled={busy !== null || !captureReady}>
           {status.baseline === null ? 'Capture' : 'Replace stale baseline'}
         </button>
+        {#if needsConfirmation && !storeVerified}
+          <span class="muted" data-testid="capture-blocked">
+            Tick the confirmation above to enable this.
+          </span>
+        {/if}
       </p>
     {/if}
   </section>
@@ -371,6 +379,25 @@
   }
   dd {
     margin: 0;
+  }
+  .confirm {
+    /* The tick box, its sentence and the note that explains it are one block,
+       so the note lines up with the words rather than with the box. */
+    display: grid;
+    gap: 0.35rem;
+    margin: 0.75rem 0;
+  }
+  .confirm-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+  .confirm-row input {
+    /* Nudged onto the first line's baseline rather than its box top. */
+    margin-top: 0.2rem;
+  }
+  .confirm-note {
+    margin: 0 0 0 1.5rem;
   }
   h3 {
     font-size: 0.9rem;

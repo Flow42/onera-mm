@@ -30,6 +30,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// allocate gigabytes.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
+/// Longest page address the host will record.
+pub const MAX_PAGE_URL_BYTES: usize = 512;
+
 /// A request from the extension.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
@@ -54,6 +57,17 @@ pub enum Command {
     Ping,
     /// Report the host's status to the extension's popup.
     Status,
+    /// Report whether the desktop application is running.
+    AppState,
+    /// Start the desktop application if it is not already running.
+    LaunchApp,
+    /// Report what Onera already knows about one mod.
+    ModState {
+        /// Provider game slug from the page URL.
+        game_domain: String,
+        /// Mod id from the page URL.
+        mod_id: String,
+    },
     /// Record a mod for later without downloading.
     AddMod {
         /// Provider game slug from the page URL.
@@ -69,6 +83,10 @@ pub enum Command {
         mod_id: String,
         /// A specific file, when the user already chose one.
         file_id: Option<String>,
+        /// The page this was requested from, recorded so the desktop can
+        /// reopen it later. Validated as a provider URL before it is stored.
+        #[serde(default)]
+        page_url: Option<String>,
     },
     /// Download and then install, previewing conflicts first.
     DownloadAndInstall {
@@ -78,6 +96,9 @@ pub enum Command {
         mod_id: String,
         /// A specific file, when the user already chose one.
         file_id: Option<String>,
+        /// The page this was requested from.
+        #[serde(default)]
+        page_url: Option<String>,
     },
 }
 
@@ -246,8 +267,12 @@ pub fn validate(request: &Request) -> Result<(), Response> {
     };
 
     match &request.command {
-        Command::Ping | Command::Status => Ok(()),
+        Command::Ping | Command::Status | Command::AppState | Command::LaunchApp => Ok(()),
         Command::AddMod {
+            game_domain,
+            mod_id,
+        }
+        | Command::ModState {
             game_domain,
             mod_id,
         } => {
@@ -258,20 +283,68 @@ pub fn validate(request: &Request) -> Result<(), Response> {
             game_domain,
             mod_id,
             file_id,
+            page_url,
         }
         | Command::DownloadAndInstall {
             game_domain,
             mod_id,
             file_id,
+            page_url,
         } => {
             check("game_domain", game_domain)?;
             check("mod_id", mod_id)?;
-            match file_id {
-                Some(id) => check("file_id", id),
+            if let Some(id) = file_id {
+                check("file_id", id)?;
+            }
+            match page_url {
+                Some(url) => check_page_url(&request.id, url),
                 None => Ok(()),
             }
         }
     }
+}
+
+/// Accept only a provider mod page as a recorded address.
+///
+/// The URL is the one field an extension supplies that Onera later hands back
+/// to a browser, so it is checked against the same host and shape the content
+/// script runs on. Anything else is dropped rather than stored: a `javascript:`
+/// or `file:` address surviving into the desktop's "open on Nexus" button would
+/// turn a stored string into code someone else chose.
+fn check_page_url(request_id: &str, url: &str) -> Result<(), Response> {
+    let reject = |why: &str| {
+        Err(error_response(
+            request_id,
+            ErrorCode::Malformed,
+            format!("page_url {why}"),
+        ))
+    };
+    if url.len() > MAX_PAGE_URL_BYTES {
+        return reject("is longer than this host accepts");
+    }
+    let Some(rest) = url.strip_prefix("https://www.nexusmods.com/") else {
+        return reject("is not a Nexus Mods page address");
+    };
+    // Same shape the content script matches: <game>/mods/<id>, and nothing that
+    // could carry a credential or a second target.
+    let mut parts = rest.split('/');
+    let (Some(game), Some("mods"), Some(mod_id)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return reject("is not a mod page address");
+    };
+    if game.is_empty() || mod_id.is_empty() {
+        return reject("names no mod");
+    }
+    if url.contains(['@', '?', '#', '\\']) {
+        return reject("carries a query, fragment or credential");
+    }
+    if !rest
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'))
+    {
+        return reject("contains characters that are not allowed");
+    }
+    Ok(())
 }
 
 /// Build a success response.
@@ -371,6 +444,7 @@ mod tests {
                     game_domain: "cyberpunk2077".into(),
                     mod_id: "107".into(),
                     file_id: None,
+                    page_url: None,
                 },
             ),
             (
@@ -379,6 +453,7 @@ mod tests {
                     game_domain: "cyberpunk2077".into(),
                     mod_id: "107".into(),
                     file_id: Some("100".into()),
+                    page_url: None,
                 },
             ),
         ];
@@ -386,6 +461,94 @@ mod tests {
             let parsed = read_message(&mut Cursor::new(frame(json))).unwrap();
             assert_eq!(parsed.command, expected, "{json}");
         }
+    }
+
+    #[test]
+    fn the_new_commands_parse_from_their_documented_shape() {
+        let cases = vec![
+            (r#"{"v":1,"id":"a","type":"app_state"}"#, Command::AppState),
+            (
+                r#"{"v":1,"id":"a","type":"launch_app"}"#,
+                Command::LaunchApp,
+            ),
+            (
+                r#"{"v":1,"id":"a","type":"mod_state","game_domain":"cyberpunk2077","mod_id":"107"}"#,
+                Command::ModState {
+                    game_domain: "cyberpunk2077".into(),
+                    mod_id: "107".into(),
+                },
+            ),
+            (
+                r#"{"v":1,"id":"a","type":"download","game_domain":"cyberpunk2077","mod_id":"107","file_id":"100","page_url":"https://www.nexusmods.com/cyberpunk2077/mods/107"}"#,
+                Command::Download {
+                    game_domain: "cyberpunk2077".into(),
+                    mod_id: "107".into(),
+                    file_id: Some("100".into()),
+                    page_url: Some("https://www.nexusmods.com/cyberpunk2077/mods/107".into()),
+                },
+            ),
+        ];
+        for (json, expected) in cases {
+            let parsed = read_message(&mut Cursor::new(frame(json))).unwrap();
+            assert_eq!(parsed.command, expected, "{json}");
+        }
+    }
+
+    #[test]
+    fn only_a_provider_mod_page_is_accepted_as_a_page_url() {
+        let accepted = [
+            "https://www.nexusmods.com/cyberpunk2077/mods/107",
+            "https://www.nexusmods.com/skyrimspecialedition/mods/3863/",
+        ];
+        for url in accepted {
+            let request = request(Command::Download {
+                game_domain: "cyberpunk2077".into(),
+                mod_id: "107".into(),
+                file_id: None,
+                page_url: Some(url.to_owned()),
+            });
+            assert!(validate(&request).is_ok(), "{url} should be accepted");
+        }
+
+        let rejected = [
+            // Not the provider, however much the path looks like it.
+            "https://www.nexusmods.com.evil.test/cyberpunk2077/mods/107",
+            "http://www.nexusmods.com/cyberpunk2077/mods/107",
+            "https://nexusmods.com/cyberpunk2077/mods/107",
+            // Not a mod page.
+            "https://www.nexusmods.com/cyberpunk2077/users/1",
+            "https://www.nexusmods.com/cyberpunk2077/mods/",
+            // Anything that could carry a second target or a credential.
+            "https://user:pw@www.nexusmods.com/cyberpunk2077/mods/107",
+            "https://www.nexusmods.com/cyberpunk2077/mods/107?key=secret",
+            "https://www.nexusmods.com/cyberpunk2077/mods/107#x",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+        ];
+        for url in rejected {
+            let request = request(Command::Download {
+                game_domain: "cyberpunk2077".into(),
+                mod_id: "107".into(),
+                file_id: None,
+                page_url: Some(url.to_owned()),
+            });
+            assert!(validate(&request).is_err(), "{url} should be rejected");
+        }
+    }
+
+    #[test]
+    fn an_oversized_page_url_is_rejected() {
+        let long = format!(
+            "https://www.nexusmods.com/cyberpunk2077/mods/{}",
+            "1".repeat(MAX_PAGE_URL_BYTES)
+        );
+        let request = request(Command::Download {
+            game_domain: "cyberpunk2077".into(),
+            mod_id: "107".into(),
+            file_id: None,
+            page_url: Some(long),
+        });
+        assert!(validate(&request).is_err());
     }
 
     #[test]
@@ -508,6 +671,7 @@ mod tests {
             game_domain: "cyberpunk2077".into(),
             mod_id: "107".into(),
             file_id: Some("file_100-a".into()),
+            page_url: Some("https://www.nexusmods.com/cyberpunk2077/mods/107".into()),
         });
         assert!(validate(&request).is_ok());
     }

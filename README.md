@@ -13,7 +13,10 @@ a recoverable state, not a broken game.
 > complete. Onera can capture and verify a local baseline, preview and atomically
 > switch multi-mod profiles, retain disabled artifacts for offline reactivation,
 > return a game to its recorded clean state, and recover the complete set after a
-> failed write. Dependency-aware compatible planning is the next milestone.
+> failed write. The browser extension knows whether the window is running, starts
+> it, and shows what Onera already has for the mod on the page; a download or
+> install sent from there runs on its own — stopping only at a plan that needs a
+> decision. Dependency-aware compatible planning is the next milestone.
 
 ## Why another mod manager
 

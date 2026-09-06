@@ -115,6 +115,15 @@ impl Paths {
         self.cache.join("downloads")
     }
 
+    /// Cached provider artwork, keyed by a hash of the source address.
+    ///
+    /// Under cache rather than data because every file here is re-fetchable: a
+    /// cleaner that deletes it costs one request per mod, and nothing else.
+    #[must_use]
+    pub fn thumbnails(&self) -> PathBuf {
+        self.cache.join("thumbnails")
+    }
+
     /// User configuration file.
     #[must_use]
     pub fn config_file(&self) -> PathBuf {
@@ -132,6 +141,7 @@ impl Paths {
             self.staging(),
             self.logs(),
             self.downloads(),
+            self.thumbnails(),
             self.config.clone(),
         ] {
             tokio::fs::create_dir_all(&dir)
@@ -155,6 +165,7 @@ mod tests {
         assert!(p.staging().starts_with("/root/state"));
         assert!(p.logs().starts_with("/root/state"));
         assert!(p.downloads().starts_with("/root/cache"));
+        assert!(p.thumbnails().starts_with("/root/cache"));
         assert!(p.config_file().starts_with("/root/config"));
     }
 
@@ -178,6 +189,7 @@ mod tests {
             p.staging(),
             p.logs(),
             p.downloads(),
+            p.thumbnails(),
         ] {
             assert!(path.is_dir(), "{} was not created", path.display());
         }
