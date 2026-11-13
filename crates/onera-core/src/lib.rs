@@ -30,10 +30,14 @@ pub mod redact;
 
 pub use error::{CoreError, Result};
 pub use hash::{FileHash, HashAlgorithm};
+pub use domain::project::{
+    DeploymentStrategy, Project, ProjectArtifact, ProjectKind, ProvenanceUri,
+};
 pub use ids::{
-    AccountId, ArchiveId, BackupId, BaselineId, BaselineScanRunId, ConflictId, DependencyGroupId,
-    DependencySnapshotId, DeployedFileId, DownloadJobId, GameId, InboxRequestId, InstallationId,
-    LocalGameId, ModId, OperationId, ProfileId, ProfileMemberId, ProviderFileGroupId,
-    ProviderFileId, ProviderId, ProviderModId, ProviderVersionId, ReleaseId, StoreDlcId,
+    AccountId, ArchiveId, ArtifactId, BackupId, BaselineId, BaselineScanRunId, ConflictId,
+    DependencyGroupId, DependencySnapshotId, DeployedFileId, DownloadJobId, GameId, InboxRequestId,
+    InstallationId, LocalGameId, ModId, OperationId, ProfileId, ProfileMemberId, ProjectId,
+    ProviderFileGroupId, ProviderFileId, ProviderId, ProviderModId, ProviderVersionId, ReleaseId,
+    StoreDlcId,
 };
 pub use paths::{DeployRootKind, RelPath, RelPathError};

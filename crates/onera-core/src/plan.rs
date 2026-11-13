@@ -6,6 +6,7 @@
 //! journal before a single byte moves — so what is approved and what is applied
 //! cannot diverge.
 
+use crate::domain::project::DeploymentStrategy;
 use crate::domain::provider_stack::ProviderStack;
 use crate::hash::FileHash;
 use crate::ids::{InstallationId, LocalGameId, ModId, OperationId};
@@ -283,6 +284,9 @@ pub struct InstallPlan {
     pub installation_id: InstallationId,
     /// The mod lineage being installed.
     pub mod_id: ModId,
+    /// Deployment strategy to use (defaults to Symlink).
+    #[serde(default)]
+    pub deployment_strategy: DeploymentStrategy,
     /// Every file, sorted by target for a stable preview.
     pub files: Vec<PlannedFile>,
 }
@@ -635,6 +639,7 @@ mod tests {
             local_game_id: LocalGameId::new(),
             installation_id: InstallationId::new(),
             mod_id: ModId::new(),
+            deployment_strategy: DeploymentStrategy::default(),
             files,
         }
     }

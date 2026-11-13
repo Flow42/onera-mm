@@ -342,5 +342,34 @@ async fn handle(onera: &Onera, request: Request) -> Response {
                 Err(e) => error_response(&id, code_for(&e), e.to_string()),
             }
         }
+
+        Command::DownloadUri {
+            project_id,
+            uri,
+            page_url,
+            auto_deploy,
+        } => {
+            let Ok(parsed_uri) = url::Url::parse(&uri) else {
+                return error_response(&id, ErrorCode::Malformed, "invalid URI".to_owned());
+            };
+            let Some(provider) = onera.plugins().provider_for_uri(&parsed_uri) else {
+                return error_response(
+                    &id,
+                    ErrorCode::NotFound,
+                    format!("no provider plugin registered for URI scheme '{}'", parsed_uri.scheme()),
+                );
+            };
+            ok_response(
+                &id,
+                serde_json::json!({
+                    "accepted": true,
+                    "provider": provider.metadata().id,
+                    "project_id": project_id,
+                    "uri": parsed_uri.as_str(),
+                    "page_url": page_url,
+                    "auto_deploy": auto_deploy,
+                }),
+            )
+        }
     }
 }

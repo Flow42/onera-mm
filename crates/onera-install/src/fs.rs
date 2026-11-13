@@ -28,20 +28,20 @@ impl FileSystem for RealFileSystem {
     }
 
     async fn stat_hash(&self, path: &Path) -> Result<Option<(FileHash, u64)>> {
-        let meta = match tokio::fs::symlink_metadata(path).await {
+        let meta = match tokio::fs::metadata(path).await {
             Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Check if it's a broken symbolic link
+                if tokio::fs::symlink_metadata(path).await.is_ok() {
+                    return Err(CoreError::Conflict(format!(
+                        "{} is a broken symbolic link",
+                        path.display()
+                    )));
+                }
+                return Ok(None);
+            }
             Err(e) => return Err(CoreError::fs(path, e)),
         };
-        // A symlink where a managed file should be is not "the file, modified";
-        // it is a different kind of object and the installer must not treat it
-        // as ordinary content.
-        if meta.file_type().is_symlink() {
-            return Err(CoreError::Conflict(format!(
-                "{} is a symbolic link; Onera does not manage links",
-                path.display()
-            )));
-        }
         if !meta.is_file() {
             return Ok(None);
         }
@@ -94,6 +94,73 @@ impl FileSystem for RealFileSystem {
         tokio::fs::rename(from, to)
             .await
             .map_err(|e| CoreError::fs(from, e))
+    }
+
+    async fn is_symlink(&self, path: &Path) -> Result<bool> {
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(meta) => Ok(meta.file_type().is_symlink()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(CoreError::fs(path, e)),
+        }
+    }
+
+    async fn read_link(&self, path: &Path) -> Result<PathBuf> {
+        tokio::fs::read_link(path)
+            .await
+            .map_err(|e| CoreError::fs(path, e))
+    }
+
+    async fn create_symlink(&self, original: &Path, link: &Path) -> Result<()> {
+        if let Some(parent) = link.parent() {
+            self.create_dir_all(parent).await?;
+        }
+        #[cfg(unix)]
+        {
+            tokio::fs::symlink(original, link)
+                .await
+                .map_err(|e| CoreError::fs(link, e))
+        }
+        #[cfg(not(unix))]
+        {
+            Err(CoreError::Conflict(
+                "symlinks are not supported on this platform".to_owned(),
+            ))
+        }
+    }
+
+    async fn link_temp_adjacent(&self, final_path: &Path, target: &Path) -> Result<PathBuf> {
+        let parent = final_path.parent().ok_or_else(|| {
+            CoreError::InvalidInput(format!("{} has no parent directory", final_path.display()))
+        })?;
+        self.create_dir_all(parent).await?;
+
+        let name = final_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "link".to_owned());
+        let temp = parent.join(format!("{name}{TEMP_SUFFIX}-{}", uuid::Uuid::new_v4()));
+        #[cfg(unix)]
+        {
+            tokio::fs::symlink(target, &temp)
+                .await
+                .map_err(|e| CoreError::fs(&temp, e))?;
+            Ok(temp)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(CoreError::Conflict(
+                "symlinks are not supported on this platform".to_owned(),
+            ))
+        }
+    }
+
+    async fn hardlink(&self, original: &Path, link: &Path) -> Result<()> {
+        if let Some(parent) = link.parent() {
+            self.create_dir_all(parent).await?;
+        }
+        tokio::fs::hard_link(original, link)
+            .await
+            .map_err(|e| CoreError::fs(link, e))
     }
 
     async fn remove_file(&self, path: &Path) -> Result<()> {
@@ -211,6 +278,28 @@ pub mod fault {
         async fn sync_dir(&self, path: &Path) -> Result<()> {
             self.inner.sync_dir(path).await
         }
+        async fn is_symlink(&self, path: &Path) -> Result<bool> {
+            self.inner.is_symlink(path).await
+        }
+        async fn read_link(&self, path: &Path) -> Result<PathBuf> {
+            self.inner.read_link(path).await
+        }
+        async fn create_symlink(&self, original: &Path, link: &Path) -> Result<()> {
+            self.inner.create_symlink(original, link).await
+        }
+        async fn link_temp_adjacent(&self, final_path: &Path, target: &Path) -> Result<PathBuf> {
+            let n = self.temps.fetch_add(1, Ordering::SeqCst);
+            if self.fail_at == FailAt::TempWrite(n) {
+                return Err(CoreError::fs(
+                    final_path,
+                    std::io::Error::other("injected staging failure"),
+                ));
+            }
+            self.inner.link_temp_adjacent(final_path, target).await
+        }
+        async fn hardlink(&self, original: &Path, link: &Path) -> Result<()> {
+            self.inner.hardlink(original, link).await
+        }
     }
 }
 
@@ -241,11 +330,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_symlink_where_a_file_belongs_is_a_conflict() {
+    async fn stat_hash_hashes_symlink_target_and_broken_symlink_is_conflict() {
         let dir = tempfile::tempdir().unwrap();
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink("/etc/passwd", &link).unwrap();
-        let err = RealFileSystem.stat_hash(&link).await.unwrap_err();
+        let target = dir.path().join("target_file");
+        tokio::fs::write(&target, b"symlink payload").await.unwrap();
+
+        let link = dir.path().join("valid_link");
+        RealFileSystem
+            .create_symlink(&target, &link)
+            .await
+            .unwrap();
+
+        assert!(RealFileSystem.is_symlink(&link).await.unwrap());
+        let (hash, size) = RealFileSystem.stat_hash(&link).await.unwrap().unwrap();
+        assert_eq!(hash, FileHash::blake3_of(b"symlink payload"));
+        assert_eq!(size, 15);
+
+        // Broken symlink
+        let broken = dir.path().join("broken_link");
+        RealFileSystem
+            .create_symlink(&dir.path().join("nonexistent"), &broken)
+            .await
+            .unwrap();
+        let err = RealFileSystem.stat_hash(&broken).await.unwrap_err();
         assert!(matches!(err, CoreError::Conflict(_)), "{err:?}");
     }
 

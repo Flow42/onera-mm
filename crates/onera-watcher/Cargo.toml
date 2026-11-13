@@ -1,0 +1,21 @@
+[package]
+name = "onera-watcher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Folder baseline capture, continuous file change tracking, and drift detection for Onera projects"
+
+[dependencies]
+onera-core = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+walkdir = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

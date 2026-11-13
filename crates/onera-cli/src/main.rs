@@ -199,6 +199,102 @@ enum Commands {
         #[command(subcommand)]
         action: DepsAction,
     },
+    /// Manage folder-based projects, snapshots, change history, URI provenance, and dependencies.
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
+    /// List registered provider and project profile plugins.
+    Plugins,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum StrategyArg {
+    Symlink,
+    Hardlink,
+    Reflink,
+    Copy,
+}
+
+impl From<StrategyArg> for onera_core::domain::project::DeploymentStrategy {
+    fn from(arg: StrategyArg) -> Self {
+        match arg {
+            StrategyArg::Symlink => Self::Symlink,
+            StrategyArg::Hardlink => Self::Hardlink,
+            StrategyArg::Reflink => Self::Reflink,
+            StrategyArg::Copy => Self::Copy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DepKindArg {
+    Required,
+    Recommended,
+    Conflicts,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectAction {
+    /// Initialize any directory as a tracked project and capture its initial state.
+    Init {
+        /// Human-readable project name.
+        #[arg(long)]
+        name: String,
+        /// Directory path to track.
+        #[arg(long)]
+        path: std::path::PathBuf,
+        /// Deployment strategy for staged files.
+        #[arg(long, value_enum, default_value_t = StrategyArg::Symlink)]
+        strategy: StrategyArg,
+    },
+    /// List all initialized projects.
+    List,
+    /// Capture a project snapshot, optionally diffing against a previous snapshot JSON file.
+    Scan {
+        /// Project ID.
+        #[arg(long)]
+        project: String,
+        /// Path to a previous snapshot JSON file to diff against and persist changes.
+        #[arg(long)]
+        since: Option<std::path::PathBuf>,
+        /// Optional path to write the new snapshot JSON.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Show the recorded file change ledger for a project.
+    History {
+        /// Project ID.
+        #[arg(long)]
+        project: String,
+    },
+    /// Record or query the download URI provenance for an artifact.
+    Provenance {
+        /// Artifact ID.
+        #[arg(long)]
+        artifact: String,
+        /// Download URI to associate with this artifact.
+        #[arg(long)]
+        uri: Option<String>,
+        /// Optional source page URL.
+        #[arg(long)]
+        page_url: Option<String>,
+        /// Optional provider plugin ID (e.g. "http", "nexus").
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// Define or resolve dependencies between downloaded artifacts.
+    Depends {
+        /// Artifact ID.
+        #[arg(long)]
+        artifact: String,
+        /// Target dependency artifact ID (when defining an edge).
+        #[arg(long)]
+        depends_on: Option<String>,
+        /// Dependency edge kind.
+        #[arg(long, value_enum, default_value_t = DepKindArg::Required)]
+        kind: DepKindArg,
+    },
 }
 
 /// Dependency subcommands.
@@ -708,6 +804,8 @@ async fn main() -> Result<()> {
             profiles(&onera, action, &progress, &cancel, cli.json).await
         }
         Commands::Deps { action } => deps(&onera, action, cli.json).await,
+        Commands::Project { action } => project_cmd(&onera, action, cli.json).await,
+        Commands::Plugins => plugins_cmd(&onera, cli.json),
     }
 }
 
@@ -722,6 +820,233 @@ fn awaiting(method: &str) -> anyhow::Error {
         "this command needs `Onera::{method}`, which Milestone 4 has not wired up yet. \
          No dependency answer is invented here, so nothing is printed."
     )
+}
+
+async fn project_cmd(onera: &Onera, action: ProjectAction, json: bool) -> Result<()> {
+    use onera_core::domain::project::ProvenanceUri;
+    use onera_core::ids::{ArtifactId, ProjectId, ProviderId};
+    use onera_db::projects::{ArtifactDependencyKind, ArtifactDependencyRecord};
+    use std::collections::BTreeSet;
+
+    match action {
+        ProjectAction::Init {
+            name,
+            path,
+            strategy,
+        } => {
+            let (project, snapshot) = onera
+                .init_project(name, path, strategy.into())
+                .await
+                .context("initialize project")?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "project": project,
+                        "initial_snapshot": snapshot,
+                    }))?
+                );
+            } else {
+                println!(
+                    "Initialized project {} ({}) at {} ({} initial entries)",
+                    project.name,
+                    project.id,
+                    project.root_path.display(),
+                    snapshot.entries.len()
+                );
+            }
+        }
+        ProjectAction::List => {
+            let projects = onera.list_projects().await.context("list projects")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&projects)?);
+            } else if projects.is_empty() {
+                println!("No projects registered.");
+            } else {
+                for p in projects {
+                    println!(
+                        "{}  {}  [{:?}]  {}",
+                        p.id,
+                        p.name,
+                        p.deployment_strategy,
+                        p.root_path.display()
+                    );
+                }
+            }
+        }
+        ProjectAction::Scan {
+            project,
+            since,
+            out,
+        } => {
+            let project_id = ProjectId::from_str(&project).context("invalid project id")?;
+            let proj = onera
+                .get_project(project_id)
+                .await?
+                .with_context(|| format!("project {project_id} not found"))?;
+            let (snapshot, changes) = if let Some(since_path) = since {
+                let raw = tokio::fs::read_to_string(&since_path)
+                    .await
+                    .with_context(|| format!("read previous snapshot {}", since_path.display()))?;
+                let prev = serde_json::from_str(&raw).context("parse previous snapshot JSON")?;
+                onera
+                    .scan_and_record_changes(&proj, &prev, &BTreeSet::new())
+                    .await?
+            } else {
+                (onera.capture_project_snapshot(&proj).await?, Vec::new())
+            };
+            if let Some(out_path) = out {
+                tokio::fs::write(&out_path, serde_json::to_vec_pretty(&snapshot)?)
+                    .await
+                    .with_context(|| format!("write snapshot {}", out_path.display()))?;
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "snapshot": snapshot,
+                        "changes": changes,
+                    }))?
+                );
+            } else {
+                println!(
+                    "Scanned {} ({} entries, {} changes recorded)",
+                    proj.name,
+                    snapshot.entries.len(),
+                    changes.len()
+                );
+            }
+        }
+        ProjectAction::History { project } => {
+            let project_id = ProjectId::from_str(&project).context("invalid project id")?;
+            let records = onera.project_change_history(project_id).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&records)?);
+            } else if records.is_empty() {
+                println!("No file changes recorded.");
+            } else {
+                for r in records {
+                    println!(
+                        "{}  [{}]  {}  ({})",
+                        r.observed_at.to_rfc3339(),
+                        r.event_type,
+                        r.path,
+                        r.source
+                    );
+                }
+            }
+        }
+        ProjectAction::Provenance {
+            artifact,
+            uri,
+            page_url,
+            provider,
+        } => {
+            let artifact_id = ArtifactId::from_str(&artifact).context("invalid artifact id")?;
+            if let Some(uri_str) = uri {
+                let parsed_uri = url::Url::parse(&uri_str).context("invalid download URI")?;
+                let prov = ProvenanceUri {
+                    uri: parsed_uri,
+                    referrer_url: page_url,
+                    provider: Some(ProviderId::new(
+                        provider.unwrap_or_else(|| "http".to_owned()),
+                    )),
+                    etag: None,
+                    content_hash: onera_core::hash::FileHash::blake3_of(
+                        uri_str.as_bytes(),
+                    ),
+                    downloaded_at: chrono::Utc::now(),
+                };
+                onera.record_artifact_provenance(artifact_id, &prov).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&prov)?);
+                } else {
+                    println!("Recorded provenance {} for artifact {}", prov.uri, artifact_id);
+                }
+            } else {
+                let prov = onera.artifact_provenance(artifact_id).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&prov)?);
+                } else if let Some(p) = prov {
+                    let prov_label = p
+                        .provider
+                        .as_ref()
+                        .map_or_else(|| "unknown".to_owned(), ToString::to_string);
+                    println!("{}  (provider: {})", p.uri, prov_label);
+                } else {
+                    println!("No provenance recorded for {artifact_id}.");
+                }
+            }
+        }
+        ProjectAction::Depends {
+            artifact,
+            depends_on,
+            kind,
+        } => {
+            let artifact_id = ArtifactId::from_str(&artifact).context("invalid artifact id")?;
+            if let Some(dep_str) = depends_on {
+                let dep_id =
+                    ArtifactId::from_str(&dep_str).context("invalid depends_on artifact id")?;
+                let dep_kind = match kind {
+                    DepKindArg::Required => ArtifactDependencyKind::Required,
+                    DepKindArg::Recommended => ArtifactDependencyKind::Recommended,
+                    DepKindArg::Conflicts => ArtifactDependencyKind::Conflicts,
+                };
+                let rec = ArtifactDependencyRecord {
+                    artifact_id,
+                    depends_on_artifact: dep_id,
+                    kind: dep_kind,
+                    version_constraint: None,
+                };
+                onera.define_artifact_dependency(&rec).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rec)?);
+                } else {
+                    println!("Recorded dependency: {artifact_id} -> {dep_id}");
+                }
+            } else {
+                let mut selected = BTreeSet::new();
+                selected.insert(artifact_id);
+                let resolution = onera.resolve_project_dependencies(&selected).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&resolution)?);
+                } else {
+                    println!(
+                        "Install order: {} item(s), {} missing, {} conflicts, {} cycles",
+                        resolution.ordered_install.len(),
+                        resolution.missing_required.len(),
+                        resolution.conflicts.len(),
+                        resolution.cycles.len()
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn plugins_cmd(onera: &Onera, json: bool) -> Result<()> {
+    let providers = onera.plugins().list_providers();
+    let profiles = onera.plugins().list_profiles();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "providers": providers,
+                "profiles": profiles,
+            }))?
+        );
+    } else {
+        println!("Providers ({}):", providers.len());
+        for p in &providers {
+            println!("  {} ({}) - {}", p.id, p.version, p.description);
+        }
+        println!("Profiles ({}):", profiles.len());
+        for p in &profiles {
+            println!("  {} ({}) - {}", p.id, p.version, p.description);
+        }
+    }
+    Ok(())
 }
 
 async fn deps(onera: &Onera, action: DepsAction, json: bool) -> Result<()> {
@@ -2456,5 +2781,77 @@ mod tests {
             assert!(json.get(field).is_some(), "missing {field}");
         }
         assert_eq!(json["ready"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn project_and_plugins_cli_subcommands_parse() {
+        let cli = Cli::try_parse_from([
+            "onera",
+            "project",
+            "init",
+            "--name",
+            "MyFolder",
+            "--path",
+            "/tmp/myfolder",
+            "--strategy",
+            "symlink",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Project {
+                action: ProjectAction::Init { .. }
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["onera", "project", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Project {
+                action: ProjectAction::List
+            }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "onera",
+            "project",
+            "provenance",
+            "--artifact",
+            "00000000-0000-0000-0000-000000000001",
+            "--uri",
+            "https://example.com/file.zip",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Project {
+                action: ProjectAction::Provenance { uri: Some(_), .. }
+            }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "onera",
+            "project",
+            "depends",
+            "--artifact",
+            "00000000-0000-0000-0000-000000000001",
+            "--depends-on",
+            "00000000-0000-0000-0000-000000000002",
+            "--kind",
+            "required",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Project {
+                action: ProjectAction::Depends {
+                    depends_on: Some(_),
+                    ..
+                }
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["onera", "plugins"]).unwrap();
+        assert!(matches!(cli.command, Commands::Plugins));
     }
 }

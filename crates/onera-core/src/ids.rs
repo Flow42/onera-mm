@@ -106,6 +106,26 @@ uuid_id!(
     LocalGameId
 );
 uuid_id!(
+    /// A managed project / folder workspace on this machine.
+    ProjectId
+);
+uuid_id!(
+    /// A tracked artifact/package within a project.
+    ArtifactId
+);
+
+impl From<LocalGameId> for ProjectId {
+    fn from(id: LocalGameId) -> Self {
+        Self(id.0)
+    }
+}
+
+impl From<ProjectId> for LocalGameId {
+    fn from(id: ProjectId) -> Self {
+        Self(id.0)
+    }
+}
+uuid_id!(
     /// A mod as tracked by Onera, independent of the provider it came from.
     ModId
 );

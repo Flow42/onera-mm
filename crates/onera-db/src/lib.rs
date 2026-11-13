@@ -29,6 +29,7 @@ pub mod fault;
 pub mod jobs;
 pub mod journal;
 pub mod profiles;
+pub mod projects;
 
 use onera_core::{CoreError, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous};
@@ -41,7 +42,7 @@ use std::time::Duration;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The schema version this build understands.
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// A pooled SQLite database.
 #[derive(Debug, Clone)]

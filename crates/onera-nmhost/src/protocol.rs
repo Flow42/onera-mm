@@ -110,6 +110,20 @@ pub enum Command {
         #[serde(default)]
         grant: Option<WireGrant>,
     },
+    /// Download an arbitrary URI into a project's archive and provenance store.
+    DownloadUri {
+        /// Target project ID, if pre-selected.
+        #[serde(default)]
+        project_id: Option<String>,
+        /// Source URI (`https://...`, `nxm://...`, etc.).
+        uri: String,
+        /// Optional referrer page URL.
+        #[serde(default)]
+        page_url: Option<String>,
+        /// Whether to automatically deploy into the project after download.
+        #[serde(default)]
+        auto_deploy: bool,
+    },
 }
 
 /// A permission the provider's website minted for one file, as it crosses the
@@ -371,6 +385,47 @@ pub fn validate(request: &Request) -> Result<(), Response> {
                 Some(url) => check_page_url(&request.id, url),
                 None => Ok(()),
             }
+        }
+        Command::DownloadUri {
+            project_id,
+            uri,
+            page_url,
+            ..
+        } => {
+            if let Some(pid) = project_id {
+                check("project_id", pid)?;
+            }
+            if uri.is_empty() || uri.len() > 2048 {
+                return Err(error_response(
+                    &request.id,
+                    ErrorCode::Malformed,
+                    "uri must be between 1 and 2048 bytes".to_owned(),
+                ));
+            }
+            let parsed = url::Url::parse(uri).map_err(|e| {
+                error_response(
+                    &request.id,
+                    ErrorCode::Malformed,
+                    format!("invalid uri: {e}"),
+                )
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https" | "nxm") {
+                return Err(error_response(
+                    &request.id,
+                    ErrorCode::Malformed,
+                    format!("unsupported uri scheme '{}'", parsed.scheme()),
+                ));
+            }
+            if let Some(p) = page_url {
+                if p.len() > MAX_PAGE_URL_BYTES {
+                    return Err(error_response(
+                        &request.id,
+                        ErrorCode::Malformed,
+                        "page_url exceeds maximum length".to_owned(),
+                    ));
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -868,5 +923,46 @@ mod tests {
         .unwrap();
         assert!(!encoded.contains("apikey"), "{encoded}");
         assert!(!encoded.contains("token"), "{encoded}");
+    }
+
+    #[test]
+    fn download_uri_parses_round_trips_and_validates() {
+        let raw = r#"{"id":"u1","v":1,"type":"download_uri","uri":"https://example.com/archive.zip","project_id":"proj-1"}"#;
+        let framed = frame(raw);
+        let req = read_message(&mut framed.as_slice()).unwrap();
+        assert_eq!(req.id, "u1");
+        assert!(matches!(
+            req.command,
+            Command::DownloadUri {
+                ref uri,
+                project_id: Some(ref p),
+                page_url: None,
+                auto_deploy: false,
+            } if uri == "https://example.com/archive.zip" && p == "proj-1"
+        ));
+
+        let bad_empty = request(Command::DownloadUri {
+            uri: "   ".into(),
+            project_id: None,
+            page_url: None,
+            auto_deploy: false,
+        });
+        assert!(validate(&bad_empty).is_err());
+
+        let bad_scheme = request(Command::DownloadUri {
+            uri: "javascript:alert(1)".into(),
+            project_id: None,
+            page_url: None,
+            auto_deploy: false,
+        });
+        assert!(validate(&bad_scheme).is_err());
+
+        let ok_nxm = request(Command::DownloadUri {
+            uri: "nxm://cyberpunk2077/mods/107/files/1".into(),
+            project_id: None,
+            page_url: Some("https://www.nexusmods.com/cyberpunk2077/mods/107".into()),
+            auto_deploy: true,
+        });
+        assert!(validate(&ok_nxm).is_ok());
     }
 }

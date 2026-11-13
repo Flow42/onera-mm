@@ -41,6 +41,8 @@ pub struct PlanRequest<'a> {
     pub adapter: &'a dyn GameAdapter,
     /// Remembered rules for this mod.
     pub rules: &'a [ScopedRule],
+    /// Strategy to use when deploying files (defaults to Symlink).
+    pub deployment_strategy: Option<onera_core::domain::project::DeploymentStrategy>,
 }
 
 /// Build a plan without touching anything.
@@ -160,6 +162,7 @@ pub async fn plan_install(
         local_game_id: request.local_game_id,
         installation_id: request.installation_id,
         mod_id: request.mod_id,
+        deployment_strategy: request.deployment_strategy.unwrap_or_default(),
         files,
     };
     plan.sort();

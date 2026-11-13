@@ -58,6 +58,7 @@ use onera_core::ids::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod artifact_graph;
 mod solver;
 
 /// One profile member the solver must account for.

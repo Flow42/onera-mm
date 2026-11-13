@@ -45,6 +45,7 @@ async fn plan(
             roots: &world.roots,
             adapter: &adapter,
             rules,
+            deployment_strategy: None,
         },
         &onera_install::RealFileSystem,
         &world.db,
@@ -1138,6 +1139,7 @@ async fn cancelling_during_planning_stops_cleanly() {
             roots: &world.roots,
             adapter: &adapter,
             rules: &[],
+            deployment_strategy: None,
         },
         &onera_install::RealFileSystem,
         &world.db,
@@ -1483,4 +1485,207 @@ fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+#[tokio::test]
+async fn symlink_deployment_links_into_staging_and_verifies() {
+    let world = World::new().await;
+    let installation = InstallationId::new();
+    let files = vec![("bin/x64/mod.dll", b"compiled mod payload" as &[u8])];
+    let (mut plan, staging) = plan(
+        &world,
+        "symlink-mod",
+        world.mod_id,
+        installation,
+        &files,
+        &[],
+    )
+    .await;
+
+    // Explicitly set deployment strategy to Symlink
+    plan.deployment_strategy = onera_core::domain::project::DeploymentStrategy::Symlink;
+
+    let report = world
+        .installer()
+        .apply(
+            &plan,
+            &staging,
+            &world.roots,
+            world.release,
+            world.archive,
+            &NullProgress,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.written, 1);
+
+    let target_path = world.roots["game"].join("bin/x64/mod.dll");
+    assert!(target_path.exists());
+
+    // Verify it is a symlink pointing to the staging path
+    let is_link = onera_core::ports::FileSystem::is_symlink(&onera_install::RealFileSystem, &target_path)
+        .await
+        .unwrap();
+    assert!(is_link, "deployed file must be a symbolic link");
+
+    let link_target = onera_core::ports::FileSystem::read_link(&onera_install::RealFileSystem, &target_path)
+        .await
+        .unwrap();
+    let expected_staged_source = staging.join("bin/x64/mod.dll");
+    assert_eq!(link_target, expected_staged_source);
+
+    // Verify verification passes cleanly
+    let report = verify_installation(
+        world.local_game,
+        installation,
+        &world.roots,
+        &onera_install::RealFileSystem,
+        &world.db,
+        &NullProgress,
+        &CancelToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert!(report.is_clean(), "symlink deployment must verify clean: {report:?}");
+
+    // Remove the mod
+    world
+        .remover()
+        .remove(
+            world.local_game,
+            installation,
+            &world.roots,
+            ModifiedFilePolicy::Ask,
+            &NullProgress,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+
+    // Symlink in game folder is removed, but staging source remains
+    assert!(!target_path.exists(), "target symlink must be removed");
+    assert!(expected_staged_source.exists(), "staged source file must remain intact");
+}
+
+#[tokio::test]
+async fn hardlink_deployment_shares_inode_and_verifies() {
+    use std::os::unix::fs::MetadataExt;
+
+    let world = World::new().await;
+    let installation = InstallationId::new();
+    let files = vec![("bin/x64/hardlink.dll", b"hardlink payload" as &[u8])];
+    let (mut plan, staging) = plan(
+        &world,
+        "hardlink-mod",
+        world.mod_id,
+        installation,
+        &files,
+        &[],
+    )
+    .await;
+
+    plan.deployment_strategy = onera_core::domain::project::DeploymentStrategy::Hardlink;
+
+    let report = world
+        .installer()
+        .apply(
+            &plan,
+            &staging,
+            &world.roots,
+            world.release,
+            world.archive,
+            &NullProgress,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.written, 1);
+
+    let target_path = world.roots["game"].join("bin/x64/hardlink.dll");
+    let staged_path = staging.join("bin/x64/hardlink.dll");
+    assert!(target_path.exists());
+    assert!(
+        !onera_core::ports::FileSystem::is_symlink(&onera_install::RealFileSystem, &target_path)
+            .await
+            .unwrap()
+    );
+    let target_ino = std::fs::metadata(&target_path).unwrap().ino();
+    let staged_ino = std::fs::metadata(&staged_path).unwrap().ino();
+    assert_eq!(target_ino, staged_ino, "hardlink must share inode with staged file");
+
+    let verify = verify_installation(
+        world.local_game,
+        installation,
+        &world.roots,
+        &onera_install::RealFileSystem,
+        &world.db,
+        &NullProgress,
+        &CancelToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(verify.is_clean(), "hardlink deployment must verify clean: {verify:?}");
+}
+
+#[tokio::test]
+async fn copy_deployment_writes_regular_file_and_verifies() {
+    use std::os::unix::fs::MetadataExt;
+
+    let world = World::new().await;
+    let installation = InstallationId::new();
+    let files = vec![("bin/x64/copy.dll", b"copy payload" as &[u8])];
+    let (mut plan, staging) = plan(
+        &world,
+        "copy-mod",
+        world.mod_id,
+        installation,
+        &files,
+        &[],
+    )
+    .await;
+
+    plan.deployment_strategy = onera_core::domain::project::DeploymentStrategy::Copy;
+
+    let report = world
+        .installer()
+        .apply(
+            &plan,
+            &staging,
+            &world.roots,
+            world.release,
+            world.archive,
+            &NullProgress,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.written, 1);
+
+    let target_path = world.roots["game"].join("bin/x64/copy.dll");
+    let staged_path = staging.join("bin/x64/copy.dll");
+    assert!(target_path.exists());
+    assert!(
+        !onera_core::ports::FileSystem::is_symlink(&onera_install::RealFileSystem, &target_path)
+            .await
+            .unwrap()
+    );
+    let target_ino = std::fs::metadata(&target_path).unwrap().ino();
+    let staged_ino = std::fs::metadata(&staged_path).unwrap().ino();
+    assert_ne!(target_ino, staged_ino, "copy deployment must create a distinct inode");
+
+    let verify = verify_installation(
+        world.local_game,
+        installation,
+        &world.roots,
+        &onera_install::RealFileSystem,
+        &world.db,
+        &NullProgress,
+        &CancelToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(verify.is_clean(), "copy deployment must verify clean: {verify:?}");
 }

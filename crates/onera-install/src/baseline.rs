@@ -319,14 +319,40 @@ async fn verify_with_evidence(
                     detail,
                 ));
             }
-            DiskEntry::Special(detail) => findings.push(finding(
-                root_key.clone(),
-                path.clone(),
-                FileClassification::SpecialFile,
-                baseline_file.map(|f| f.hash.clone()),
-                None,
-                Some(detail.clone()),
-            )),
+            DiskEntry::Special(detail) => {
+                let target = TargetLocation {
+                    root_key: root_key.clone(),
+                    path: path.clone(),
+                };
+                if managed_targets.contains(&target) && baseline_file.is_some() {
+                    findings.push(finding(
+                        root_key.clone(),
+                        path.clone(),
+                        FileClassification::Modified,
+                        baseline_file.map(|f| f.hash.clone()),
+                        None,
+                        Some(detail.clone()),
+                    ));
+                } else if managed_targets.contains(&target) {
+                    findings.push(finding(
+                        root_key.clone(),
+                        path.clone(),
+                        FileClassification::ExtraManaged,
+                        None,
+                        None,
+                        Some(detail.clone()),
+                    ));
+                } else {
+                    findings.push(finding(
+                        root_key.clone(),
+                        path.clone(),
+                        FileClassification::SpecialFile,
+                        baseline_file.map(|f| f.hash.clone()),
+                        None,
+                        Some(detail.clone()),
+                    ));
+                }
+            }
             DiskEntry::Unreadable(detail) => findings.push(finding(
                 root_key.clone(),
                 path.clone(),

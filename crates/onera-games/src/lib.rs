@@ -39,6 +39,14 @@ pub fn adapter_for_provider_slug(slug: &str) -> Option<&'static dyn GameAdapter>
         .find(|a| a.provider_slugs().contains(&slug))
 }
 
+/// Register all built-in game adapters as [`onera_plugin::ProjectProfilePlugin`]s.
+pub fn register_profiles(registry: &mut onera_plugin::PluginRegistry) {
+    use onera_plugin::GameProfileAdapter;
+    use std::sync::Arc;
+    registry.register_profile(Arc::new(GameProfileAdapter::new(Cyberpunk2077, 100)));
+    registry.register_profile(Arc::new(GameProfileAdapter::new(SkyrimSpecialEdition, 100)));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

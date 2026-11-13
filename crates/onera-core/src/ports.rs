@@ -446,6 +446,21 @@ pub trait FileSystem: Send + Sync {
     /// Atomically move `from` onto `to`, replacing it.
     async fn rename(&self, from: &Path, to: &Path) -> Result<()>;
 
+    /// Whether `path` is a symbolic link.
+    async fn is_symlink(&self, path: &Path) -> Result<bool>;
+
+    /// Read the destination target of a symbolic link.
+    async fn read_link(&self, path: &Path) -> Result<PathBuf>;
+
+    /// Create a symbolic link pointing to `original` at location `link`.
+    async fn create_symlink(&self, original: &Path, link: &Path) -> Result<()>;
+
+    /// Create a temporary symlink adjacent to `final_path` pointing to `target` and return it.
+    async fn link_temp_adjacent(&self, final_path: &Path, target: &Path) -> Result<PathBuf>;
+
+    /// Create a hard link pointing to `original` at location `link`.
+    async fn hardlink(&self, original: &Path, link: &Path) -> Result<()>;
+
     /// Remove a file. Succeeds if it is already gone.
     async fn remove_file(&self, path: &Path) -> Result<()>;
 

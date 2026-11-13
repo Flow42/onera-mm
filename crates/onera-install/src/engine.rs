@@ -16,6 +16,7 @@
 //! already restored, deleting a temp file that is already gone — a rollback can
 //! itself be interrupted and resumed.
 
+use crate::fs::TEMP_SUFFIX;
 use crate::planner::RootMap;
 use onera_core::domain::operation::{Operation, OperationKind, OperationState};
 use onera_core::domain::provider_stack::{FileProvider, StackEntry};
@@ -235,10 +236,38 @@ impl Installer {
             self.journal.put_entry(operation_id, &entry).await?;
 
             let source_path = file.source.resolve_under(staging);
-            let temp = self
-                .fs
-                .write_temp_adjacent(&target_path, &source_path)
-                .await?;
+            let temp = match plan.deployment_strategy {
+                onera_core::domain::project::DeploymentStrategy::Symlink => {
+                    self.fs
+                        .link_temp_adjacent(&target_path, &source_path)
+                        .await?
+                }
+                onera_core::domain::project::DeploymentStrategy::Hardlink => {
+                    let parent = target_path.parent().ok_or_else(|| {
+                        CoreError::InvalidInput(format!(
+                            "{} has no parent directory",
+                            target_path.display()
+                        ))
+                    })?;
+                    self.fs.create_dir_all(parent).await?;
+                    let name = target_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "link".to_owned());
+                    let temp = parent.join(format!(
+                        "{name}{TEMP_SUFFIX}-{}",
+                        uuid::Uuid::new_v4()
+                    ));
+                    self.fs.hardlink(&source_path, &temp).await?;
+                    temp
+                }
+                onera_core::domain::project::DeploymentStrategy::Reflink
+                | onera_core::domain::project::DeploymentStrategy::Copy => {
+                    self.fs
+                        .write_temp_adjacent(&target_path, &source_path)
+                        .await?
+                }
+            };
 
             // Verify the staged bytes before they are allowed anywhere near the
             // target: a bad copy must fail here, not after the rename.

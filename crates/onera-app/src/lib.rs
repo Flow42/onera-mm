@@ -21,6 +21,7 @@ pub mod logging;
 pub mod paths;
 pub mod presence;
 pub mod profile;
+pub mod projects;
 pub mod secrets;
 pub mod staging;
 

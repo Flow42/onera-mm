@@ -154,3 +154,19 @@ export function withTimeout(promise, ms) {
     );
   });
 }
+
+/**
+ * Send a generic `download_uri` command for any supported URI (HTTP/HTTPS/NXM)
+ * optionally bound to a target project.
+ *
+ * @param {string} uri
+ * @param {{ projectId?: string | null, pageUrl?: string | null, autoDeploy?: boolean }} [options]
+ */
+export async function sendDownloadUri(uri, options = {}) {
+  return send('download_uri', {
+    uri,
+    project_id: options.projectId ?? null,
+    page_url: options.pageUrl ?? null,
+    auto_deploy: Boolean(options.autoDeploy),
+  });
+}

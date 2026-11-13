@@ -324,7 +324,14 @@ impl ReconciliationEngine {
                     })?,
                 };
                 verify(self.fs.as_ref(), &source, &provider.hash).await?;
-                let temp = self.fs.write_temp_adjacent(&absolute, &source).await?;
+                let temp = match provider.provider {
+                    onera_core::domain::provider_stack::FileProvider::Installation { .. } => {
+                        self.fs.link_temp_adjacent(&absolute, &source).await?
+                    }
+                    onera_core::domain::provider_stack::FileProvider::UnmanagedBackup { .. } => {
+                        self.fs.write_temp_adjacent(&absolute, &source).await?
+                    }
+                };
                 verify(self.fs.as_ref(), &temp, &provider.hash).await?;
                 entry.source_hash = provider.hash.clone();
                 entry.temp_path = Some(temp);

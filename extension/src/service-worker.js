@@ -16,13 +16,14 @@
 import { actionsFor, transferActionFor } from './mod-actions.js';
 import { canonicalModUrl, identifyModPage } from './page-identity.js';
 import { parseNxmUrl } from './nxm.js';
-import { send } from './native.js';
+import { send, sendDownloadUri } from './native.js';
 
 /** Commands the popup and content script may ask for. */
 const ACTIONS = Object.freeze({
   ADD: 'add_mod',
   DOWNLOAD: 'download',
   DOWNLOAD_AND_INSTALL: 'download_and_install',
+  DOWNLOAD_URI: 'download_uri',
   STATUS: 'status',
   MOD_STATE: 'mod_state',
   MOD_VIEW: 'mod_view',
@@ -65,6 +66,9 @@ export async function handle(message) {
   }
   if (action === ACTIONS.NXM) {
     return handOverDownload(url);
+  }
+  if (action === ACTIONS.DOWNLOAD_URI) {
+    return handOverUri(message);
   }
 
   if (
@@ -167,6 +171,38 @@ export async function handOverDownload(rawUrl) {
     grant: link.grant,
   });
   return result.ok === true ? { ...result, desktop: desktop.data ?? null } : result;
+}
+
+/**
+ * Forward a generic download URI (HTTP/HTTPS/NXM) to the native host,
+ * optionally associating it with a target project and source page URL.
+ *
+ * @param {Record<string, unknown>} message
+ */
+export async function handOverUri(message) {
+  const { uri, projectId, pageUrl, autoDeploy } = message;
+  if (typeof uri !== 'string' || uri.trim().length === 0) {
+    return { ok: false, code: 'malformed', message: 'Missing download URI.' };
+  }
+  let parsed;
+  try {
+    parsed = new URL(uri);
+  } catch {
+    return { ok: false, code: 'malformed', message: 'Invalid download URI.' };
+  }
+  if (!['http:', 'https:', 'nxm:'].includes(parsed.protocol)) {
+    return {
+      ok: false,
+      code: 'malformed',
+      message: `Unsupported URI scheme: ${parsed.protocol}`,
+    };
+  }
+
+  return sendDownloadUri(parsed.toString(), {
+    projectId: typeof projectId === 'string' && projectId.length > 0 ? projectId : null,
+    pageUrl: typeof pageUrl === 'string' && pageUrl.length > 0 ? pageUrl : null,
+    autoDeploy: autoDeploy === true,
+  });
 }
 
 /**

@@ -8,6 +8,8 @@ members = [
     "crates/onera-discovery",
     "crates/onera-games",
     "crates/onera-provider",
+    "crates/onera-plugin",
+    "crates/onera-watcher",
     "crates/onera-resolver",
     "crates/onera-nexus",
     "crates/onera-download",
@@ -33,6 +35,8 @@ onera-install = { path = "crates/onera-install", version = "0.1.0" }
 onera-discovery = { path = "crates/onera-discovery", version = "0.1.0" }
 onera-games = { path = "crates/onera-games", version = "0.1.0" }
 onera-provider = { path = "crates/onera-provider", version = "0.1.0" }
+onera-plugin = { path = "crates/onera-plugin", version = "0.1.0" }
+onera-watcher = { path = "crates/onera-watcher", version = "0.1.0" }
 onera-resolver = { path = "crates/onera-resolver", version = "0.1.0" }
 onera-nexus = { path = "crates/onera-nexus", version = "0.1.0" }
 onera-download = { path = "crates/onera-download", version = "0.1.0" }

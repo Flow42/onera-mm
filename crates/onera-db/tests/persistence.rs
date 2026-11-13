@@ -290,6 +290,7 @@ fn plan_for(f: &Fixture, installation: InstallationId) -> InstallPlan {
         local_game_id: f.game,
         installation_id: installation,
         mod_id: f.mod_id,
+        deployment_strategy: onera_core::domain::project::DeploymentStrategy::default(),
         files: vec![PlannedFile {
             source: RelPath::normalize("bin/x64/plugin.dll").unwrap(),
             target: target("bin/x64/plugin.dll"),

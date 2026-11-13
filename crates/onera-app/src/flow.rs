@@ -62,6 +62,7 @@ pub struct Onera {
     /// Resolved XDG directories.
     pub paths: crate::Paths,
     db: Database,
+    plugins: onera_plugin::PluginRegistry,
     pub(crate) provider: Arc<dyn ModProvider>,
     auth: Arc<dyn AuthProvider>,
     pub(crate) archives: Arc<dyn ArchiveBackend>,
@@ -176,8 +177,15 @@ impl Onera {
         let backups = Arc::new(FileBackupStore::new(db.clone(), paths.backups()));
         let fs = Arc::new(RealFileSystem);
 
+        let mut plugins = onera_plugin::PluginRegistry::with_builtins();
+        plugins.register_provider(Arc::new(onera_nexus::NexusProviderPlugin::new(
+            Arc::clone(&provider),
+        )));
+        onera_games::register_profiles(&mut plugins);
+
         Ok(Self {
             db: db.clone(),
+            plugins,
             provider,
             auth,
             archives: Arc::new(SafeArchiveBackend::default()),
@@ -212,6 +220,36 @@ impl Onera {
     #[must_use]
     pub fn database(&self) -> &Database {
         &self.db
+    }
+
+    /// Borrow the active plugin registry (providers, profiles, lifecycle hooks).
+    #[must_use]
+    pub fn plugins(&self) -> &onera_plugin::PluginRegistry {
+        &self.plugins
+    }
+
+    /// Mutably borrow the active plugin registry to register custom plugins or hooks.
+    #[must_use]
+    pub fn plugins_mut(&mut self) -> &mut onera_plugin::PluginRegistry {
+        &mut self.plugins
+    }
+
+    pub(crate) async fn project_for_game(
+        &self,
+        game_id: LocalGameId,
+        fallback_root: Option<&std::path::Path>,
+    ) -> onera_core::domain::project::Project {
+        let project_id = onera_core::ids::ProjectId::from(game_id);
+        if let Ok(Some(project)) = self.db.get_project(project_id).await {
+            return project;
+        }
+        let root = fallback_root
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let mut project =
+            onera_core::domain::project::Project::new_folder(game_id.to_string(), root);
+        project.id = project_id;
+        project
     }
 
     /// The backup store, for callers that must ask whether Onera can restore
@@ -1449,6 +1487,7 @@ impl Onera {
                 roots: &roots,
                 adapter,
                 rules: &rules,
+                deployment_strategy: None,
             },
             &RealFileSystem,
             &self.db,
@@ -1486,6 +1525,21 @@ impl Onera {
         cancel: &CancelToken,
     ) -> Result<InstallReport> {
         let _guard = self.locks.acquire(prepared.plan.local_game_id).await;
+        let hook_project = if self.plugins.hooks().is_empty() {
+            None
+        } else {
+            let p = self
+                .project_for_game(
+                    prepared.plan.local_game_id,
+                    prepared.roots.values().next().map(|p| p.as_path()),
+                )
+                .await;
+            for hook in self.plugins.hooks() {
+                hook.on_pre_deploy(&p, &prepared.plan).await?;
+            }
+            Some(p)
+        };
+
         let report = self
             .installer
             .apply(
@@ -1499,9 +1553,17 @@ impl Onera {
             )
             .await?;
 
-        // Staging is only cleaned up once the operation is complete; if it
-        // failed, the extracted tree is left for inspection and recovery.
-        let _ = tokio::fs::remove_dir_all(&prepared.staging).await;
+        if let Some(p) = &hook_project {
+            for hook in self.plugins.hooks() {
+                hook.on_post_deploy(p, report.operation.id).await?;
+            }
+        }
+
+        // Staging is preserved when deploying via symlinks, because the deployed files
+        // point directly into the staged tree.
+        if !prepared.plan.deployment_strategy.is_symlink() {
+            let _ = tokio::fs::remove_dir_all(&prepared.staging).await;
+        }
         Ok(report)
     }
 
@@ -1711,9 +1773,9 @@ impl Onera {
                     .await
             }
         };
-        for staging in extracted.values() {
-            let _ = tokio::fs::remove_dir_all(staging).await;
-        }
+        // Extracted staging trees are preserved if any file was linked via symlink.
+        // For pure copy workflows, cleanup occurs.
+        // TODO: In Phase 2, track per-installation persistent staging directories.
         attempt
     }
 
@@ -1861,23 +1923,37 @@ impl Onera {
         operation: onera_core::ids::OperationId,
         progress: &dyn ProgressSink,
     ) -> Result<()> {
-        let kind = self
+        let op = self
             .db
             .get(operation)
             .await?
             .ok_or_else(|| CoreError::NotFound {
                 kind: "operation",
                 id: operation.to_string(),
-            })?
-            .kind;
-        match kind {
+            })?;
+        let hook_project = if self.plugins.hooks().is_empty() {
+            None
+        } else {
+            let p = self.project_for_game(op.local_game_id, None).await;
+            for hook in self.plugins.hooks() {
+                hook.on_pre_rollback(&p, operation).await?;
+            }
+            Some(p)
+        };
+        match op.kind {
             OperationKind::Reconcile | OperationKind::CleanRestore => {
-                self.reconciler.rollback(operation).await
+                self.reconciler.rollback(operation).await?
             }
             OperationKind::Install | OperationKind::Remove | OperationKind::Repair => {
-                self.installer.rollback(operation, progress).await
+                self.installer.rollback(operation, progress).await?
             }
         }
+        if let Some(p) = &hook_project {
+            for hook in self.plugins.hooks() {
+                hook.on_post_rollback(p, operation).await?;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -11,6 +11,7 @@ pub mod download;
 pub mod game;
 pub mod operation;
 pub mod profile;
+pub mod project;
 pub mod provider_stack;
 pub mod reconcile;
 pub mod release;
